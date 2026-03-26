@@ -2966,7 +2966,7 @@ APP_BUILD_ID = _load_embedded_build_id("dev-local")
 # Compat affichage / User-Agent (même valeur que le build CI).
 APP_VERSION = APP_BUILD_ID
 
-# Mises à jour : remplir UPDATE_GITHUB_REPO (format « propriétaire/nom-du-repo ») pour utiliser automatiquement :
+# Mises à jour :remplir UPDATE_GITHUB_REPO (format « propriétaire/nom-du-repo ») pour utiliser automatiquement :
 #   https://github.com/<repo>/releases/latest/download/update-manifest.json
 # (généré par le workflow GitHub Actions à chaque build.)
 UPDATE_GITHUB_REPO = "IsmailZegour/SnowMaster"  # ex. "MonCompte/SnowMaster"
