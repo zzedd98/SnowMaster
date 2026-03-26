@@ -150,14 +150,18 @@ def _default_target_exe() -> str:
 
 def _read_local_build_id(target_exe: str) -> str:
     d = os.path.dirname(os.path.abspath(target_exe))
-    p = os.path.join(d, "build_id.txt")
-    if not os.path.isfile(p):
-        return ""
-    try:
-        with open(p, encoding="utf-8") as f:
-            return (f.readline() or "").strip()
-    except Exception:
-        return ""
+    for fname in ("version.txt", "build_id.txt"):
+        p = os.path.join(d, fname)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                line = (f.readline() or "").strip()
+            if line:
+                return line
+        except Exception:
+            continue
+    return ""
 
 
 def _manifest_url_from_repo(repo: str) -> str:
@@ -188,7 +192,104 @@ def _download_to_file(
     progress_q.put(("done", None, None))
 
 
-def _replace_and_relaunch(target: str, tmp_dl: str) -> None:
+class RoundedButton(tk.Canvas):
+    def __init__(
+        self,
+        parent,
+        text,
+        command,
+        width=170,
+        height=42,
+        radius=14,
+        bg="#0284C7",
+        bg_hover="#0EA5E9",
+        bg_disabled="#334155",
+        fg="#FFFFFF",
+        canvas_bg="#0B1220",
+    ):
+        super().__init__(
+            parent,
+            width=width,
+            height=height,
+            bd=0,
+            highlightthickness=0,
+            bg=canvas_bg,
+        )
+        self._text = text
+        self._command = command
+        self._radius = radius
+        self._bg = bg
+        self._bg_hover = bg_hover
+        self._bg_disabled = bg_disabled
+        self._fg = fg
+        self._enabled = True
+        self._shape_id = None
+        self._text_id = None
+        self._draw(self._bg)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+
+    def _rounded_points(self, x1, y1, x2, y2, r):
+        return [
+            x1 + r,
+            y1,
+            x2 - r,
+            y1,
+            x2,
+            y1,
+            x2,
+            y1 + r,
+            x2,
+            y2 - r,
+            x2,
+            y2,
+            x2 - r,
+            y2,
+            x1 + r,
+            y2,
+            x1,
+            y2,
+            x1,
+            y2 - r,
+            x1,
+            y1 + r,
+            x1,
+            y1,
+        ]
+
+    def _draw(self, color):
+        self.delete("all")
+        w = int(self.cget("width"))
+        h = int(self.cget("height"))
+        pts = self._rounded_points(2, 2, w - 2, h - 2, self._radius)
+        self._shape_id = self.create_polygon(pts, smooth=True, fill=color, outline="")
+        self._text_id = self.create_text(
+            w // 2,
+            h // 2,
+            text=self._text,
+            fill=self._fg,
+            font=("Segoe UI", 10, "bold"),
+        )
+
+    def _on_enter(self, _e):
+        if self._enabled:
+            self._draw(self._bg_hover)
+
+    def _on_leave(self, _e):
+        if self._enabled:
+            self._draw(self._bg)
+
+    def _on_click(self, _e):
+        if self._enabled and self._command:
+            self._command()
+
+    def set_enabled(self, enabled: bool):
+        self._enabled = bool(enabled)
+        self._draw(self._bg if self._enabled else self._bg_disabled)
+
+
+def _replace_exe(target: str, tmp_dl: str) -> None:
     target = os.path.abspath(target)
     exe_dir = os.path.dirname(target)
     bak = target + ".old"
@@ -222,22 +323,16 @@ def _replace_and_relaunch(target: str, tmp_dl: str) -> None:
     else:
         raise RuntimeError("Impossible d'installer le nouveau fichier.")
 
-    if sys.platform == "win32":
-        import subprocess
+    # Nettoyage : on ne conserve pas l'ancien exe en .old.
+    for _ in range(120):
+        try:
+            if os.path.isfile(bak):
+                os.remove(bak)
+            break
+        except OSError:
+            time.sleep(0.25)
 
-        subprocess.Popen(
-            [target],
-            cwd=exe_dir,
-            creationflags=_windows_detach_flags(),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
-    else:
-        import subprocess
-
-        subprocess.Popen([target], cwd=exe_dir, close_fds=True)
+    return
 
 
 class UpdaterApp:
@@ -262,53 +357,73 @@ class UpdaterApp:
         self.root = tk.Tk()
         self.root.title(f"Mise à jour — {self.app_name}")
         self.root.resizable(False, False)
-        self.root.minsize(420, 260)
+        self.root.minsize(460, 190)
+        self.root.configure(bg="#0B1220")
 
         self._progress_q: queue.Queue = queue.Queue()
 
-        frm = ttk.Frame(self.root, padding=16)
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("Snow.TFrame", background="#0B1220")
+        style.configure(
+            "SnowTitle.TLabel",
+            background="#0B1220",
+            foreground="#E6F2FF",
+            font=("Segoe UI", 13, "bold"),
+        )
+        style.configure(
+            "SnowInfo.TLabel",
+            background="#0B1220",
+            foreground="#93C5FD",
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "Snow.Horizontal.TProgressbar",
+            troughcolor="#1E293B",
+            background="#38BDF8",
+            bordercolor="#1E293B",
+            lightcolor="#38BDF8",
+            darkcolor="#0EA5E9",
+        )
+        frm = ttk.Frame(self.root, style="Snow.TFrame", padding=18)
         frm.pack(fill=tk.BOTH, expand=True)
 
-        self.lbl_title = ttk.Label(frm, text="", font=("", 11, "bold"))
+        self.lbl_title = ttk.Label(frm, text="", style="SnowTitle.TLabel")
         self.lbl_title.pack(anchor=tk.W)
 
-        self.txt_body = tk.Text(
-            frm,
-            height=8,
-            width=52,
-            wrap=tk.WORD,
-            state=tk.DISABLED,
-            font=("Segoe UI", 10),
-            relief=tk.FLAT,
-            bg="#f5f5f5",
-        )
-        self.txt_body.pack(fill=tk.BOTH, expand=True, pady=(10, 8))
+        self.lbl_brief = ttk.Label(frm, text="", style="SnowInfo.TLabel")
+        self.lbl_brief.pack(anchor=tk.W, pady=(8, 8))
 
-        self.progress = ttk.Progressbar(frm, mode="determinate", maximum=100)
+        self.progress = ttk.Progressbar(
+            frm, mode="determinate", maximum=100, style="Snow.Horizontal.TProgressbar"
+        )
         self.progress.pack(fill=tk.X, pady=(0, 8))
         self.progress.pack_forget()
 
-        self.lbl_progress = ttk.Label(frm, text="")
+        self.lbl_progress = ttk.Label(frm, text="", style="SnowInfo.TLabel")
         self.lbl_progress.pack(anchor=tk.W)
 
-        btn_row = ttk.Frame(frm)
-        btn_row.pack(fill=tk.X, pady=(8, 0))
+        btn_row = ttk.Frame(frm, style="Snow.TFrame")
+        btn_row.pack(pady=(10, 0))
 
-        self.btn_install = ttk.Button(
-            btn_row, text="Télécharger et installer", command=self._on_install
+        self.btn_install = RoundedButton(
+            btn_row,
+            text="UPDATE",
+            command=self._on_install,
+            width=180,
+            height=44,
+            radius=16,
         )
-        self.btn_install.pack(side=tk.RIGHT, padx=(8, 0))
-
-        self.btn_close = ttk.Button(btn_row, text="Fermer", command=self.root.destroy)
-        self.btn_close.pack(side=tk.RIGHT)
+        self.btn_install.pack()
 
         self._apply_state_from_args_or_fetch()
 
     def _set_body(self, text: str) -> None:
-        self.txt_body.configure(state=tk.NORMAL)
-        self.txt_body.delete("1.0", tk.END)
-        self.txt_body.insert(tk.END, text)
-        self.txt_body.configure(state=tk.DISABLED)
+        line = (text or "").strip().splitlines()
+        self.lbl_brief.configure(text=line[0] if line else "")
 
     def _resolve_manifest_url(self) -> str:
         if self.manifest_url:
@@ -339,14 +454,8 @@ class UpdaterApp:
         murl = self._resolve_manifest_url()
         if not murl:
             self.lbl_title.configure(text="Configuration incomplète")
-            self._set_body(
-                "Impossible de vérifier les mises à jour : aucune URL de manifest connue.\n\n"
-                "Renseignez UPDATE_GITHUB_REPO ou UPDATE_MANIFEST_URL en tête du fichier "
-                "SnowMasterUpdater.py (comme dans SnowMaster.py), ou utilisez les variables "
-                "d'environnement BOTMASTER_GITHUB_REPO / BOTMASTER_UPDATE_MANIFEST_URL, "
-                "ou les options --github-repo / --manifest-url en ligne de commande."
-            )
-            self.btn_install.state(["disabled"])
+            self._set_body("Configuration des mises à jour manquante.")
+            self.btn_install.set_enabled(False)
             return
 
         self.manifest_url = murl
@@ -360,16 +469,14 @@ class UpdaterApp:
             )
         except Exception as e:
             self.lbl_title.configure(text="Vérification impossible")
-            self._set_body(
-                "Le serveur de mises à jour n'a pas pu être joint.\n\n" f"Détail : {e}"
-            )
-            self.btn_install.state(["disabled"])
+            self._set_body(f"Impossible de joindre le serveur ({e}).")
+            self.btn_install.set_enabled(False)
             return
 
         if not remote or not durl:
             self.lbl_title.configure(text="Manifest invalide")
-            self._set_body("Le fichier de mise à jour distant est incomplet.")
-            self.btn_install.state(["disabled"])
+            self._set_body("Manifest invalide.")
+            self.btn_install.set_enabled(False)
             return
 
         self.remote_build_id = remote
@@ -377,34 +484,31 @@ class UpdaterApp:
         if not self.local_build_id:
             self.local_build_id = _read_local_build_id(self.target_exe)
 
+        # Si l'ID local est inconnu (ex: lancement standalone sans metadata locale),
+        # on évite les faux positifs de mise à jour.
+        if not self.local_build_id:
+            self.lbl_title.configure(text="Vérification impossible")
+            self._set_body("Version locale introuvable.")
+            self.btn_install.set_enabled(False)
+            return
+
         if self.local_build_id == self.remote_build_id:
             self.lbl_title.configure(text="Logiciel à jour")
-            self._set_body(
-                f"{self.app_name} est à jour.\n\n"
-                f"Build installé : {self.local_build_id or '(inconnu)'}\n"
-                f"Dernier build publié : {self.remote_build_id}"
-            )
-            self.btn_install.state(["disabled"])
+            self._set_body(f"{self.app_name} est à jour.")
+            self.btn_install.set_enabled(False)
             return
 
         self._show_update_available_ui()
 
     def _show_update_available_ui(self) -> None:
         self.lbl_title.configure(text="Mise à jour disponible")
-        self._set_body(
-            f"Une version plus récente de {self.app_name} est disponible.\n\n"
-            f"Build installé : {self.local_build_id or '(inconnu)'}\n"
-            f"Nouveau build : {self.remote_build_id}\n\n"
-            "Cliquez sur « Télécharger et installer » pour mettre à jour. "
-            "L'application principale doit être fermée pendant l'installation."
-        )
-        self.btn_install.state(["!disabled"])
+        self._set_body("Une mise à jour est disponible.")
+        self.btn_install.set_enabled(True)
 
     def _on_install(self) -> None:
         if not self.download_url:
             return
-        self.btn_install.state(["disabled"])
-        self.btn_close.state(["disabled"])
+        self.btn_install.set_enabled(False)
         self.progress.pack(fill=tk.X, pady=(0, 8))
         self.progress["value"] = 0
         self.lbl_progress.configure(text="Préparation…")
@@ -461,9 +565,13 @@ class UpdaterApp:
                         self.progress["value"] = 100
                         self.lbl_progress.configure(text="Installation…")
                         self.root.update_idletasks()
-                        _replace_and_relaunch(self.target_exe, tmp_dl)
+                        _replace_exe(self.target_exe, tmp_dl)
+                        self.lbl_title.configure(text="Mise à jour terminée")
+                        self._set_body(
+                            "Mise à jour terminée. Relance manuelle de SnowMaster."
+                        )
+                        self.lbl_progress.configure(text="")
                         reschedule = False
-                        self.root.destroy()
                         return
                     except Exception as e:
                         try:
@@ -471,11 +579,10 @@ class UpdaterApp:
                         except Exception:
                             pass
                         self._set_body(
-                            "La mise à jour n'a pas pu être finalisée.\n\n" + str(e)
+                            f"La mise à jour n'a pas pu être finalisée ({e})."
                         )
                         self.lbl_progress.configure(text="")
-                        self.btn_install.state(["!disabled"])
-                        self.btn_close.state(["!disabled"])
+                        self.btn_install.set_enabled(True)
                         reschedule = False
                         return
                 elif kind == "error":
@@ -488,9 +595,8 @@ class UpdaterApp:
                     except Exception:
                         pass
                     self.lbl_progress.configure(text="")
-                    self._set_body("La mise à jour a échoué.\n\n" + str(a))
-                    self.btn_install.state(["!disabled"])
-                    self.btn_close.state(["!disabled"])
+                    self._set_body(f"La mise à jour a échoué ({a}).")
+                    self.btn_install.set_enabled(True)
                     reschedule = False
                     return
         finally:

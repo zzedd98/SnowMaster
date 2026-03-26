@@ -40,19 +40,19 @@ jobs:
           python -m pip install -U pip
           pip install pyinstaller "flask>=3.0" "PySide6>=6.6" pywin32 psutil "playwright>=1.40"
 
-      - name: Write build_id.txt
+      - name: Write version.txt
         shell: pwsh
         run: |
           $id = "${{ github.run_id }}-${{ github.sha }}"
           $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-          [System.IO.File]::WriteAllText("$pwd/build_id.txt", $id.Trim(), $utf8NoBom)
+          [System.IO.File]::WriteAllText("$pwd/version.txt", $id.Trim(), $utf8NoBom)
 
       - name: Build SnowMaster.exe
         run: >
           pyinstaller --noconfirm --onefile --windowed
           --icon "images/master.ico"
           --uac-admin
-          --add-data "build_id.txt;."
+          --add-data "version.txt;."
           --name SnowMaster
           "SnowMaster.py"
 
@@ -65,7 +65,7 @@ jobs:
       - name: Write update-manifest.json
         shell: pwsh
         run: |
-          $bid = (Get-Content -Path "build_id.txt" -Raw).Trim()
+          $bid = (Get-Content -Path "version.txt" -Raw).Trim()
           $repo = "${{ github.repository }}"
           $downloadUrl = "https://github.com/$repo/releases/latest/download/SnowMaster.exe"
           $obj = [ordered]@{ build_id = $bid; download_url = $downloadUrl }

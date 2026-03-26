@@ -6,6 +6,6 @@ configs/
 *.exe
 *.log
 
-# Généré en CI ou en local pour PyInstaller (ne pas versionner)
-build_id.txt
+# Généré localement au runtime (version installée)
+version.txt
 

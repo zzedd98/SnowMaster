@@ -2935,7 +2935,7 @@ else:
     APP_ALERT_TAG = "SNOWMASTER"
 
 
-# Identifiant de build : généré automatiquement en CI dans build_id.txt (PyInstaller --add-data).
+# Identifiant de build : généré automatiquement en CI dans version.txt (PyInstaller --add-data).
 # Format typique : « run_id GitHub » + « SHA du commit » — pas d'édition manuelle.
 def _load_embedded_build_id(fallback: str = "dev-local") -> str:
     roots = []
@@ -2947,19 +2947,40 @@ def _load_embedded_build_id(fallback: str = "dev-local") -> str:
     else:
         roots.append(os.path.dirname(os.path.abspath(__file__)))
     for root in roots:
-        p = os.path.join(root, "build_id.txt")
-        if os.path.isfile(p):
-            try:
-                with open(p, encoding="utf-8") as f:
-                    line = (f.readline() or "").strip()
-                if line:
-                    return line
-            except Exception:
-                pass
+        for fname in ("version.txt", "build_id.txt"):
+            p = os.path.join(root, fname)
+            if os.path.isfile(p):
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        line = (f.readline() or "").strip()
+                    if line:
+                        return line
+                except Exception:
+                    pass
     return fallback
 
 
+def _derive_local_build_id_from_git() -> str:
+    """Fallback local: utilise le commit git courant quand version.txt est absent/invalide."""
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=base,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        sha = (out or "").strip()
+        if sha:
+            return f"dev-{sha}"
+    except Exception:
+        pass
+    return "dev-local"
+
+
 APP_BUILD_ID = _load_embedded_build_id("dev-local")
+if APP_BUILD_ID in ("", "dev-local") and not getattr(sys, "frozen", False):
+    APP_BUILD_ID = _derive_local_build_id_from_git()
 # Compat affichage / User-Agent (même valeur que le build CI).
 APP_VERSION = APP_BUILD_ID
 
@@ -2987,14 +3008,16 @@ def _effective_update_manifest_url() -> str:
     return ""
 
 
-def _sync_build_id_sidecar_for_updater() -> None:
-    """Écrit build_id.txt à côté de l'exe pour SnowMasterUpdater (lancement autonome)."""
-    if not getattr(sys, "frozen", False):
-        return
+def _sync_local_version_txt() -> None:
+    """Écrit version.txt localement pour que l'updater puisse lire la version installée."""
     try:
-        p = os.path.join(os.path.dirname(sys.executable), "build_id.txt")
+        if getattr(sys, "frozen", False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        p = os.path.join(base_dir, "version.txt")
         with open(p, "w", encoding="utf-8") as f:
-            f.write((APP_BUILD_ID or "").strip())
+            f.write((APP_BUILD_ID or "dev-local").strip() + "\n")
     except Exception:
         pass
 
@@ -11939,8 +11962,7 @@ def maybe_check_for_update_and_run_updater(parent_widget=None) -> bool:
 # ======================== MAIN ============================
 def main():
     load_paths()
-    if getattr(sys, "frozen", False):
-        _sync_build_id_sidecar_for_updater()
+    _sync_local_version_txt()
 
     # start flask server in a background thread
     threading.Thread(target=run_server, daemon=True).start()
