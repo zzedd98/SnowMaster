@@ -2988,6 +2988,18 @@ def _effective_update_manifest_url() -> str:
     return ""
 
 
+def _sync_build_id_sidecar_for_updater() -> None:
+    """Écrit build_id.txt à côté de l'exe pour BotMasterUpdater (vérification en lancement autonome)."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        p = os.path.join(os.path.dirname(sys.executable), "build_id.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write((APP_BUILD_ID or "").strip())
+    except Exception:
+        pass
+
+
 # Discord / webhooks
 DISCORD_ALERT_SEARCH_TOKEN = f"ALERTE {APP_ALERT_TAG}"
 DISCORD_ALERT_SYSTEM_FOOTER = f"{APP_DISPLAY_NAME} Alert System"
@@ -11743,6 +11755,8 @@ def maybe_check_for_update_and_run_updater(parent_widget=None) -> bool:
     if not manifest_url:
         return True
 
+    _sync_build_id_sidecar_for_updater()
+
     try:
         req = urllib.request.Request(
             manifest_url,
@@ -11765,21 +11779,22 @@ def maybe_check_for_update_and_run_updater(parent_widget=None) -> bool:
     if remote_build_id == local_build_id:
         return True
 
-    # Demander à l'utilisateur s'il veut mettre à jour maintenant.
-    msg = (
-        f"Une nouvelle version de {APP_DISPLAY_NAME} est disponible.\n\n"
+    # Popup : ouvrir l'assistant graphique (BotMasterUpdater) pour confirmer et télécharger.
+    box = QMessageBox(parent_widget)
+    box.setIcon(QMessageBox.Information)
+    box.setWindowTitle(f"Mise à jour — {APP_DISPLAY_NAME}")
+    box.setText(f"Une mise à jour est disponible pour {APP_DISPLAY_NAME}.")
+    box.setInformativeText(
         f"Build installé : {local_build_id}\n"
         f"Build publié : {remote_build_id}\n\n"
-        "Voulez-vous télécharger et installer cette mise à jour maintenant ?"
+        "Cliquez sur « Mettre à jour » pour ouvrir l'assistant de mise à jour. "
+        "Vous pourrez ensuite lancer le téléchargement depuis cette fenêtre."
     )
-    box = QMessageBox(parent_widget)
-    box.setIcon(QMessageBox.Question)
-    box.setWindowTitle(f"Mise à jour {APP_DISPLAY_NAME}")
-    box.setText(msg)
-    box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-    box.setDefaultButton(QMessageBox.Yes)
-    choice = box.exec()
-    if choice != QMessageBox.Yes:
+    btn_update = box.addButton("Mettre à jour", QMessageBox.AcceptRole)
+    box.addButton("Plus tard", QMessageBox.RejectRole)
+    box.setDefaultButton(btn_update)
+    box.exec()
+    if box.clickedButton() != btn_update:
         return True
 
     exe_dir = os.path.dirname(sys.executable)
@@ -11799,8 +11814,14 @@ def maybe_check_for_update_and_run_updater(parent_widget=None) -> bool:
             sys.executable,
             "--download-url",
             download_url,
-            "--version",
+            "--manifest-url",
+            manifest_url,
+            "--local-build-id",
+            local_build_id,
+            "--remote-build-id",
             remote_build_id,
+            "--app-display-name",
+            APP_DISPLAY_NAME,
         ]
         subprocess.Popen(args, cwd=exe_dir)
     except Exception as e:
