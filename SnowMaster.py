@@ -967,13 +967,9 @@ def click_connexion_button(
                 return True
             else:
                 print("[WARN] BM_CLICK sans effet, tentative WM_COMMAND(BN_CLICKED)")
-                try:
-                    parent = win32gui.GetParent(btn) or hwnd
-                except Exception:
-                    parent = hwnd
-                if _send_bn_clicked_to_parent(parent, btn):
+                if _send_bn_clicked_to_parent(btn):
                     print(
-                        f"[EARLY CLICK] WM_COMMAND(BN_CLICKED) parent={parent} child={btn}"
+                        f"[EARLY CLICK] WM_COMMAND vers parent du bouton child={btn}"
                     )
                     return True
     except Exception as e:
@@ -1049,6 +1045,73 @@ def _bm_click(hwnd_button: int) -> bool:
         return False
 
 
+def _find_best_winforms_button_by_hint_substrings(
+    hwnd_parent: int,
+    hints: tuple[str, ...],
+) -> int | None:
+    """Meilleur bouton WinForms : score = longueur de la plus longue sous-chaîne dans le caption."""
+    prepared = []
+    for h in hints:
+        s = (h or "").strip().lower()
+        if s:
+            prepared.append(s)
+    if not prepared:
+        return None
+    prepared.sort(key=len, reverse=True)
+    best_hwnd = None
+    best_score = 0
+    for hwnd in _iter_children_recursive(hwnd_parent):
+        cls = _safe_get_class(hwnd)
+        if not cls.startswith("WindowsForms10.BUTTON"):
+            continue
+        txt = _safe_get_text(hwnd).strip().lower()
+        if not txt:
+            continue
+        score = 0
+        for hint in prepared:
+            if hint in txt:
+                score = max(score, len(hint))
+        if score > best_score:
+            best_score = score
+            best_hwnd = hwnd
+    return best_hwnd
+
+
+def click_ankabot_open_gestionnaire_toolbar_bg(main_hwnd: int) -> bool:
+    """
+    AnkaBot : ouvrir le gestionnaire de comptes via libellé WinForms (sans coordonnées).
+    En complément du clic relatif (background_click_robust_by_relative).
+    """
+    hints = (
+        "gestionnaire de comptes",
+        "gestionnaire de compte",
+        "gestionnaire",
+        "mes comptes",
+        "comptes",
+        "accounts",
+        "account manager",
+    )
+    btn = _find_best_winforms_button_by_hint_substrings(main_hwnd, hints)
+    if not btn:
+        print("[ANKA-GEST] aucun bouton WinForms candidat (hints gestionnaire/comptes)")
+        return False
+    try:
+        print(
+            "[ANKA-GEST] candidat hwnd=0x%08X text=%r"
+            % (btn, _safe_get_text(btn))
+        )
+    except Exception:
+        pass
+    if _bm_click(btn):
+        print("[ANKA-GEST] BM_CLICK OK")
+        return True
+    if _send_bn_clicked_to_parent(btn):
+        print("[ANKA-GEST] WM_COMMAND fallback OK")
+        return True
+    print("[ANKA-GEST] échec BM_CLICK et WM_COMMAND")
+    return False
+
+
 # def _send_bn_clicked_to_parent(parent_hwnd: int, child_hwnd: int) -> bool:
 #     """
 #     Simule le 'click' d'un bouton via le message parent WM_COMMAND/BN_CLICKED.
@@ -1090,11 +1153,17 @@ def background_command_click_by_relative(
         H = max(1, b - t)
         x = int(max(0, min(1, rx)) * W) + int(dx)
         y = int(max(0, min(1, ry)) * H) + int(dy)
-        child = _deep_child_from_client_point(parent_hwnd, x, y)
-        if not child or not win32gui.IsWindow(child):
-            print("[BG-CMD] aucun child sous le point")
-            return False
-        return send_command_to_top_by_child(child)
+        CWP_ALL = 0x0001 | 0x0002 | 0x0004
+        cwps = [CWP_ALL]
+        if APP_VARIANT == "ankabot":
+            cwps.append(0x0001)
+        for fl in cwps:
+            child = _deep_child_from_client_point(parent_hwnd, x, y, fl)
+            if child and win32gui.IsWindow(child):
+                if send_command_to_top_by_child(child):
+                    return True
+        print("[BG-CMD] aucun child sous le point")
+        return False
     except Exception as e:
         print(f"[BG-CMD] error: {e}")
         return False
@@ -1102,19 +1171,22 @@ def background_command_click_by_relative(
 
 # --- retrouver le deep child sous un point CLIENT du parent ---
 def _deep_child_from_client_point(
-    parent_hwnd: int, x_client: int, y_client: int
+    parent_hwnd: int,
+    x_client: int,
+    y_client: int,
+    cwp_flags: int | None = None,
 ) -> int:
     CWP_SKIPINVISIBLE = 0x0001
     CWP_SKIPDISABLED = 0x0002
     CWP_SKIPTRANSPARENT = 0x0004
+    if cwp_flags is None:
+        cwp_flags = CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT
     pt = (x_client, y_client)
     h = parent_hwnd
     last = h
     while True:
         try:
-            child = win32gui.ChildWindowFromPointEx(
-                h, pt, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT
-            )
+            child = win32gui.ChildWindowFromPointEx(h, pt, cwp_flags)
         except Exception:
             child = 0
         if not child or child == h:
@@ -1660,28 +1732,6 @@ def _client_to_screen(hwnd: int, x: int, y: int):
     _user32.ClientToScreen(int(hwnd), ctypes.byref(pt))
     return pt.x, pt.y
 
-
-def _deep_child_from_client_point(parent_hwnd: int, x: int, y: int) -> int:
-    CWP = 0x0001 | 0x0002 | 0x0004  # SKIPINVISIBLE|SKIPDISABLED|SKIPTRANSPARENT
-    h = parent_hwnd
-    last = h
-    pt = (x, y)
-    while True:
-        try:
-            ch = win32gui.ChildWindowFromPointEx(h, pt, CWP)
-        except Exception:
-            ch = 0
-        if not ch or ch == h:
-            return last
-        try:
-            pt = win32gui.MapWindowPoints(h, ch, pt)
-        except AttributeError:
-            xs, ys = _client_to_screen(h, pt[0], pt[1])
-            pt = win32gui.ScreenToClient(ch, (xs, ys))
-        last = ch
-        h = ch
-
-
 ############### TEMPORAIRE ###############
 
 
@@ -1737,6 +1787,9 @@ def background_click_robust_by_relative(
       - sinon WM_COMMAND(BN_CLICKED) vers top-level
       - sinon WM_COMMAND(neutral) vers top-level
       - retry sur PARENT immédiat (certaines app gèrent au niveau parent)
+    Mode AnkaBot : second passage hit-test (CWP_SKIPINVISIBLE seul) si la fenêtre
+    n’est pas active — certains contrôles passent en « disabled »/transparent pour
+    ChildWindowFromPointEx et ne sont vus qu’avec un filtre assoupli.
     """
     try:
         l, t, r, b = win32gui.GetClientRect(parent_hwnd)
@@ -1745,50 +1798,54 @@ def background_click_robust_by_relative(
         x = int(max(0, min(1, rx)) * W) + int(dx)
         y = int(max(0, min(1, ry)) * H) + int(dy)
 
-        child = _deep_child_from_client_point(parent_hwnd, x, y)
-        if not child or not win32gui.IsWindow(child):
-            print("[BG] aucun child sous le point")
-            return False
+        CWP_ALL = 0x0001 | 0x0002 | 0x0004
+        cwps = [CWP_ALL]
+        if APP_VARIANT == "ankabot":
+            cwps.append(0x0001)
 
-        cls = _safe_class(child)
-        txt = _safe_text(child)
-        try:
-            cid = win32gui.GetDlgCtrlID(child) or 0
-        except:
-            cid = 0
-        print(f"[BG] hit child=0x{child:08X} class='{cls}' text='{txt}' id={cid}")
+        for fl in cwps:
+            child = _deep_child_from_client_point(parent_hwnd, x, y, fl)
+            if not child or not win32gui.IsWindow(child):
+                continue
 
-        top = win32gui.GetAncestor(child, win32con.GA_ROOT) or parent_hwnd
-        par = win32gui.GetParent(child) or 0
+            cls = _safe_class(child)
+            txt = _safe_text(child)
+            try:
+                cid = win32gui.GetDlgCtrlID(child) or 0
+            except:
+                cid = 0
+            print(f"[BG] hit child=0x{child:08X} class='{cls}' text='{txt}' id={cid} cwp={fl}")
 
-        # 1) vrai bouton ?
-        if cls.startswith("WindowsForms10.BUTTON") or cls == "Button":
-            if _try_bm_click(child):
-                print("[BG] BM_CLICK sent")
-                return True
-            # si BM_CLICK silence, on tente BN_CLICKED
+            top = win32gui.GetAncestor(child, win32con.GA_ROOT) or parent_hwnd
+            par = win32gui.GetParent(child) or 0
+
+            # 1) vrai bouton ?
+            if cls.startswith("WindowsForms10.BUTTON") or cls == "Button":
+                if _try_bm_click(child):
+                    print("[BG] BM_CLICK sent")
+                    return True
+                if _try_wm_command_bn_clicked(top, child):
+                    print("[BG] WM_COMMAND(BN_CLICKED) to top OK")
+                    return True
+                if par and _try_wm_command_bn_clicked(par, child):
+                    print("[BG] WM_COMMAND(BN_CLICKED) to parent OK")
+                    return True
+
+            # 2) pas un bouton → owner-draw/menu/panel : on force BN_CLICKED via ID
             if _try_wm_command_bn_clicked(top, child):
                 print("[BG] WM_COMMAND(BN_CLICKED) to top OK")
+                return True
+            if _try_wm_command_neutral(top, child):
+                print("[BG] WM_COMMAND(neutral) to top OK")
                 return True
             if par and _try_wm_command_bn_clicked(par, child):
                 print("[BG] WM_COMMAND(BN_CLICKED) to parent OK")
                 return True
+            if par and _try_wm_command_neutral(par, child):
+                print("[BG] WM_COMMAND(neutral) to parent OK")
+                return True
 
-        # 2) pas un bouton → owner-draw/menu/panel : on force BN_CLICKED via ID
-        if _try_wm_command_bn_clicked(top, child):
-            print("[BG] WM_COMMAND(BN_CLICKED) to top OK")
-            return True
-        if _try_wm_command_neutral(top, child):
-            print("[BG] WM_COMMAND(neutral) to top OK")
-            return True
-        if par and _try_wm_command_bn_clicked(par, child):
-            print("[BG] WM_COMMAND(BN_CLICKED) to parent OK")
-            return True
-        if par and _try_wm_command_neutral(par, child):
-            print("[BG] WM_COMMAND(neutral) to parent OK")
-            return True
-
-        print("[BG] all strategies failed")
+        print("[BG] aucun child sous le point / hit-test épuisé")
         return False
     except Exception as e:
         print(f"[BG] error: {e}")
@@ -2541,6 +2598,27 @@ def bring_to_front(hwnd):
             )
         except Exception:
             pass
+
+
+def restore_visible_without_foreground(hwnd):
+    """
+    Réaffiche une fenêtre si besoin sans activer ni voler le focus global.
+    Utilisé pour le lancement AnkaBot : les clics passent par BM_CLICK / WM_COMMAND.
+    SW_SHOWNOACTIVATE restaure aussi une fenêtre minimisée sans foreground.
+    """
+    try:
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return
+        no_act = getattr(win32con, "SW_SHOWNOACTIVATE", 4)
+        win32gui.ShowWindow(hwnd, no_act)
+    except Exception:
+        try:
+            show_na = getattr(win32con, "SW_SHOWNA", 8)
+            win32gui.ShowWindow(hwnd, show_na)
+        except Exception:
+            pass
+
+
 
 
 def get_leftmost_monitor():
@@ -3972,9 +4050,10 @@ def apply_dark_blue_style(app: QApplication):
             border: 2px solid rgba(74,222,128,0.82);          /* vert menthe clair légèrement adouci */
             background-color: rgba(22,163,74,0.13);           /* halo vert très léger */
         }
+        /* Sélection carte verte : lueur blanchâtre (texte : QLabel#CardTitle inchangé) */
         QWidget#InstanceCard[state="green"][selected="true"] {
-            border: 2px solid rgba(110,231,183,0.92);
-            background-color: rgba(16,185,129,0.21);
+            border: 2px solid rgba(255,255,255,0.78);
+            background-color: rgba(236,253,245,0.16);
         }
 
         QWidget#InstanceCard[state="yellow"] {
@@ -6744,6 +6823,35 @@ class SnowMasterGUI(QWidget):
         except Exception:
             return "Last Update : -" if with_label else "-"
 
+    @staticmethod
+    def _effective_last_update_ts(inst: InstanceState) -> float:
+        """
+        Timestamp pour « Last Update » (carte + panneau détails) :
+        avec sous-contrôleurs → plus ancienne ts parmi eux (celui le plus en retard) ;
+        sinon heartbeat principal de l'instance.
+        """
+        try:
+            sm = getattr(inst, "sub_map", None) or {}
+            if not sm:
+                return float(getattr(inst, "last_heartbeat", 0) or 0)
+            subs_ts = []
+            for _, info in sm.items():
+                try:
+                    ts = (
+                        float(info.get("ts"))
+                        if isinstance(info, dict) and info.get("ts") is not None
+                        else float(info)
+                    )
+                    if ts > 0:
+                        subs_ts.append(ts)
+                except Exception:
+                    continue
+            if subs_ts:
+                return float(min(subs_ts))
+            return float(getattr(inst, "last_heartbeat", 0) or 0)
+        except Exception:
+            return float(getattr(inst, "last_heartbeat", 0) or 0)
+
     def _age_to_red(self, age_s: float, stopped: bool) -> bool:
         if stopped:
             return False
@@ -7255,7 +7363,9 @@ class SnowMasterGUI(QWidget):
         if card:
             card.set_title(inst.title)
             color = self.instance_color(inst)
-            extra = self.fmt_last_update(inst.last_heartbeat, with_label=True)
+            extra = self.fmt_last_update(
+                self._effective_last_update_ts(inst), with_label=True
+            )
             card.update_status(color, extra)
             self._update_card_buttons_state(title, inst, card)
 
@@ -7430,7 +7540,9 @@ class SnowMasterGUI(QWidget):
 
         # --- Last Update ---
         self.lbl_status.setText(
-            self.fmt_last_update(inst.last_heartbeat, with_label=False)
+            self.fmt_last_update(
+                self._effective_last_update_ts(inst), with_label=False
+            )
         )
 
         # --- État de l’instance ---
@@ -10835,8 +10947,12 @@ def run_snowbot_flow(
         acquire_mouse_lock(owner=title, ttl=180.0)
         acquired = True
 
-        # Mettre la fenêtre au premier plan
-        bring_to_front(main_hwnd)
+        # AnkaBot : ne pas appeler SetForegroundWindow (clics 100 % messages Win32).
+        # SnowBot : comportement historique (fenêtre à gauche + premier plan pour fiabilité).
+        if APP_VARIANT == "ankabot":
+            restore_visible_without_foreground(main_hwnd)
+        else:
+            bring_to_front(main_hwnd)
         time.sleep(0.35)
 
         # Renommer la fenêtre avec le titre de l'instance
@@ -10845,9 +10961,18 @@ def run_snowbot_flow(
         except Exception:
             pass  # Ignorer les erreurs de renommage
 
-        ok = background_click_robust_by_relative(
-            main_hwnd, rx=0.072, ry=0.946, dx=+14, dy=0
-        )
+        ok = False
+        _attempts = 3 if APP_VARIANT == "ankabot" else 1
+        for _attempt in range(_attempts):
+            if APP_VARIANT == "ankabot":
+                ok = click_ankabot_open_gestionnaire_toolbar_bg(main_hwnd)
+            if not ok:
+                ok = background_click_robust_by_relative(
+                    main_hwnd, rx=0.072, ry=0.946, dx=+14, dy=0
+                )
+            if ok:
+                break
+            time.sleep(0.25)
         # print("BG robust click:", ok)
 
         # Laisse un petit délai, puis re-scanne la boîte :
