@@ -5,6 +5,7 @@ configs/
 # Binaires et journaux
 *.exe
 *.log
+*.rar
 
 # Généré localement au runtime (version installée)
 version.txt
