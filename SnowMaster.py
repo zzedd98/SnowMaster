@@ -36,6 +36,7 @@ if getattr(sys, "frozen", False):
 import threading
 import time
 import json
+import unicodedata
 import tempfile
 import subprocess
 import ctypes
@@ -130,6 +131,7 @@ from PySide6.QtCore import (
     QItemSelectionModel,
     QCoreApplication,
     QMetaObject,
+    QDateTime,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -173,6 +175,14 @@ from PySide6.QtGui import QIntValidator
 
 from PySide6.QtCore import QPropertyAnimation, QEasingCurve
 from PySide6.QtWidgets import QGraphicsOpacityEffect
+
+from PySide6.QtCharts import (
+    QChart,
+    QChartView,
+    QLineSeries,
+    QDateTimeAxis,
+    QValueAxis,
+)
 
 
 # system libs used by runner
@@ -349,6 +359,25 @@ SERVER_KAMAS_DISPLAY_ORDER = [
     "Tylezia",
     "Ombre",
 ]
+
+# Schéma holdings.json — historique (classification serveurs figée produit)
+HOLDINGS_SCHEMA_VERSION = 2
+KAMAS_HISTORY_KEY = "kamas_history"
+MONO_SERVERS_HISTORY_UI = (
+    "Mikhal",
+    "Kourial",
+    "Dakal",
+    "Draconiros",
+)
+MULTI_SERVERS_HISTORY_UI = (
+    "Brial",
+    "Rafal",
+    "Salar",
+    "Hell Mina",
+    "Imagiro",
+    "Orukam",
+    "Tylezia",
+)
 
 
 def iter_servers_in_display_order(keys_iterable):
@@ -2261,12 +2290,13 @@ def _persist_holdings_to_disk():
 
     with _revenue_lock:
         out = {
-            "schema": 1,
+            "schema": HOLDINGS_SCHEMA_VERSION,
             "last_player_update_ts": _revenue_data.get("last_player_update_ts", 0),
             "holdings": {
                 "TS": dict((_revenue_data.get("holdings") or {}).get("TS", {})),
                 "M": dict((_revenue_data.get("holdings") or {}).get("M", {})),
             },
+            KAMAS_HISTORY_KEY: list(_revenue_data.get(KAMAS_HISTORY_KEY) or []),
         }
 
     tmp_fd, tmp_path = tempfile.mkstemp(prefix="holdings_", suffix=".json", dir=dirpath)
@@ -2290,6 +2320,9 @@ def _load_holdings_from_disk():
             data = json.load(f)
         holds_in = data.get("holdings", {}) or {}
         last_ts = data.get("last_player_update_ts", 0)
+        hist_in = data.get(KAMAS_HISTORY_KEY)
+        if not isinstance(hist_in, list):
+            hist_in = []
 
         ts_map = holds_in.get("TS", {}) or {}
         m_map = holds_in.get("M", {}) or holds_in.get("Metier", {}) or {}
@@ -2310,6 +2343,28 @@ def _load_holdings_from_disk():
                     pass
             if last_ts:
                 _revenue_data["last_player_update_ts"] = last_ts
+            cleaned = []
+            for item in hist_in:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    entry = {
+                        "ts": float(item.get("ts", 0)),
+                        "schema": int(item.get("schema", 1)),
+                        "kind": str(item.get("kind", "TS")).strip().upper()
+                        if item.get("kind") is not None
+                        else "TS",
+                        "server": str(item.get("server", "")),
+                        "kamas_m": int(item.get("kamas_m", 0)),
+                        "eur": float(item.get("eur", 0)),
+                        "price_eur_per_m": float(item.get("price_eur_per_m", 0)),
+                    }
+                except Exception:
+                    continue
+                if entry["kind"] not in ("TS", "M"):
+                    entry["kind"] = "TS"
+                cleaned.append(entry)
+            _revenue_data[KAMAS_HISTORY_KEY] = cleaned
         return True
     except Exception:
         return False
@@ -2327,6 +2382,90 @@ def _holdings_snapshot():
             },
             "last_player_update_ts": _revenue_data.get("last_player_update_ts", 0),
         }
+
+
+def _append_kamas_history_event(kind: str, server: str, kamas_m: int):
+    """
+    Enregistre un point d'historique (valeur absolue de kamas après MAJ + € figés au moment T).
+    À appeler uniquement hors de tout bloc `with _revenue_lock:` (sinon deadlock si réentrance).
+    """
+    try:
+        km = int(kamas_m)
+    except Exception:
+        km = 0
+    k = (kind or "").strip().upper()
+    if k not in ("TS", "M"):
+        k = "TS"
+    with _revenue_lock:
+        servers_map = _revenue_data.get("servers") or {}
+        canon = (server or "").strip()
+        found = None
+        for s in servers_map.keys():
+            if s.strip().lower() == canon.lower():
+                found = s
+                break
+        if found is not None:
+            canon = found
+        try:
+            price = float(servers_map.get(canon, 0.0))
+        except Exception:
+            price = 0.0
+        eur = float(km) * price
+        hist = _revenue_data.setdefault(KAMAS_HISTORY_KEY, [])
+        hist.append(
+            {
+                "ts": time.time(),
+                "schema": 1,
+                "kind": k,
+                "server": canon,
+                "kamas_m": km,
+                "eur": round(eur, 6),
+                "price_eur_per_m": round(price, 6),
+            }
+        )
+
+
+def _server_name_match_key(s: str) -> str:
+    """
+    Clé de comparaison pour les noms de serveurs (NFKC, sans catégories invisibles
+    type Cf/Mn/Me) — évite que « Mikhal » et « Mikhal »+ZWSP ne fassent pas 2 entrées.
+    """
+    t = unicodedata.normalize("NFKC", (s or "").strip())
+    t = "".join(c for c in t if unicodedata.category(c) not in ("Cf", "Mn", "Me"))
+    return t.lower()
+
+
+def _match_existing_server_key(server: str, existing_keys) -> Optional[str]:
+    """Retourne la clé exacte du dict si une entrée correspond au nom logique."""
+    want = _server_name_match_key(server)
+    if not want:
+        return None
+    for k in existing_keys:
+        if _server_name_match_key(k) == want:
+            return k
+    return None
+
+
+def _holdings_get_int_for_server(hold_map: dict, server: str) -> int:
+    """Lit holdings[server] en tolérant une différence de clé (unicode / casse)."""
+    if not isinstance(hold_map, dict):
+        return 0
+    k = _match_existing_server_key(server, hold_map.keys())
+    if k is None:
+        return 0
+    try:
+        return int(hold_map[k])
+    except Exception:
+        return 0
+
+
+def _holdings_resolved_write_key(hold_map: dict, server: str) -> str:
+    """Clé à utiliser en écriture : réutilise une entrée existante si elle matche."""
+    s = (server or "").strip()
+    if not isinstance(hold_map, dict):
+        return s
+    k = _match_existing_server_key(s, hold_map.keys())
+    return k if k is not None else s
 
 
 def _normalize_holdings_payload(payload: dict) -> Dict[str, Dict[str, int]]:
@@ -2364,6 +2503,7 @@ def _normalize_holdings_payload(payload: dict) -> Dict[str, Dict[str, int]]:
 def _apply_holdings_payload(payload: dict, last_ts=None) -> bool:
     normalized = _normalize_holdings_payload(payload)
     changed = False
+    pending_history = []
 
     with _revenue_lock:
         holds = _revenue_data.setdefault("holdings", {"TS": {}, "M": {}})
@@ -2372,9 +2512,19 @@ def _apply_holdings_payload(payload: dict, last_ts=None) -> bool:
                 continue
             kind_map = holds.setdefault(kind, {})
             for server, value in normalized[kind].items():
-                if kind_map.get(server) != value:
-                    kind_map[server] = value
+                try:
+                    new_val = int(value)
+                except Exception:
+                    continue
+                old_raw = kind_map.get(server)
+                try:
+                    old_int = int(old_raw) if old_raw is not None else None
+                except Exception:
+                    old_int = None
+                if old_int != new_val:
+                    kind_map[server] = new_val
                     changed = True
+                    pending_history.append((kind, server, new_val))
         if last_ts is not None:
             try:
                 ts_val = float(last_ts)
@@ -2383,6 +2533,12 @@ def _apply_holdings_payload(payload: dict, last_ts=None) -> bool:
                     changed = True
             except Exception:
                 pass
+
+    for hk, srv, nv in pending_history:
+        try:
+            _append_kamas_history_event(hk, srv, nv)
+        except Exception:
+            pass
 
     if changed:
         try:
@@ -2904,6 +3060,7 @@ _state_lock = threading.Lock()
 _revenue_data = {
     "servers": {},  # prix unique du kama par serveur
     "holdings": {"TS": {}, "M": {}},  # millions de kamas
+    KAMAS_HISTORY_KEY: [],  # événements {ts, kind, server, kamas_m, eur, price_eur_per_m}
 }
 _revenue_lock = threading.Lock()
 
@@ -3664,8 +3821,10 @@ def api_bank_update():
         return jsonify({"err": "cannot detect server from alias"}), 400
     server = " ".join(cands)
 
-    # recharge les holdings existants depuis le disque pour merger en temps réel
-    _load_holdings_from_disk()
+    # Ne PAS appeler _load_holdings_from_disk() ici : la lecture du fichier peut être
+    # plus ancienne qu'une écriture UI pas encore flushée, et réécraser la mémoire
+    # (ex. TS Mikhal repassait à 0). Le store en mémoire est la source de vérité ;
+    # on applique la MAJ HTTP puis on persiste.
 
     # normalisation serveur (match keys existantes si possible)
     with _revenue_lock:
@@ -3681,7 +3840,29 @@ def api_bank_update():
         if kind is None:
             kind = "TS"
         holds.setdefault(kind, {})
+        try:
+            prev_raw = holds[kind].get(server_key)
+            prev_i = int(prev_raw) if prev_raw is not None else None
+        except Exception:
+            prev_i = None
+        if prev_i is not None and prev_i == kamas_val:
+            snapshot = _holdings_snapshot()
+            return jsonify(
+                {
+                    "ok": True,
+                    "unchanged": True,
+                    "server": server_key,
+                    "kind": kind,
+                    "kamas": kamas_val,
+                    **snapshot,
+                }
+            )
         holds[kind][server_key] = kamas_val
+
+    try:
+        _append_kamas_history_event(kind, server_key, kamas_val)
+    except Exception:
+        pass
 
     # persist (HORS lock)
     try:
@@ -4437,26 +4618,51 @@ class NoFocusDelegate(QStyledItemDelegate):
         super().paint(painter, option, index)
 
 
+# Boutons reset (détail revenus TS / M) — vert, compact
+# Taille du texte : modifier font-size ci-dessous (ex. 12px → 13px pour +1pt visuel)
+_REVENUE_RESET_BTN_STYLE = (
+    "QPushButton { background-color:#15803d; color:#ecfdf5; border:none; "
+    "border-radius:5px; padding:0px 5px; font-size:12px; font-weight:600; }"
+    "QPushButton:hover { background-color:#16a34a; color:#ffffff; }"
+    "QPushButton:pressed { background-color:#14532d; }"
+)
+_REVENUE_RESET_ALL_BTN_STYLE = (
+    "QPushButton { background-color:#15803d; color:#ecfdf5; border:none; "
+    "border-radius:8px; padding:4px 10px; font-size:12px; font-weight:600; }"
+    "QPushButton:hover { background-color:#16a34a; color:#ffffff; }"
+    "QPushButton:pressed { background-color:#14532d; }"
+)
+
+
 class RevenueKindRow(QWidget):
-    """Une ligne : Serveur | Kamas (M) | Valeur € — compacte, bordurée."""
+    """Une ligne : Serveur | Reset | Kamas (M) | Valeur € — compacte, bordurée."""
 
     valueChanged = Signal(str, int)  # (server, new_kamas)
 
-    def __init__(self, server: str, price_per_million: float, kamas_m: int):
+    def __init__(
+        self,
+        server: str,
+        price_per_million: float,
+        kamas_m: int,
+        display_label: Optional[str] = None,
+    ):
         super().__init__()
+        # `server` = clé dans holdings (peut différer légèrement du libellé affiché)
         self.server = server
         self.price = float(price_per_million)
+        _label = display_label if display_label is not None else server
 
         self.setObjectName("StaticCard")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setMinimumHeight(28)
+        self.setMinimumHeight(26)
 
-        # --- colonnes fixes : KAMAS (milieu) = 60px, EUROS (droite) = 110px ---
+        # --- colonnes fixes : Reset | Kamas | Euros ---
         KAMAS_COL_W = 60
         EUROS_COL_W = 110
+        RESET_COL_W = 58
 
         # widgets
-        self.lbl_server = QLabel(server)
+        self.lbl_server = QLabel(_label)
         self.lbl_server.setStyleSheet("font-weight:600;")
 
         # Champ texte numérique-only, centré, sans menu contextuel si tu veux
@@ -4480,10 +4686,10 @@ class RevenueKindRow(QWidget):
 
         # layout
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setContentsMargins(8, 2, 8, 2)
         lay.setSpacing(8)
 
-        # Colonne Kamas AU MILIEU : conteneur largeur fixe, champ centré dedans
+        # Colonne Kamas : conteneur largeur fixe, champ centré dedans
         km_holder = QWidget()
         km_holder.setFixedWidth(KAMAS_COL_W)
         km_lay = QHBoxLayout(km_holder)
@@ -4499,10 +4705,33 @@ class RevenueKindRow(QWidget):
         eur_lay.setSpacing(0)
         eur_lay.addWidget(self.lbl_value, 1, Qt.AlignRight | Qt.AlignVCenter)
 
-        # Placement des 3 colonnes
+        self.btn_reset = QPushButton("Reset")
+        self.btn_reset.setStyleSheet(_REVENUE_RESET_BTN_STYLE)
+        self.btn_reset.setFixedWidth(RESET_COL_W)
+        # Remplir la hauteur de la ligne : sinon les clics sur la cellule vide
+        # au-dessus / en dessous du petit rectangle du bouton ne déclenchent rien.
+        self.btn_reset.setMinimumHeight(20)
+        self.btn_reset.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.btn_reset.setCursor(Qt.PointingHandCursor)
+        self.btn_reset.setToolTip("Remettre les kamas à 0 pour ce serveur")
+        self.btn_reset.clicked.connect(self._on_reset_clicked)
+        # Sinon Qt met autoDefault sur le 1er bouton du dialogue → Entrée déclenche Reset (ligne Mikhal).
+        self.btn_reset.setAutoDefault(False)
+        self.btn_reset.setDefault(False)
+        self.btn_reset.setFocusPolicy(Qt.ClickFocus)
+
+        reset_holder = QWidget()
+        reset_holder.setFixedWidth(RESET_COL_W)
+        reset_lay = QHBoxLayout(reset_holder)
+        reset_lay.setContentsMargins(0, 0, 0, 0)
+        reset_lay.setSpacing(0)
+        reset_lay.addWidget(self.btn_reset)
+
+        # Serveur | Reset | Kamas | Euros
         lay.addWidget(self.lbl_server, 1)  # s'étire
-        lay.addWidget(km_holder, 0)  # milieu fixe
-        lay.addWidget(eur_holder, 0)  # droite fixe
+        lay.addWidget(reset_holder, 0)
+        lay.addWidget(km_holder, 0)
+        lay.addWidget(eur_holder, 0)
 
     # --- helpers ---
     def _current_kamas(self) -> int:
@@ -4526,6 +4755,13 @@ class RevenueKindRow(QWidget):
         self.valueChanged.emit(self.server, v)
         # Enlève le focus visuel après validation
         self.edit_kamas.clearFocus()
+
+    def _on_reset_clicked(self):
+        if self._current_kamas() == 0:
+            return
+        self.edit_kamas.setText("0")
+        self.lbl_value.setText(self._fmt_value(0))
+        self.valueChanged.emit(self.server, 0)
 
     # Select-All à la prise de focus
     def eventFilter(self, obj, ev):
@@ -4577,7 +4813,7 @@ class RevenueKindDialog(QDialog):
     def __init__(self, parent, kind: str, servers_ref: dict, holdings: dict):
         super().__init__(parent)
         self.setWindowTitle(f"Détail {kind}")
-        self.setMinimumSize(420, 540)
+        self.setMinimumSize(500, 540)
         self.kind = kind
         self.servers_ref = servers_ref  # {"Imagiro":{"TS":..,"M":..}, ...}
         self.holdings = holdings  # {"Imagiro": 152, ...} en millions
@@ -4585,6 +4821,7 @@ class RevenueKindDialog(QDialog):
         # mêmes largeurs que dans la row
         KAMAS_COL_W = 60
         EUROS_COL_W = 110
+        RESET_COL_W = 58
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -4596,7 +4833,7 @@ class RevenueKindDialog(QDialog):
         grp_v.setContentsMargins(8, 8, 8, 8)
         grp_v.setSpacing(6)
 
-        # En-tête : Serveur | Kamas | Euros
+        # En-tête : Serveur | (vide, aligné reset) | Kamas | Euros
         header = QWidget()
         header.setObjectName("StaticCard")
         header.setAttribute(Qt.WA_StyledBackground, True)
@@ -4606,6 +4843,10 @@ class RevenueKindDialog(QDialog):
 
         lbl_srv = QLabel("Serveur")
         lbl_srv.setStyleSheet("font-weight:700;")
+
+        # Espace réservé sous les boutons Reset (pas de titre de colonne)
+        reset_head_holder = QWidget()
+        reset_head_holder.setFixedWidth(RESET_COL_W)
 
         lbl_km = QLabel("Kamas")
         lbl_km.setStyleSheet("font-weight:700;")
@@ -4628,6 +4869,7 @@ class RevenueKindDialog(QDialog):
         eur_head_lay.addWidget(lbl_eur, 1, Qt.AlignRight | Qt.AlignVCenter)
 
         h.addWidget(lbl_srv, 1)
+        h.addWidget(reset_head_holder, 0)
         h.addWidget(km_head_holder, 0)
         h.addWidget(eur_head_holder, 0)
         grp_v.addWidget(header, 0)
@@ -4652,22 +4894,37 @@ class RevenueKindDialog(QDialog):
         for srv in iter_servers_in_display_order(self.servers_ref.keys()):
             ref = self.servers_ref.get(srv)
             price = float(ref) if isinstance(ref, (int, float, str)) else 0.0
-            kamas = int(self.holdings.get(srv, 0))
+            kamas = _holdings_get_int_for_server(self.holdings, srv)
+            write_key = _holdings_resolved_write_key(self.holdings, srv)
             item = QListWidgetItem()
             item.setSizeHint(QSize(10, 30))
-            row = RevenueKindRow(srv, price, kamas)
+            row = RevenueKindRow(write_key, price, kamas, display_label=srv)
             row.valueChanged.connect(self._on_row_changed)
             self.list.addItem(item)
             self.list.setItemWidget(item, row)
-            self._rows_by_server[srv] = row
+            self._rows_by_server[write_key] = row
 
-        # Bouton fermer (NON défaut)
+        # Pied : Reset All + fermer
+        btn_reset_all = QPushButton("Reset All")
+        btn_reset_all.setStyleSheet(_REVENUE_RESET_ALL_BTN_STYLE)
+        btn_reset_all.setAutoDefault(False)
+        btn_reset_all.setDefault(False)
+        btn_reset_all.setToolTip("Remettre à 0 les kamas pour tous les serveurs")
+        btn_reset_all.setFixedHeight(30)
+        btn_reset_all.setCursor(Qt.PointingHandCursor)
+        btn_reset_all.clicked.connect(self._on_reset_all)
+
         btn_close = QPushButton("Fermer")
         btn_close.setAutoDefault(False)
         btn_close.setDefault(False)
         btn_close.clicked.connect(self.accept)
         btn_close.setFixedHeight(32)
-        root.addWidget(btn_close, 0, Qt.AlignRight)
+
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        footer.addWidget(btn_reset_all)
+        footer.addWidget(btn_close)
+        root.addLayout(footer)
 
         # Pas de focus initial sur la 1ère ligne
         self.setFocusPolicy(Qt.NoFocus)
@@ -4679,43 +4936,90 @@ class RevenueKindDialog(QDialog):
         except Exception:
             pass
 
-    def _on_row_value_changed(self, server: str, v: int):
-        """Reçoit les changements d'une ligne (RevenueKindRow). Met à jour les holdings + persiste + notifie."""
+        # Sécurité : aucun bouton ne doit être « défaut » pour Entrée (footers déjà False).
+        for _b in self.findChildren(QPushButton):
+            _b.setAutoDefault(False)
+            _b.setDefault(False)
+
+    def _on_reset_all(self):
+        """Remet à 0 les kamas pour chaque serveur (type TS ou M courant)."""
         try:
-            v = int(v)
+            if not any(
+                row._current_kamas() != 0
+                for row in self._rows_by_server.values()
+            ):
+                return
         except Exception:
-            v = 0
+            pass
+        kind_lbl = "Métier" if self.kind == "M" else "TS"
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Tout remettre à zéro")
+        dlg.setModal(True)
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(14)
+        lbl = QLabel(
+            f"Remettre à 0 les kamas de tous les serveurs pour le compte « {kind_lbl} » ?\n\n"
+            "Cette action est immédiate et enregistrée sur le disque."
+        )
+        lbl.setWordWrap(True)
+        root.addWidget(lbl)
+        row_btn = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        confirm_btn = QPushButton("Confirm")
+        cancel_btn.setStyleSheet(
+            "QPushButton { background-color: #dc2626; color: #fef2f2; border: none; "
+            "border-radius: 8px; padding: 8px 18px; font-weight: 600; min-width: 88px; }"
+            "QPushButton:hover { background-color: #ef4444; }"
+        )
+        confirm_btn.setStyleSheet(
+            "QPushButton { background-color: #15803d; color: #ecfdf5; border: none; "
+            "border-radius: 8px; padding: 8px 18px; font-weight: 600; min-width: 88px; }"
+            "QPushButton:hover { background-color: #16a34a; }"
+        )
+        for _btn in (cancel_btn, confirm_btn):
+            _btn.setAutoDefault(False)
+            _btn.setDefault(False)
+        cancel_btn.setDefault(True)
+        # Ordre fixe L→R : Cancel (gauche) … Confirm (droite)
+        row_btn.addWidget(cancel_btn)
+        row_btn.addStretch(1)
+        row_btn.addWidget(confirm_btn)
+        root.addLayout(row_btn)
+        cancel_btn.clicked.connect(dlg.reject)
+        confirm_btn.clicked.connect(dlg.accept)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
 
         changed = False
-        with _revenue_lock:
-            _revenue_data.setdefault("holdings", {"TS": {}, "Metier": {}})
-            _revenue_data["holdings"].setdefault(self.kind, {})
-            prev = _revenue_data["holdings"][self.kind].get(server)
-            if prev != v:
-                _revenue_data["holdings"][self.kind][server] = v
-                _revenue_data["last_player_update_ts"] = time.time()
+        for srv, row in self._rows_by_server.items():
+            try:
+                if row._current_kamas() == 0:
+                    continue
+                row.setKamas(0, do_flash=False)
+                self.holdings[srv] = 0
                 changed = True
-
-        if changed:
-            # 1) Sauvegarde sur disque
-            try:
-                _persist_holdings_to_disk()
+                try:
+                    _append_kamas_history_event(self.kind, srv, 0)
+                except Exception:
+                    pass
             except Exception:
-                pass
-
-            # 2) Notifie le reste de l’app (cartes TS/Métier, etc.)
-            try:
-                bus.revenue_updated.emit()
-            except Exception:
-                pass
-
-            # 3) (optionnel) petit flash local sur la ligne éditée
-            try:
-                row = self._rows_by_server.get(server)
-                if row:
-                    row.flash(800)
-            except Exception:
-                pass
+                continue
+        if not changed:
+            return
+        try:
+            with _revenue_lock:
+                _revenue_data["last_player_update_ts"] = time.time()
+        except Exception:
+            pass
+        try:
+            _persist_holdings_to_disk()
+        except Exception:
+            pass
+        try:
+            bus.revenue_updated.emit()
+        except Exception:
+            pass
 
     def _on_bus_revenue_updated(self):
         """Quand un update arrive, on recharge les holdings et on met à jour les lignes avec un flash."""
@@ -4734,7 +5038,9 @@ class RevenueKindDialog(QDialog):
         # Applique sur les lignes affichées
         for srv, row in self._rows_by_server.items():
             try:
-                new_kamas = int(holdings_kind.get(srv, 0))
+                if row.edit_kamas.hasFocus():
+                    continue
+                new_kamas = _holdings_get_int_for_server(holdings_kind, srv)
                 row.setKamas(new_kamas, do_flash=True)
             except Exception:
                 continue
@@ -4747,9 +5053,50 @@ class RevenueKindDialog(QDialog):
         return super().closeEvent(e)
 
     def _on_row_changed(self, server: str, new_kamas: int):
-        # Persiste la valeur
-        self.holdings[server] = new_kamas
-        # Notifie toute l’UI (dialog + compteur principal) qu'il faut recalculer
+        """Saisie manuelle, Reset ligne : MAJ store global + holdings.json + bus."""
+        try:
+            v = int(new_kamas)
+        except Exception:
+            v = 0
+        wkey = None
+        prev_v = None
+        try:
+            with _revenue_lock:
+                _revenue_data.setdefault("holdings", {"TS": {}, "M": {}})
+                hm = _revenue_data["holdings"].setdefault(self.kind, {})
+                wkey = _holdings_resolved_write_key(hm, server)
+                prev_v = hm.get(wkey)
+                try:
+                    prev_int = int(prev_v) if prev_v is not None else None
+                except Exception:
+                    prev_int = None
+                # Évite persist + bus si Qt envoie editingFinished en double (v == déjà stocké)
+                if prev_int is not None and prev_int == v:
+                    return
+                hm[wkey] = v
+                _revenue_data["last_player_update_ts"] = time.time()
+        except Exception:
+            try:
+                wkey = _holdings_resolved_write_key(self.holdings, server)
+                prev_v = self.holdings.get(wkey)
+                try:
+                    prev_int = int(prev_v) if prev_v is not None else None
+                except Exception:
+                    prev_int = None
+                if prev_int is not None and prev_int == v:
+                    return
+                self.holdings[wkey] = v
+            except Exception:
+                return
+        if wkey is not None:
+            try:
+                _append_kamas_history_event(self.kind, wkey, v)
+            except Exception:
+                pass
+        try:
+            _persist_holdings_to_disk()
+        except Exception:
+            pass
         try:
             bus.revenue_updated.emit()
         except Exception:
@@ -4772,11 +5119,384 @@ class RevenueKindDialog(QDialog):
         super().mousePressEvent(e)
 
 
+class KamasHistoryChartPanel(QWidget):
+    """Graphique d'historique kamas / € (filtres, période, courbes + somme)."""
+
+    _SERIES_COLORS = [
+        "#38bdf8",
+        "#a78bfa",
+        "#f472b6",
+        "#34d399",
+        "#fbbf24",
+        "#fb923c",
+        "#2dd4bf",
+        "#e879f9",
+        "#4ade80",
+        "#f87171",
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._period_secs = 86400  # 24 h par défaut
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(6)
+
+        period_row = QHBoxLayout()
+        period_row.addWidget(QLabel("Période :"))
+        self._btn_24h = QPushButton("24 h")
+        self._btn_7j = QPushButton("7 j")
+        self._btn_30j = QPushButton("30 j")
+        for b in (self._btn_24h, self._btn_7j, self._btn_30j):
+            b.setCheckable(True)
+            b.setAutoDefault(False)
+            b.setDefault(False)
+            b.setFixedHeight(26)
+            b.setCursor(Qt.PointingHandCursor)
+        self._btn_24h.setChecked(True)
+        self._btn_24h.clicked.connect(lambda: self._set_period(86400))
+        self._btn_7j.clicked.connect(lambda: self._set_period(7 * 86400))
+        self._btn_30j.clicked.connect(lambda: self._set_period(30 * 86400))
+        period_row.addWidget(self._btn_24h)
+        period_row.addWidget(self._btn_7j)
+        period_row.addWidget(self._btn_30j)
+        period_row.addStretch(1)
+
+        self._chk_kamas = QCheckBox("Axe Y : kamas (M)")
+        self._chk_eur = QCheckBox("Axe Y : €")
+        self._chk_kamas.setChecked(True)
+        self._chk_kamas.toggled.connect(self._on_yaxis_toggle)
+        self._chk_eur.toggled.connect(self._on_yaxis_toggle)
+        period_row.addWidget(self._chk_kamas)
+        period_row.addWidget(self._chk_eur)
+
+        self._chk_lines = QCheckBox("Courbes par série")
+        self._chk_sum = QCheckBox("Courbe somme")
+        self._chk_lines.setChecked(True)
+        self._chk_sum.setChecked(False)
+        self._chk_lines.toggled.connect(self._rebuild_chart)
+        self._chk_sum.toggled.connect(self._rebuild_chart)
+        period_row.addWidget(self._chk_lines)
+        period_row.addWidget(self._chk_sum)
+        root.addLayout(period_row)
+
+        filt = QGridLayout()
+        r = 0
+        self._cb_types = {}
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("Type :"))
+        self._cb_types_all = QCheckBox("Tout")
+        self._cb_types_all.setChecked(True)
+        self._cb_types_all.toggled.connect(self._on_types_all)
+        type_row.addWidget(self._cb_types_all)
+        for label, key in (("TS", "TS"), ("Métier", "M")):
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.toggled.connect(self._sync_types_all)
+            self._cb_types[key] = cb
+            type_row.addWidget(cb)
+        type_row.addStretch(1)
+        filt.addLayout(type_row, r, 0, 1, 2)
+        r += 1
+
+        mono_l = QHBoxLayout()
+        mono_l.addWidget(QLabel("Mono :"))
+        self._cb_mono_all = QCheckBox("Tout")
+        self._cb_mono_all.setChecked(True)
+        self._cb_mono_all.toggled.connect(self._on_mono_all)
+        mono_l.addWidget(self._cb_mono_all)
+        self._cb_mono = {}
+        for name in MONO_SERVERS_HISTORY_UI:
+            cb = QCheckBox(name)
+            cb.setChecked(True)
+            cb.toggled.connect(self._sync_mono_all)
+            self._cb_mono[name] = cb
+            mono_l.addWidget(cb)
+        mono_l.addStretch(1)
+        filt.addLayout(mono_l, r, 0)
+        r += 1
+
+        multi_l = QHBoxLayout()
+        multi_l.addWidget(QLabel("Multi :"))
+        self._cb_multi_all = QCheckBox("Tout")
+        self._cb_multi_all.setChecked(True)
+        self._cb_multi_all.toggled.connect(self._on_multi_all)
+        multi_l.addWidget(self._cb_multi_all)
+        self._cb_multi = {}
+        for name in MULTI_SERVERS_HISTORY_UI:
+            cb = QCheckBox(name)
+            cb.setChecked(True)
+            cb.toggled.connect(self._sync_multi_all)
+            self._cb_multi[name] = cb
+            multi_l.addWidget(cb)
+        multi_l.addStretch(1)
+        filt.addLayout(multi_l, r, 0)
+        r += 1
+
+        other_row = QHBoxLayout()
+        self._cb_other = QCheckBox("Autres serveurs (hors listes)")
+        self._cb_other.setChecked(True)
+        self._cb_other.toggled.connect(self._rebuild_chart)
+        other_row.addWidget(self._cb_other)
+        other_row.addStretch(1)
+        filt.addLayout(other_row, r, 0)
+        root.addLayout(filt)
+
+        self._chart = QChart()
+        self._chart.setTheme(QChart.ChartTheme.ChartThemeDark)
+        self._chart.legend().setVisible(True)
+        self._chart.setBackgroundRoundness(4)
+
+        self._chart_view = QChartView(self._chart)
+        self._chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._chart_view.setMinimumSize(360, 260)
+        root.addWidget(self._chart_view, 1)
+
+        try:
+            bus.revenue_updated.connect(self._rebuild_chart)
+        except Exception:
+            pass
+
+        self._rebuild_chart()
+
+    def _set_period(self, secs: int):
+        self._period_secs = int(secs)
+        for b, s in (
+            (self._btn_24h, 86400),
+            (self._btn_7j, 7 * 86400),
+            (self._btn_30j, 30 * 86400),
+        ):
+            b.setChecked(s == self._period_secs)
+        self._rebuild_chart()
+
+    def _on_yaxis_toggle(self):
+        send = self.sender()
+        if send is self._chk_kamas and self._chk_kamas.isChecked():
+            self._chk_eur.setChecked(False)
+        elif send is self._chk_eur and self._chk_eur.isChecked():
+            self._chk_kamas.setChecked(False)
+        if not self._chk_kamas.isChecked() and not self._chk_eur.isChecked():
+            if send is self._chk_kamas:
+                self._chk_eur.setChecked(True)
+            else:
+                self._chk_kamas.setChecked(True)
+        self._rebuild_chart()
+
+    def _on_types_all(self, on: bool):
+        for cb in self._cb_types.values():
+            cb.blockSignals(True)
+            cb.setChecked(on)
+            cb.blockSignals(False)
+        self._rebuild_chart()
+
+    def _sync_types_all(self):
+        all_on = all(cb.isChecked() for cb in self._cb_types.values())
+        self._cb_types_all.blockSignals(True)
+        self._cb_types_all.setChecked(all_on)
+        self._cb_types_all.blockSignals(False)
+        self._rebuild_chart()
+
+    def _on_mono_all(self, on: bool):
+        for cb in self._cb_mono.values():
+            cb.blockSignals(True)
+            cb.setChecked(on)
+            cb.blockSignals(False)
+        self._rebuild_chart()
+
+    def _sync_mono_all(self):
+        all_on = all(cb.isChecked() for cb in self._cb_mono.values())
+        self._cb_mono_all.blockSignals(True)
+        self._cb_mono_all.setChecked(all_on)
+        self._cb_mono_all.blockSignals(False)
+        self._rebuild_chart()
+
+    def _on_multi_all(self, on: bool):
+        for cb in self._cb_multi.values():
+            cb.blockSignals(True)
+            cb.setChecked(on)
+            cb.blockSignals(False)
+        self._rebuild_chart()
+
+    def _sync_multi_all(self):
+        all_on = all(cb.isChecked() for cb in self._cb_multi.values())
+        self._cb_multi_all.blockSignals(True)
+        self._cb_multi_all.setChecked(all_on)
+        self._cb_multi_all.blockSignals(False)
+        self._rebuild_chart()
+
+    def _server_bucket_ok(self, server: str) -> bool:
+        s = (server or "").strip()
+        if s in self._cb_mono and self._cb_mono[s].isChecked():
+            return True
+        if s in self._cb_multi and self._cb_multi[s].isChecked():
+            return True
+        if s not in self._cb_mono and s not in self._cb_multi:
+            return self._cb_other.isChecked()
+        return False
+
+    def _selected_types(self):
+        out = set()
+        if self._cb_types.get("TS") and self._cb_types["TS"].isChecked():
+            out.add("TS")
+        if self._cb_types.get("M") and self._cb_types["M"].isChecked():
+            out.add("M")
+        return out
+
+    def _series_key(self, kind: str, server: str) -> str:
+        return f"{kind}|{server}"
+
+    def _rebuild_chart(self):
+        for old_ax in list(self._chart.axes()):
+            self._chart.removeAxis(old_ax)
+        self._chart.removeAllSeries()
+
+        use_eur = self._chk_eur.isChecked()
+        t_cut = time.time() - float(self._period_secs)
+        try:
+            with _revenue_lock:
+                raw = list(_revenue_data.get(KAMAS_HISTORY_KEY) or [])
+        except Exception:
+            raw = []
+
+        events = []
+        for ev in raw:
+            if not isinstance(ev, dict):
+                continue
+            try:
+                ts = float(ev.get("ts", 0))
+            except Exception:
+                continue
+            if ts < t_cut:
+                continue
+            kind = str(ev.get("kind", "TS")).strip().upper()
+            if kind not in ("TS", "M"):
+                kind = "TS"
+            server = str(ev.get("server", ""))
+            if kind not in self._selected_types():
+                continue
+            if not self._server_bucket_ok(server):
+                continue
+            km = int(ev.get("kamas_m", 0))
+            try:
+                eur = float(ev.get("eur", 0))
+            except Exception:
+                eur = 0.0
+            yv = eur if use_eur else float(km)
+            events.append((ts, kind, server, yv))
+
+        events.sort(key=lambda x: x[0])
+
+        mono_set = set(MONO_SERVERS_HISTORY_UI)
+        multi_set = set(MULTI_SERVERS_HISTORY_UI)
+        active_servers = set()
+        for name, cb in self._cb_mono.items():
+            if cb.isChecked():
+                active_servers.add(name)
+        for name, cb in self._cb_multi.items():
+            if cb.isChecked():
+                active_servers.add(name)
+
+        type_sel = self._selected_types()
+        simplified_keys = []
+        for k in ("TS", "M"):
+            if k not in type_sel:
+                continue
+            for srv in sorted(active_servers):
+                simplified_keys.append(self._series_key(k, srv))
+        if self._cb_other.isChecked():
+            extra_srv = set()
+            for _ts, _kk, srv, _yv in events:
+                if srv not in mono_set and srv not in multi_set:
+                    extra_srv.add(srv)
+            for srv in sorted(extra_srv):
+                for k in ("TS", "M"):
+                    if k not in type_sel:
+                        continue
+                    simplified_keys.append(self._series_key(k, srv))
+
+        all_y = []
+
+        if self._chk_lines.isChecked():
+            by_series = {}
+            for ts, kind, server, yv in events:
+                sk = self._series_key(kind, server)
+                by_series.setdefault(sk, []).append((ts, yv))
+            color_i = 0
+            for sk in simplified_keys:
+                pts = by_series.get(sk)
+                if not pts:
+                    continue
+                ser = QLineSeries()
+                ser.setName(sk.replace("|", " · "))
+                for ts, yv in pts:
+                    x_ms = float(QDateTime.fromMSecsSinceEpoch(int(ts * 1000)).toMSecsSinceEpoch())
+                    ser.append(x_ms, float(yv))
+                    all_y.append(float(yv))
+                try:
+                    ser.setColor(
+                        QColor(self._SERIES_COLORS[color_i % len(self._SERIES_COLORS)])
+                    )
+                except Exception:
+                    pass
+                color_i += 1
+                self._chart.addSeries(ser)
+
+        if self._chk_sum.isChecked() and simplified_keys:
+            last = {sk: 0.0 for sk in simplified_keys}
+            sum_series = QLineSeries()
+            sum_series.setName("Somme (sélection)")
+            try:
+                sum_series.setColor(QColor("#f8fafc"))
+            except Exception:
+                pass
+            n_sum_pts = 0
+            for ts, kind, server, yv in events:
+                sk = self._series_key(kind, server)
+                if sk not in last:
+                    continue
+                last[sk] = float(yv)
+                total = sum(last.values())
+                x_ms = float(QDateTime.fromMSecsSinceEpoch(int(ts * 1000)).toMSecsSinceEpoch())
+                sum_series.append(x_ms, float(total))
+                all_y.append(float(total))
+                n_sum_pts += 1
+            if n_sum_pts:
+                self._chart.addSeries(sum_series)
+
+        axis_x = QDateTimeAxis()
+        axis_x.setFormat("dd/MM HH:mm")
+        axis_x.setTitleText("Temps")
+        min_dt = QDateTime.fromMSecsSinceEpoch(int(t_cut * 1000))
+        max_dt = QDateTime.fromMSecsSinceEpoch(int(time.time() * 1000))
+        axis_x.setRange(min_dt, max_dt)
+
+        val_title = "€" if use_eur else "Kamas (M)"
+        axis_y = QValueAxis()
+        axis_y.setTitleText(val_title)
+        axis_y.setLabelFormat("%.0f" if not use_eur else "%.2f")
+        if all_y:
+            mn = min(all_y)
+            mx = max(all_y)
+            pad = 1.0 if mn == mx else (mx - mn) * 0.08
+            axis_y.setRange(mn - pad, mx + pad)
+        else:
+            axis_y.setRange(0, 1)
+
+        self._chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+        self._chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+        for s in self._chart.series():
+            s.attachAxis(axis_x)
+            s.attachAxis(axis_y)
+
+        self._chart.setTitle("Historique des changements")
+
+
 class RevenueDialog(QDialog):
     def __init__(self, parent, revenue_data: dict):
         super().__init__(parent)
         self.setWindowTitle("€ générés - Détails")
-        self.setMinimumSize(520, 400)
+        self.setMinimumSize(1080, 460)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -4845,6 +5565,14 @@ class RevenueDialog(QDialog):
 
         root.addWidget(right_group, 1)
 
+        chart_group = QGroupBox("Historique kamas")
+        chart_v = QVBoxLayout(chart_group)
+        chart_v.setContentsMargins(6, 10, 6, 6)
+        chart_v.setSpacing(4)
+        self._kamas_chart = KamasHistoryChartPanel(self)
+        chart_v.addWidget(self._kamas_chart, 1)
+        root.addWidget(chart_group, 2)
+
         bus.prices_fetch_finished.connect(self._on_prices_fetch_finished)
         bus.revenue_updated.connect(self._on_bus_revenue_updated)
 
@@ -4890,13 +5618,6 @@ class RevenueDialog(QDialog):
         # Click -> détail
         self.card_ts.clicked.connect(lambda: self._open_kind_editor("TS"))
         self.card_metier.clicked.connect(lambda: self._open_kind_editor("M"))
-
-    def closeEvent(self, e):
-        try:
-            bus.revenue_updated.disconnect(self._on_bus_revenue_updated)
-        except Exception:
-            pass
-        return super().closeEvent(e)
 
     def _apply_status_colors(self):
         try:
@@ -5097,6 +5818,11 @@ class RevenueDialog(QDialog):
         # si tu avais connecté bus.revenue_updated → déconnecte-le ici aussi
         try:
             bus.revenue_updated.disconnect(self._on_bus_revenue_updated)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_kamas_chart", None) is not None:
+                bus.revenue_updated.disconnect(self._kamas_chart._rebuild_chart)
         except Exception:
             pass
         return super().closeEvent(e)
@@ -6481,7 +7207,7 @@ class SnowMasterGUI(QWidget):
         self.configDock.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.configDock.setStyleSheet(
             "#ConfigDock QPushButton { padding:5px 8px; font-size:13px; } "
-            "#ConfigDock QLabel:not(#EuroBigCounter) { font-size:13px; } "
+            # "#ConfigDock QLabel:not(#EuroBigCounter) { font-size:13px; } "
             "#ConfigDock { font-size:13px; }"
         )
 
@@ -10972,9 +11698,7 @@ def run_snowbot_flow(
     if APP_VARIANT == "ankabot":
         try:
             ok_left_prelock = force_window_on_left_screen_no_activate(main_hwnd)
-            print(
-                f"[LEFT] prelock hwnd=0x{int(main_hwnd):08X} ok={ok_left_prelock}"
-            )
+            print(f"[LEFT] prelock hwnd=0x{int(main_hwnd):08X} ok={ok_left_prelock}")
         except Exception:
             pass
 
@@ -10988,9 +11712,7 @@ def run_snowbot_flow(
                 return
             try:
                 ok_left = force_window_on_left_screen_no_activate(main_hwnd)
-                print(
-                    f"[LEFT] {where} hwnd=0x{int(main_hwnd):08X} ok={ok_left}"
-                )
+                print(f"[LEFT] {where} hwnd=0x{int(main_hwnd):08X} ok={ok_left}")
             except Exception:
                 pass
 
