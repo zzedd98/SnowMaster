@@ -47,6 +47,7 @@ import shlex
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import traceback
+import math
 
 
 # ==================== CRASH HANDLER GLOBAL ====================
@@ -132,6 +133,8 @@ from PySide6.QtCore import (
     QCoreApplication,
     QMetaObject,
     QDateTime,
+    QPointF,
+    QMargins,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -162,8 +165,13 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QProgressBar,
     QFrame,
+    QGraphicsView,
+    QScrollArea,
+    QTabBar,
+    QToolButton,
+    QToolTip,
 )
-from PySide6.QtGui import QIcon, QColor
+from PySide6.QtGui import QIcon, QColor, QBrush, QPen, QFont
 from PySide6.QtWidgets import QStyledItemDelegate
 from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import QStyle
@@ -180,6 +188,7 @@ from PySide6.QtCharts import (
     QChart,
     QChartView,
     QLineSeries,
+    QSplineSeries,
     QDateTimeAxis,
     QValueAxis,
 )
@@ -222,6 +231,7 @@ AUTOPILOT_DIR = os.path.join(ANKADIR, "autopilot")
 PREFS_FILE = os.path.join(CONFIGS_DIR, SETTINGS_BASENAME)
 INSTANCES_FILE = os.path.join(CONFIGS_DIR, "instances.json")
 HOLDINGS_STATE_PATH = os.path.join(CONFIGS_DIR, "holdings.json")
+KAMAS_HISTORY_UI_FILE = os.path.join(CONFIGS_DIR, "kamas_history_ui.json")
 
 # -------------------- Logging fichier --------------------
 # S'assurer que le dossier existe AVANT de créer les handlers
@@ -378,6 +388,69 @@ MULTI_SERVERS_HISTORY_UI = (
     "Orukam",
     "Tylezia",
 )
+
+
+def _default_kamas_history_ui_state() -> dict:
+    return {
+        "sidebar_collapsed": False,
+        "period_tab_index": 0,
+        "chk_kamas": True,
+        "chk_lines": True,
+        "chk_sum": False,
+        "types_all": True,
+        "types": {"TS": True, "M": True},
+        "mono_all": True,
+        "mono": {n: True for n in MONO_SERVERS_HISTORY_UI},
+        "multi_all": True,
+        "multi": {n: True for n in MULTI_SERVERS_HISTORY_UI},
+        "sections": {
+            "affichage": True,
+            "type": True,
+            "mono": True,
+            "multi": True,
+        },
+    }
+
+
+def _load_kamas_history_ui_state() -> dict:
+    base = _default_kamas_history_ui_state()
+    try:
+        if not os.path.isfile(KAMAS_HISTORY_UI_FILE):
+            return base
+        with open(KAMAS_HISTORY_UI_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return base
+        out = dict(base)
+        for k, v in data.items():
+            if k in ("types", "mono", "multi", "sections") and isinstance(v, dict):
+                merged = dict(base.get(k, {}))
+                merged.update(v)
+                out[k] = merged
+            elif k in out:
+                out[k] = v
+        return out
+    except Exception:
+        return base
+
+
+def _save_kamas_history_ui_state(state: dict):
+    try:
+        os.makedirs(CONFIGS_DIR, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix="kamas_history_ui_", suffix=".json", dir=CONFIGS_DIR
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, KAMAS_HISTORY_UI_FILE)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def iter_servers_in_display_order(keys_iterable):
@@ -5119,11 +5192,138 @@ class RevenueKindDialog(QDialog):
         super().mousePressEvent(e)
 
 
+class HistoryChartView(QChartView):
+    """Vue graphique avec infobulle au survol près des points."""
+
+    _HOVER_RADIUS_PX = 22.0
+
+    def __init__(self, chart: QChart, parent=None):
+        super().__init__(chart, parent)
+        self.setMouseTracking(True)
+        self._hover_blocks: List[dict] = []
+        self._use_eur_axis = False
+
+    def set_hover_blocks(self, blocks: List[dict], use_eur_axis: bool):
+        self._hover_blocks = blocks or []
+        self._use_eur_axis = use_eur_axis
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        ch = self.chart()
+        if not ch or not self._hover_blocks:
+            QToolTip.hideText()
+            return
+        max_d2 = self._HOVER_RADIUS_PX * self._HOVER_RADIUS_PX
+        best_d2 = 1e18
+        best_tip = None
+        best_gp = None
+        pos = event.position()
+        for block in self._hover_blocks:
+            ser = block.get("series")
+            if ser is None:
+                continue
+            for m in block.get("metas", []):
+                try:
+                    x = float(m.get("_x", 0))
+                    y = float(m.get("_y", 0))
+                    pt = ch.mapToPosition(QPointF(x, y), ser)
+                except Exception:
+                    continue
+                dx = pt.x() - pos.x()
+                dy = pt.y() - pos.y()
+                d2 = dx * dx + dy * dy
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_tip = m.get("_tip", "")
+                    best_gp = self.mapToGlobal(pos.toPoint())
+        if best_tip and best_gp is not None and best_d2 <= max_d2:
+            QToolTip.showText(best_gp, best_tip)
+        else:
+            QToolTip.hideText()
+
+    def leaveEvent(self, event):
+        QToolTip.hideText()
+        super().leaveEvent(event)
+
+
+class _CollapsibleFilterSection(QWidget):
+    """Bloc titre repliable ; option « Tout » sur la même ligne que le titre (au-dessus de la liste)."""
+
+    def __init__(
+        self,
+        title: str,
+        parent=None,
+        tout_checkbox: Optional[QCheckBox] = None,
+    ):
+        super().__init__(parent)
+        self._toggle = QToolButton()
+        self._toggle.setObjectName("KamasSectionToggle")
+        self._toggle.setText(title)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(True)
+        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._toggle.setArrowType(Qt.ArrowType.DownArrow)
+        self._toggle.setAutoRaise(True)
+        self._toggle.setCursor(Qt.PointingHandCursor)
+        self._toggle.setStyleSheet(
+            "QToolButton#KamasSectionToggle { border: none; background: transparent; font-weight: 700; font-size: 14px; "
+            "font-family: 'Segoe UI','Inter','Roboto',sans-serif; color: #e5e7eb; padding: 0px; }"
+        )
+        self._toggle.toggled.connect(self._on_toggled)
+
+        self._header_row = QWidget()
+        hr = QHBoxLayout(self._header_row)
+        hr.setContentsMargins(0, 0, 0, 0)
+        hr.setSpacing(4)
+        hr.addWidget(self._toggle, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        hr.addStretch(1)
+        if tout_checkbox is not None:
+            hr.addWidget(tout_checkbox, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self._body = QWidget()
+        self._vl = QVBoxLayout(self._body)
+        self._vl.setContentsMargins(4, 0, 0, 4)
+        self._vl.setSpacing(1)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(1)
+        outer.addWidget(self._header_row)
+        outer.addWidget(self._body)
+
+    def _on_toggled(self, expanded: bool):
+        self._body.setVisible(expanded)
+        self._toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+
+    def inner_layout(self) -> QVBoxLayout:
+        return self._vl
+
+    def is_section_expanded(self) -> bool:
+        return self._toggle.isChecked()
+
+    def set_section_expanded(self, expanded: bool):
+        self._toggle.blockSignals(True)
+        self._toggle.setChecked(expanded)
+        self._toggle.blockSignals(False)
+        self._body.setVisible(expanded)
+        self._toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+
+
 class KamasHistoryChartPanel(QWidget):
-    """Graphique d'historique kamas / € (filtres, période, courbes + somme)."""
+    """Historique kamas — couleurs alignées sur le thème de l'app (fond sombre, accent #2563eb)."""
+
+    # Aligné sur apply_dark_blue_style : QGroupBox #111827, cartes #0b1936, accent BlueCard #2563eb
+    _PANEL_BG = "#111827"
+    _PLOT_BG = "#0b1936"
+    _ACCENT_BLUE = "#2563eb"
+    _ACCENT_BLUE_HOVER = "#3b82f6"
+    _ACCENT_BLUE_PRESS = "#1e40af"
 
     _SERIES_COLORS = [
-        "#38bdf8",
+        "#60a5fa",
         "#a78bfa",
         "#f472b6",
         "#34d399",
@@ -5135,139 +5335,464 @@ class KamasHistoryChartPanel(QWidget):
         "#f87171",
     ]
 
+    _PANEL_BASE_STYLE = """
+        QWidget#KamasHistoryChartPanel {
+            background-color: %s;
+            border-radius: 10px;
+        }
+        QWidget#KamasHistoryChartPanel QScrollArea {
+            border: none;
+            background-color: %s;
+            border-radius: 10px;
+        }
+        QWidget#KamasHistoryChartPanel QScrollArea > QWidget > QWidget {
+            background-color: %s;
+        }
+        QWidget#KamasHistoryChartPanel QChartView#KamasHistoryChartView {
+            background-color: %s;
+            border: none;
+            border-radius: 10px;
+        }
+        QWidget#KamasHistoryChartPanel QToolButton#KamasSectionToggle {
+            color: #e5e7eb;
+            font-family: 'Segoe UI','Inter','Roboto',sans-serif;
+            font-size: 14px;
+            font-weight: 700;
+        }
+    """
+
+    _FILTER_BODY_STYLE = """
+        QWidget#KamasFilterBody {
+            background-color: #0b1936;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 12px;
+        }
+        QWidget#KamasFilterBody QCheckBox {
+            font-family: 'Segoe UI','Inter','Roboto',sans-serif;
+            font-size: 14px;
+            spacing: 5px;
+            min-height: 22px;
+            color: #e5e7eb;
+            font-weight: 600;
+        }
+        QWidget#KamasFilterBody QCheckBox::indicator {
+            width: 17px;
+            height: 17px;
+        }
+    """
+
+    _TAB_BAR_STYLE = """
+        QTabBar::tab {
+            background-color: #1e293b;
+            color: #e5e7eb;
+            border: 1px solid #334155;
+            border-bottom: none;
+            border-top-left-radius: 10px;
+            border-top-right-radius: 10px;
+            min-width: 76px;
+            min-height: 28px;
+            padding: 6px 14px;
+            margin-right: 2px;
+            font-family: 'Segoe UI','Inter','Roboto',sans-serif;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        QTabBar::tab:selected {
+            background-color: #2563eb;
+            color: #f8fafc;
+            border: 1px solid #3b82f6;
+            border-bottom: none;
+            font-weight: 800;
+            padding-bottom: 7px;
+        }
+        QTabBar::tab:!selected {
+            color: #cbd5e1;
+        }
+        QTabBar::tab:!selected:hover {
+            background-color: #334155;
+            color: #f8fafc;
+        }
+    """
+
+    _FOLD_BTN_STYLE = """
+        QToolButton#KamasFoldBtn {
+            background-color: #2563eb;
+            color: #e5e7eb;
+            border: none;
+            border-radius: 10px;
+            padding: 8px 14px;
+            font-family: 'Segoe UI','Inter','Roboto',sans-serif;
+            font-size: 14px;
+            font-weight: 800;
+        }
+        QToolButton#KamasFoldBtn:hover {
+            background-color: #3b82f6;
+            color: #ffffff;
+        }
+        QToolButton#KamasFoldBtn:pressed {
+            background-color: #1e40af;
+        }
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("KamasHistoryChartPanel")
         self._period_secs = 86400  # 24 h par défaut
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(4, 4, 4, 4)
-        root.setSpacing(6)
+        self._save_ui_timer = QTimer(self)
+        self._save_ui_timer.setSingleShot(True)
+        self._save_ui_timer.timeout.connect(self._flush_ui_state_to_disk)
 
-        period_row = QHBoxLayout()
-        period_row.addWidget(QLabel("Période :"))
-        self._btn_24h = QPushButton("24 h")
-        self._btn_7j = QPushButton("7 j")
-        self._btn_30j = QPushButton("30 j")
-        for b in (self._btn_24h, self._btn_7j, self._btn_30j):
-            b.setCheckable(True)
-            b.setAutoDefault(False)
-            b.setDefault(False)
-            b.setFixedHeight(26)
-            b.setCursor(Qt.PointingHandCursor)
-        self._btn_24h.setChecked(True)
-        self._btn_24h.clicked.connect(lambda: self._set_period(86400))
-        self._btn_7j.clicked.connect(lambda: self._set_period(7 * 86400))
-        self._btn_30j.clicked.connect(lambda: self._set_period(30 * 86400))
-        period_row.addWidget(self._btn_24h)
-        period_row.addWidget(self._btn_7j)
-        period_row.addWidget(self._btn_30j)
-        period_row.addStretch(1)
+        tab_style = self._TAB_BAR_STYLE
 
+        main = QVBoxLayout(self)
+        main.setContentsMargins(2, 2, 2, 2)
+        main.setSpacing(4)
+
+        pbg = self._PANEL_BG
+        cv_bg = self._PLOT_BG
+        self.setStyleSheet(
+            (self._PANEL_BASE_STYLE % (pbg, pbg, pbg, cv_bg))
+            + self._FILTER_BODY_STYLE
+            + self._FOLD_BTN_STYLE
+        )
+
+        # Bouton replier les filtres : même ligne que les onglets ; les filtres sont uniquement sous cette barre
+        self._btn_sidebar = QToolButton()
+        self._btn_sidebar.setObjectName("KamasFoldBtn")
+        self._btn_sidebar.setAutoRaise(False)
+        self._btn_sidebar.setCursor(Qt.PointingHandCursor)
+        self._btn_sidebar.setToolTip("Afficher ou masquer la colonne filtres")
+        self._btn_sidebar.setText("◀  Filtres")
+        self._btn_sidebar.setFixedHeight(32)
+        self._btn_sidebar.setMinimumWidth(108)
+        self._btn_sidebar.clicked.connect(self._toggle_filter_column)
+
+        # ---------- Zone filtres (scroll) : rangée sous la barre [Filtres | onglets], à côté du graphique ----------
+        self._scroll_filters = QScrollArea()
+        self._scroll_filters.setWidgetResizable(True)
+        self._scroll_filters.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll_filters.setMinimumWidth(178)
+        self._scroll_filters.setMaximumWidth(328)
+        self._scroll_filters.setFrameShape(QFrame.Shape.NoFrame)
+
+        filter_root = QWidget()
+        filter_root.setStyleSheet(
+            f"background-color: {self._PANEL_BG}; border-radius: 10px;"
+        )
+        fv = QVBoxLayout(filter_root)
+        fv.setContentsMargins(2, 2, 2, 2)
+        fv.setSpacing(2)
+
+        self._filter_sections_host = QWidget()
+        self._filter_sections_host.setObjectName("KamasFilterBody")
+        self._filter_sections_layout = QVBoxLayout(self._filter_sections_host)
+        self._filter_sections_layout.setContentsMargins(4, 3, 4, 3)
+        self._filter_sections_layout.setSpacing(2)
+
+        sec_disp = _CollapsibleFilterSection("Affichage")
+        dl = sec_disp.inner_layout()
         self._chk_kamas = QCheckBox("Axe Y : kamas (M)")
-        self._chk_eur = QCheckBox("Axe Y : €")
+        self._chk_eur = QCheckBox("Axe Y : Euros")
         self._chk_kamas.setChecked(True)
         self._chk_kamas.toggled.connect(self._on_yaxis_toggle)
         self._chk_eur.toggled.connect(self._on_yaxis_toggle)
-        period_row.addWidget(self._chk_kamas)
-        period_row.addWidget(self._chk_eur)
-
         self._chk_lines = QCheckBox("Courbes par série")
         self._chk_sum = QCheckBox("Courbe somme")
         self._chk_lines.setChecked(True)
         self._chk_sum.setChecked(False)
         self._chk_lines.toggled.connect(self._rebuild_chart)
         self._chk_sum.toggled.connect(self._rebuild_chart)
-        period_row.addWidget(self._chk_lines)
-        period_row.addWidget(self._chk_sum)
-        root.addLayout(period_row)
+        dl.addWidget(self._chk_kamas)
+        dl.addWidget(self._chk_eur)
+        dl.addWidget(self._chk_lines)
+        dl.addWidget(self._chk_sum)
 
-        filt = QGridLayout()
-        r = 0
         self._cb_types = {}
-        type_row = QHBoxLayout()
-        type_row.addWidget(QLabel("Type :"))
         self._cb_types_all = QCheckBox("Tout")
         self._cb_types_all.setChecked(True)
         self._cb_types_all.toggled.connect(self._on_types_all)
-        type_row.addWidget(self._cb_types_all)
+        sec_type = _CollapsibleFilterSection("Type de compte", tout_checkbox=self._cb_types_all)
+        tl = sec_type.inner_layout()
         for label, key in (("TS", "TS"), ("Métier", "M")):
             cb = QCheckBox(label)
             cb.setChecked(True)
             cb.toggled.connect(self._sync_types_all)
             self._cb_types[key] = cb
-            type_row.addWidget(cb)
-        type_row.addStretch(1)
-        filt.addLayout(type_row, r, 0, 1, 2)
-        r += 1
+            tl.addWidget(cb)
 
-        mono_l = QHBoxLayout()
-        mono_l.addWidget(QLabel("Mono :"))
+        self._cb_mono = {}
         self._cb_mono_all = QCheckBox("Tout")
         self._cb_mono_all.setChecked(True)
         self._cb_mono_all.toggled.connect(self._on_mono_all)
-        mono_l.addWidget(self._cb_mono_all)
-        self._cb_mono = {}
+        sec_mono = _CollapsibleFilterSection("Serveurs mono", tout_checkbox=self._cb_mono_all)
+        ml = sec_mono.inner_layout()
         for name in MONO_SERVERS_HISTORY_UI:
             cb = QCheckBox(name)
             cb.setChecked(True)
             cb.toggled.connect(self._sync_mono_all)
             self._cb_mono[name] = cb
-            mono_l.addWidget(cb)
-        mono_l.addStretch(1)
-        filt.addLayout(mono_l, r, 0)
-        r += 1
+            ml.addWidget(cb)
 
-        multi_l = QHBoxLayout()
-        multi_l.addWidget(QLabel("Multi :"))
+        self._cb_multi = {}
         self._cb_multi_all = QCheckBox("Tout")
         self._cb_multi_all.setChecked(True)
         self._cb_multi_all.toggled.connect(self._on_multi_all)
-        multi_l.addWidget(self._cb_multi_all)
-        self._cb_multi = {}
+        sec_multi = _CollapsibleFilterSection("Serveurs multi", tout_checkbox=self._cb_multi_all)
+        mul = sec_multi.inner_layout()
         for name in MULTI_SERVERS_HISTORY_UI:
             cb = QCheckBox(name)
             cb.setChecked(True)
             cb.toggled.connect(self._sync_multi_all)
             self._cb_multi[name] = cb
-            multi_l.addWidget(cb)
-        multi_l.addStretch(1)
-        filt.addLayout(multi_l, r, 0)
-        r += 1
+            mul.addWidget(cb)
 
-        other_row = QHBoxLayout()
-        self._cb_other = QCheckBox("Autres serveurs (hors listes)")
-        self._cb_other.setChecked(True)
-        self._cb_other.toggled.connect(self._rebuild_chart)
-        other_row.addWidget(self._cb_other)
-        other_row.addStretch(1)
-        filt.addLayout(other_row, r, 0)
-        root.addLayout(filt)
+        self._sec_disp = sec_disp
+        self._sec_type = sec_type
+        self._sec_mono = sec_mono
+        self._sec_multi = sec_multi
 
+        self._filter_sections_layout.addWidget(sec_disp)
+        self._filter_sections_layout.addWidget(sec_type)
+        self._filter_sections_layout.addWidget(sec_mono)
+        self._filter_sections_layout.addWidget(sec_multi)
+        self._filter_sections_layout.addStretch(1)
+
+        fv.addWidget(self._filter_sections_host, 1)
+        self._scroll_filters.setWidget(filter_root)
+
+        self._filters_expanded = True
+
+        self._tab_period = QTabBar()
+        self._tab_period.setDocumentMode(True)
+        self._tab_period.setExpanding(False)
+        self._tab_period.setDrawBase(False)
+        self._tab_period.setStyleSheet(tab_style)
+        self._tab_period.addTab("24 h")
+        self._tab_period.addTab("7 jours")
+        self._tab_period.addTab("30 jours")
+        self._tab_period.setCurrentIndex(0)
+        self._tab_period.currentChanged.connect(self._on_period_tab_changed)
+
+        bg_outer = QColor(self._PANEL_BG)
+        bg_plot = QColor(self._PLOT_BG)
         self._chart = QChart()
+        self._chart.setTitle("")
         self._chart.setTheme(QChart.ChartTheme.ChartThemeDark)
+        try:
+            self._chart.setAnimationOptions(QChart.AnimationOption.NoAnimation)
+        except Exception:
+            pass
+        self._chart.setBackgroundVisible(True)
+        self._chart.setBackgroundBrush(QBrush(bg_outer))
+        self._chart.setPlotAreaBackgroundVisible(True)
+        self._chart.setPlotAreaBackgroundBrush(QBrush(bg_plot))
         self._chart.legend().setVisible(True)
-        self._chart.setBackgroundRoundness(4)
+        self._chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+        try:
+            self._chart.legend().setShowBorder(False)
+        except Exception:
+            pass
+        try:
+            self._chart.legend().setContentsMargins(4, 0, 4, 2)
+        except Exception:
+            pass
+        try:
+            leg_font = QFont("Segoe UI", 8)
+            leg_font.setWeight(QFont.Weight.DemiBold)
+            self._chart.legend().setFont(leg_font)
+        except Exception:
+            pass
+        self._chart.setBackgroundRoundness(10)
+        try:
+            self._chart.setMargins(QMargins(2, 2, 2, 0))
+        except Exception:
+            pass
 
-        self._chart_view = QChartView(self._chart)
+        self._chart_view = HistoryChartView(self._chart, self)
+        self._chart_view.setObjectName("KamasHistoryChartView")
         self._chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self._chart_view.setMinimumSize(360, 260)
-        root.addWidget(self._chart_view, 1)
+        self._chart_view.setStyleSheet(
+            f"background-color: {self._PLOT_BG}; border: none; border-radius: 10px;"
+        )
+        self._chart_view.setFrameShape(QFrame.Shape.NoFrame)
+        self._chart_view.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        try:
+            self._chart_view.setViewportUpdateMode(
+                QGraphicsView.ViewportUpdateMode.FullViewportUpdate
+            )
+        except Exception:
+            pass
+        self._chart_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._chart_view.setMinimumHeight(120)
+
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.setSpacing(10)
+        top_bar.addWidget(self._btn_sidebar, 0)
+        top_bar.addWidget(self._tab_period, 0)
+        top_bar.addStretch(1)
+        main.addLayout(top_bar)
+
+        chart_row = QHBoxLayout()
+        chart_row.setContentsMargins(0, 0, 0, 0)
+        chart_row.setSpacing(4)
+        chart_row.addWidget(self._scroll_filters, 0)
+        chart_row.addWidget(self._chart_view, 1)
+        main.addLayout(chart_row, 1)
+
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        self._wire_persist_controls()
 
         try:
             bus.revenue_updated.connect(self._rebuild_chart)
         except Exception:
             pass
 
+        self._apply_saved_ui_state(_load_kamas_history_ui_state())
         self._rebuild_chart()
+
+    def _wire_persist_controls(self):
+        for cb in (
+            self._chk_kamas,
+            self._chk_eur,
+            self._chk_lines,
+            self._chk_sum,
+            self._cb_types_all,
+            self._cb_mono_all,
+            self._cb_multi_all,
+            *self._cb_types.values(),
+            *self._cb_mono.values(),
+            *self._cb_multi.values(),
+        ):
+            cb.toggled.connect(self._schedule_save_ui)
+        for sec in (self._sec_disp, self._sec_type, self._sec_mono, self._sec_multi):
+            sec._toggle.toggled.connect(self._schedule_save_ui)
+
+    def _schedule_save_ui(self):
+        self._save_ui_timer.stop()
+        self._save_ui_timer.start(400)
+
+    def _flush_ui_state_to_disk(self):
+        try:
+            mono_d = {n: self._cb_mono[n].isChecked() for n in MONO_SERVERS_HISTORY_UI}
+            multi_d = {n: self._cb_multi[n].isChecked() for n in MULTI_SERVERS_HISTORY_UI}
+            state = {
+                "sidebar_collapsed": not self._filters_expanded,
+                "period_tab_index": self._tab_period.currentIndex(),
+                "chk_kamas": self._chk_kamas.isChecked(),
+                "chk_lines": self._chk_lines.isChecked(),
+                "chk_sum": self._chk_sum.isChecked(),
+                "types_all": self._cb_types_all.isChecked(),
+                "types": {k: self._cb_types[k].isChecked() for k in ("TS", "M")},
+                "mono_all": self._cb_mono_all.isChecked(),
+                "mono": mono_d,
+                "multi_all": self._cb_multi_all.isChecked(),
+                "multi": multi_d,
+                "sections": {
+                    "affichage": self._sec_disp.is_section_expanded(),
+                    "type": self._sec_type.is_section_expanded(),
+                    "mono": self._sec_mono.is_section_expanded(),
+                    "multi": self._sec_multi.is_section_expanded(),
+                },
+            }
+            _save_kamas_history_ui_state(state)
+        except Exception:
+            pass
+
+    def _apply_saved_ui_state(self, st: dict):
+        try:
+            self._tab_period.blockSignals(True)
+            idx = int(st.get("period_tab_index", 0))
+            idx = max(0, min(2, idx))
+            self._tab_period.setCurrentIndex(idx)
+            mapping = (86400, 7 * 86400, 30 * 86400)
+            self._period_secs = mapping[idx]
+
+            collapsed = bool(st.get("sidebar_collapsed", False))
+            self._filters_expanded = not collapsed
+            if self._filters_expanded:
+                self._scroll_filters.setVisible(True)
+                self._scroll_filters.setMinimumWidth(178)
+                self._scroll_filters.setMaximumWidth(328)
+                self._btn_sidebar.setText("◀  Filtres")
+            else:
+                self._scroll_filters.setVisible(False)
+                self._btn_sidebar.setText("▶  Filtres")
+
+            use_k = bool(st.get("chk_kamas", True))
+            self._chk_kamas.blockSignals(True)
+            self._chk_eur.blockSignals(True)
+            self._chk_kamas.setChecked(use_k)
+            self._chk_eur.setChecked(not use_k)
+            self._chk_kamas.blockSignals(False)
+            self._chk_eur.blockSignals(False)
+
+            self._chk_lines.setChecked(bool(st.get("chk_lines", True)))
+            self._chk_sum.setChecked(bool(st.get("chk_sum", False)))
+
+            self._cb_types_all.blockSignals(True)
+            self._cb_types_all.setChecked(bool(st.get("types_all", True)))
+            self._cb_types_all.blockSignals(False)
+            td = st.get("types") or {}
+            for k in ("TS", "M"):
+                if k in self._cb_types:
+                    self._cb_types[k].setChecked(bool(td.get(k, True)))
+
+            self._cb_mono_all.blockSignals(True)
+            self._cb_mono_all.setChecked(bool(st.get("mono_all", True)))
+            self._cb_mono_all.blockSignals(False)
+            md = st.get("mono") or {}
+            for n in MONO_SERVERS_HISTORY_UI:
+                if n in self._cb_mono:
+                    self._cb_mono[n].setChecked(bool(md.get(n, True)))
+
+            self._cb_multi_all.blockSignals(True)
+            self._cb_multi_all.setChecked(bool(st.get("multi_all", True)))
+            self._cb_multi_all.blockSignals(False)
+            mu = st.get("multi") or {}
+            for n in MULTI_SERVERS_HISTORY_UI:
+                if n in self._cb_multi:
+                    self._cb_multi[n].setChecked(bool(mu.get(n, True)))
+
+            secmap = st.get("sections") or {}
+            self._sec_disp.set_section_expanded(bool(secmap.get("affichage", True)))
+            self._sec_type.set_section_expanded(bool(secmap.get("type", True)))
+            self._sec_mono.set_section_expanded(bool(secmap.get("mono", True)))
+            self._sec_multi.set_section_expanded(bool(secmap.get("multi", True)))
+        finally:
+            self._tab_period.blockSignals(False)
+
+    def _toggle_filter_column(self):
+        self._filters_expanded = not self._filters_expanded
+        if self._filters_expanded:
+            self._scroll_filters.setVisible(True)
+            self._scroll_filters.setMinimumWidth(178)
+            self._scroll_filters.setMaximumWidth(328)
+            self._btn_sidebar.setText("◀  Filtres")
+        else:
+            self._scroll_filters.setVisible(False)
+            self._btn_sidebar.setText("▶  Filtres")
+        self._schedule_save_ui()
+
+    def _on_period_tab_changed(self, index: int):
+        mapping = (86400, 7 * 86400, 30 * 86400)
+        if 0 <= index < len(mapping):
+            self._period_secs = mapping[index]
+        self._rebuild_chart()
+        try:
+            self._chart_view.viewport().update()
+        except Exception:
+            pass
+        self._schedule_save_ui()
 
     def _set_period(self, secs: int):
         self._period_secs = int(secs)
-        for b, s in (
-            (self._btn_24h, 86400),
-            (self._btn_7j, 7 * 86400),
-            (self._btn_30j, 30 * 86400),
-        ):
-            b.setChecked(s == self._period_secs)
+        idx = {86400: 0, 7 * 86400: 1, 30 * 86400: 2}.get(self._period_secs, 0)
+        self._tab_period.blockSignals(True)
+        self._tab_period.setCurrentIndex(idx)
+        self._tab_period.blockSignals(False)
         self._rebuild_chart()
 
     def _on_yaxis_toggle(self):
@@ -5327,12 +5852,10 @@ class KamasHistoryChartPanel(QWidget):
 
     def _server_bucket_ok(self, server: str) -> bool:
         s = (server or "").strip()
-        if s in self._cb_mono and self._cb_mono[s].isChecked():
-            return True
-        if s in self._cb_multi and self._cb_multi[s].isChecked():
-            return True
-        if s not in self._cb_mono and s not in self._cb_multi:
-            return self._cb_other.isChecked()
+        if s in self._cb_mono:
+            return self._cb_mono[s].isChecked()
+        if s in self._cb_multi:
+            return self._cb_multi[s].isChecked()
         return False
 
     def _selected_types(self):
@@ -5346,10 +5869,103 @@ class KamasHistoryChartPanel(QWidget):
     def _series_key(self, kind: str, server: str) -> str:
         return f"{kind}|{server}"
 
+    def _format_point_tooltip(
+        self,
+        series_title: str,
+        ts: float,
+        km: int,
+        eur: float,
+        y_plot: float,
+        use_eur_axis: bool,
+    ) -> str:
+        try:
+            when = datetime.fromtimestamp(ts).strftime("%d/%m/%Y %H:%M:%S")
+        except Exception:
+            when = ""
+        lines = [series_title, when]
+        if use_eur_axis:
+            lines.append(f"Valeur affichée : {float(y_plot):,.2f} €".replace(",", " "))
+            lines.append(f"{int(km)} M kamas (snapshot historique)")
+        else:
+            lines.append(f"Valeur affichée : {int(round(float(y_plot)))} M kamas")
+            lines.append(f"{float(eur):,.2f} € au moment T".replace(",", " "))
+        return "\n".join(lines)
+
+    def _format_sum_tooltip(self, ts: float, y_plot: float, use_eur_axis: bool) -> str:
+        try:
+            when = datetime.fromtimestamp(ts).strftime("%d/%m/%Y %H:%M:%S")
+        except Exception:
+            when = ""
+        lines = ["Somme (sélection)", when]
+        if use_eur_axis:
+            lines.append(f"Total : {float(y_plot):,.2f} €".replace(",", " "))
+        else:
+            lines.append(f"Total : {int(round(float(y_plot)))} M kamas")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _nice_tick_step(x: float) -> float:
+        if x <= 0 or not math.isfinite(x):
+            return 1.0
+        exp = math.floor(math.log10(x))
+        f = x / (10**exp)
+        if f <= 1:
+            nf = 1
+        elif f <= 2:
+            nf = 2
+        elif f <= 5:
+            nf = 5
+        else:
+            nf = 10
+        return nf * (10**exp)
+
+    def _nice_y_axis_bounds_zero_base(self, mx: float) -> Tuple[float, float, float]:
+        """Ordonnée min toujours 0 ; max et pas de graduation au-dessus des données."""
+        if not math.isfinite(mx):
+            return 0.0, 1.0, 1.0
+        if mx <= 0:
+            return 0.0, 1.0, 1.0
+        pad = max(abs(mx) * 0.06, 1.0)
+        hi_raw = mx + pad
+        step = self._nice_tick_step(hi_raw / 5.0)
+        if step <= 0:
+            step = 1.0
+        hi_n = math.ceil(hi_raw / step) * step
+        if hi_n <= 0:
+            hi_n = step
+        return 0.0, hi_n, step
+
+    @staticmethod
+    def _new_curve_series(n_points: int) -> QLineSeries:
+        """Spline lissée si assez de points (Qt exige ≥3 pour un spline), sinon segments droits."""
+        if n_points >= 3:
+            return QSplineSeries()
+        return QLineSeries()
+
+    def _apply_series_style(self, ser: QLineSeries, qcolor: QColor, *, thick: float = 2.0):
+        ser.setColor(qcolor)
+        try:
+            ser.setPen(QPen(qcolor, thick))
+        except Exception:
+            pass
+        ser.setPointsVisible(False)
+        try:
+            ser.setMarkerSize(4.0)
+        except Exception:
+            pass
+
     def _rebuild_chart(self):
+        try:
+            self._chart_view.set_hover_blocks([], False)
+        except Exception:
+            pass
+        while self._chart.series():
+            try:
+                self._chart.removeSeries(self._chart.series()[0])
+            except Exception:
+                break
         for old_ax in list(self._chart.axes()):
             self._chart.removeAxis(old_ax)
-        self._chart.removeAllSeries()
 
         use_eur = self._chk_eur.isChecked()
         t_cut = time.time() - float(self._period_secs)
@@ -5383,12 +5999,10 @@ class KamasHistoryChartPanel(QWidget):
             except Exception:
                 eur = 0.0
             yv = eur if use_eur else float(km)
-            events.append((ts, kind, server, yv))
+            events.append((ts, kind, server, yv, km, eur))
 
         events.sort(key=lambda x: x[0])
 
-        mono_set = set(MONO_SERVERS_HISTORY_UI)
-        multi_set = set(MULTI_SERVERS_HISTORY_UI)
         active_servers = set()
         for name, cb in self._cb_mono.items():
             if cb.isChecked():
@@ -5404,84 +6018,127 @@ class KamasHistoryChartPanel(QWidget):
                 continue
             for srv in sorted(active_servers):
                 simplified_keys.append(self._series_key(k, srv))
-        if self._cb_other.isChecked():
-            extra_srv = set()
-            for _ts, _kk, srv, _yv in events:
-                if srv not in mono_set and srv not in multi_set:
-                    extra_srv.add(srv)
-            for srv in sorted(extra_srv):
-                for k in ("TS", "M"):
-                    if k not in type_sel:
-                        continue
-                    simplified_keys.append(self._series_key(k, srv))
 
         all_y = []
+        hover_blocks: List[dict] = []
 
         if self._chk_lines.isChecked():
             by_series = {}
-            for ts, kind, server, yv in events:
+            for ts, kind, server, yv, km, eur in events:
                 sk = self._series_key(kind, server)
-                by_series.setdefault(sk, []).append((ts, yv))
+                by_series.setdefault(sk, []).append((ts, yv, km, eur))
             color_i = 0
             for sk in simplified_keys:
                 pts = by_series.get(sk)
                 if not pts:
                     continue
-                ser = QLineSeries()
-                ser.setName(sk.replace("|", " · "))
-                for ts, yv in pts:
-                    x_ms = float(QDateTime.fromMSecsSinceEpoch(int(ts * 1000)).toMSecsSinceEpoch())
+                ser = self._new_curve_series(len(pts))
+                title_disp = sk.replace("|", " · ")
+                ser.setName(title_disp)
+                metas = []
+                for ts, yv, km, eur in pts:
+                    x_ms = float(
+                        QDateTime.fromMSecsSinceEpoch(int(ts * 1000)).toMSecsSinceEpoch()
+                    )
                     ser.append(x_ms, float(yv))
                     all_y.append(float(yv))
-                try:
-                    ser.setColor(
-                        QColor(self._SERIES_COLORS[color_i % len(self._SERIES_COLORS)])
+                    metas.append(
+                        {
+                            "_x": x_ms,
+                            "_y": float(yv),
+                            "_tip": self._format_point_tooltip(
+                                title_disp, ts, km, eur, yv, use_eur
+                            ),
+                        }
                     )
-                except Exception:
-                    pass
+                qcol = QColor(
+                    self._SERIES_COLORS[color_i % len(self._SERIES_COLORS)]
+                )
+                self._apply_series_style(ser, qcol)
                 color_i += 1
                 self._chart.addSeries(ser)
+                hover_blocks.append({"series": ser, "metas": metas})
 
         if self._chk_sum.isChecked() and simplified_keys:
             last = {sk: 0.0 for sk in simplified_keys}
-            sum_series = QLineSeries()
-            sum_series.setName("Somme (sélection)")
-            try:
-                sum_series.setColor(QColor("#f8fafc"))
-            except Exception:
-                pass
-            n_sum_pts = 0
-            for ts, kind, server, yv in events:
+            sum_metas = []
+            sum_points: List[Tuple[float, float]] = []
+            for ts, kind, server, yv, km, eur in events:
                 sk = self._series_key(kind, server)
                 if sk not in last:
                     continue
                 last[sk] = float(yv)
                 total = sum(last.values())
-                x_ms = float(QDateTime.fromMSecsSinceEpoch(int(ts * 1000)).toMSecsSinceEpoch())
-                sum_series.append(x_ms, float(total))
+                x_ms = float(
+                    QDateTime.fromMSecsSinceEpoch(int(ts * 1000)).toMSecsSinceEpoch()
+                )
+                sum_points.append((x_ms, float(total)))
                 all_y.append(float(total))
-                n_sum_pts += 1
-            if n_sum_pts:
+                sum_metas.append(
+                    {
+                        "_x": x_ms,
+                        "_y": float(total),
+                        "_tip": self._format_sum_tooltip(ts, total, use_eur),
+                    }
+                )
+            if sum_points:
+                sum_series = self._new_curve_series(len(sum_points))
+                sum_series.setName("Somme (sélection)")
+                for x_ms, total in sum_points:
+                    sum_series.append(x_ms, total)
+                sq = QColor("#cbd5e1")
+                self._apply_series_style(sum_series, sq, thick=2.5)
                 self._chart.addSeries(sum_series)
+                hover_blocks.append({"series": sum_series, "metas": sum_metas})
 
         axis_x = QDateTimeAxis()
         axis_x.setFormat("dd/MM HH:mm")
         axis_x.setTitleText("Temps")
+        try:
+            axis_x.setLabelsColor(QColor("#cbd5e1"))
+            axis_x.setTitleBrush(QBrush(QColor("#e5e7eb")))
+            axis_x.setGridLineColor(QColor("#334155"))
+        except Exception:
+            pass
         min_dt = QDateTime.fromMSecsSinceEpoch(int(t_cut * 1000))
         max_dt = QDateTime.fromMSecsSinceEpoch(int(time.time() * 1000))
         axis_x.setRange(min_dt, max_dt)
 
-        val_title = "€" if use_eur else "Kamas (M)"
+        val_title = "Euros" if use_eur else "Kamas (M)"
         axis_y = QValueAxis()
         axis_y.setTitleText(val_title)
-        axis_y.setLabelFormat("%.0f" if not use_eur else "%.2f")
+        try:
+            axis_y.setLabelsColor(QColor("#cbd5e1"))
+            axis_y.setTitleBrush(QBrush(QColor("#e5e7eb")))
+            axis_y.setGridLineColor(QColor("#334155"))
+        except Exception:
+            pass
+        axis_y.setLabelFormat("%d")
+        try:
+            axis_y.setMinorTickCount(0)
+        except Exception:
+            pass
+
         if all_y:
-            mn = min(all_y)
-            mx = max(all_y)
-            pad = 1.0 if mn == mx else (mx - mn) * 0.08
-            axis_y.setRange(mn - pad, mx + pad)
+            mx = float(max(all_y))
+            _, hi, step = self._nice_y_axis_bounds_zero_base(mx)
+            axis_y.setRange(0.0, float(hi))
+            try:
+                axis_y.setTickType(QValueAxis.TickType.TicksFixed)
+                axis_y.setTickInterval(float(step))
+            except Exception:
+                try:
+                    axis_y.setTickType(QValueAxis.TickType.TicksDynamic)
+                    axis_y.setTickCount(6)
+                except Exception:
+                    pass
         else:
-            axis_y.setRange(0, 1)
+            axis_y.setRange(0.0, 1.0)
+            try:
+                axis_y.setTickType(QValueAxis.TickType.TicksDynamic)
+                axis_y.setTickCount(3)
+            except Exception:
+                pass
 
         self._chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
         self._chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
@@ -5489,14 +6146,27 @@ class KamasHistoryChartPanel(QWidget):
             s.attachAxis(axis_x)
             s.attachAxis(axis_y)
 
-        self._chart.setTitle("Historique des changements")
+        self._chart.setBackgroundBrush(QBrush(QColor(self._PANEL_BG)))
+        self._chart.setPlotAreaBackgroundBrush(QBrush(QColor(self._PLOT_BG)))
+        try:
+            self._chart.setMargins(QMargins(2, 2, 2, 0))
+        except Exception:
+            pass
+
+        self._chart.setTitle("")
+
+        try:
+            self._chart_view.set_hover_blocks(hover_blocks, use_eur)
+            self._chart_view.viewport().update()
+        except Exception:
+            pass
 
 
 class RevenueDialog(QDialog):
     def __init__(self, parent, revenue_data: dict):
         super().__init__(parent)
         self.setWindowTitle("€ générés - Détails")
-        self.setMinimumSize(1080, 460)
+        self.setMinimumSize(1180, 500)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -5571,7 +6241,8 @@ class RevenueDialog(QDialog):
         chart_v.setSpacing(4)
         self._kamas_chart = KamasHistoryChartPanel(self)
         chart_v.addWidget(self._kamas_chart, 1)
-        root.addWidget(chart_group, 2)
+        chart_group.setMinimumWidth(600)
+        root.addWidget(chart_group, 4)
 
         bus.prices_fetch_finished.connect(self._on_prices_fetch_finished)
         bus.revenue_updated.connect(self._on_bus_revenue_updated)
@@ -5811,6 +6482,12 @@ class RevenueDialog(QDialog):
         QTimer.singleShot(0, _apply)
 
     def closeEvent(self, e):
+        try:
+            kc = getattr(self, "_kamas_chart", None)
+            if kc is not None:
+                kc._flush_ui_state_to_disk()
+        except Exception:
+            pass
         try:
             bus.prices_fetch_finished.disconnect(self._on_prices_fetch_finished)
         except Exception:
