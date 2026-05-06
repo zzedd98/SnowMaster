@@ -505,6 +505,11 @@ DEFAULT_PREFS = {
         "stop": "stop.png",
         "trash": "poubelle.png",
     },
+    # Feature flags UI/fonctionnelles
+    "features": {
+        # False = désactive le nouveau panel graphique historique kamas + son alimentation.
+        "kamas_history_graph_enabled": False,
+    },
 }
 
 
@@ -2462,6 +2467,8 @@ def _append_kamas_history_event(kind: str, server: str, kamas_m: int):
     Enregistre un point d'historique (valeur absolue de kamas après MAJ + € figés au moment T).
     À appeler uniquement hors de tout bloc `with _revenue_lock:` (sinon deadlock si réentrance).
     """
+    if not is_kamas_history_graph_enabled():
+        return
     try:
         km = int(kamas_m)
     except Exception:
@@ -2664,6 +2671,19 @@ def save_prefs(prefs: dict):
             json.dump(prefs, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print("WARN save_prefs:", e)
+
+
+def is_kamas_history_graph_enabled() -> bool:
+    """Feature flag: active/désactive tout ce qui concerne le panel graphique d'historique."""
+    try:
+        prefs_obj = _prefs if isinstance(_prefs, dict) else {}
+    except Exception:
+        prefs_obj = {}
+    try:
+        features = prefs_obj.get("features", {}) if isinstance(prefs_obj, dict) else {}
+        return bool(features.get("kamas_history_graph_enabled", False))
+    except Exception:
+        return False
 
 
 def get_bot_root(prefs: dict) -> str:
@@ -6235,14 +6255,16 @@ class RevenueDialog(QDialog):
 
         root.addWidget(right_group, 1)
 
-        chart_group = QGroupBox("Historique kamas")
-        chart_v = QVBoxLayout(chart_group)
-        chart_v.setContentsMargins(6, 10, 6, 6)
-        chart_v.setSpacing(4)
-        self._kamas_chart = KamasHistoryChartPanel(self)
-        chart_v.addWidget(self._kamas_chart, 1)
-        chart_group.setMinimumWidth(600)
-        root.addWidget(chart_group, 4)
+        self._kamas_chart = None
+        if is_kamas_history_graph_enabled():
+            chart_group = QGroupBox("Historique kamas")
+            chart_v = QVBoxLayout(chart_group)
+            chart_v.setContentsMargins(6, 10, 6, 6)
+            chart_v.setSpacing(4)
+            self._kamas_chart = KamasHistoryChartPanel(self)
+            chart_v.addWidget(self._kamas_chart, 1)
+            chart_group.setMinimumWidth(600)
+            root.addWidget(chart_group, 4)
 
         bus.prices_fetch_finished.connect(self._on_prices_fetch_finished)
         bus.revenue_updated.connect(self._on_bus_revenue_updated)
