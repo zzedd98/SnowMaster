@@ -161,6 +161,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QFrame,
     QComboBox,
+    QTabWidget,
+    QScrollArea,
 )
 from PySide6.QtGui import QIcon, QColor
 from PySide6.QtWidgets import QStyledItemDelegate
@@ -292,6 +294,9 @@ HEARTBEAT_RED_S = 480  # Délai par défaut avant qu'un voyant passe au rouge (8
 # Contrôleur utilisé par le bouton PANIC (chemin vers le script contrôleur global)
 PANIC_CONTROLLER_PATH = ""
 MAX_LOGS_PER_INSTANCE = 1000
+MAX_HEARTBEAT_HISTORY = 800  # buffer RAM par widget (deque)
+HEARTBEAT_HISTORY_DEDUP_S = 8  # ignore HB identiques rapprochés
+HEARTBEAT_HISTORY_DISPLAY_MAX = 400  # lignes max affichées dans la popup
 CARD_HEIGHT = 62  # compact
 CARD_WIDTH = 320
 
@@ -380,6 +385,7 @@ DEFAULT_PREFS = {
     "autoRelaunch": True,  # conservé pour compat ; relance crash toujours active dans le code
     "autoReddotRelaunch": False,
     "reddotRelaunchDelay": 300,  # secondes en reddot avant reset automatique
+    "hb_history_enabled": True,  # stocker l'historique heartbeats en RAM
     "autopilot": {"enabled": False, "mode": "load_only", "schedules": []},
     "instances": {
         "launch_delay": 1,  # délai par défaut en secondes entre les relances
@@ -436,6 +442,14 @@ def static_shadows_enabled() -> bool:
     """Préférence UI (settings.json → ui.static_shadows_enabled) : ombres fixes panneau €."""
     try:
         return bool(_prefs.get("ui", {}).get("static_shadows_enabled", True))
+    except Exception:
+        return True
+
+
+def hb_history_storage_enabled() -> bool:
+    """Préférence : enregistrer l'historique heartbeats en RAM."""
+    try:
+        return bool(_prefs.get("hb_history_enabled", True))
     except Exception:
         return True
 
@@ -3061,6 +3075,175 @@ class InstanceState:
         self.restored_recently: bool = False  # <--- nouveau flag
         self.manual_empty: bool = False
         self.reddot_resettable: bool = True  # False après 1er reset auto reddot (cooldown 30 min)
+        self.hb_history: Deque = deque(maxlen=MAX_HEARTBEAT_HISTORY)
+        self._hb_dedup_key: Optional[tuple] = None
+        self._hb_dedup_ts: float = 0.0
+
+
+class HeartbeatSubLine:
+    """Une ligne d'historique = un sous-contrôleur dans un heartbeat, ou un marqueur reset."""
+
+    __slots__ = (
+        "batch_ts",
+        "sub_id",
+        "alias",
+        "sub_ts",
+        "label",
+        "is_green",
+        "line_text",
+        "filter_key",
+        "is_reset",
+        "show_in_launch_tab",
+    )
+
+    def __init__(
+        self,
+        batch_ts: float,
+        sub_id: str,
+        alias: str,
+        sub_ts: float,
+        label: str,
+        is_green: bool,
+        line_text: str,
+        *,
+        is_reset: bool = False,
+        show_in_launch_tab: bool = True,
+    ):
+        self.batch_ts = float(batch_ts)
+        self.sub_id = sub_id
+        self.alias = alias
+        self.sub_ts = float(sub_ts)
+        self.label = label
+        self.is_green = bool(is_green)
+        self.line_text = line_text
+        self.filter_key = sub_id
+        self.is_reset = bool(is_reset)
+        self.show_in_launch_tab = bool(show_in_launch_tab)
+
+
+def _hb_sub_is_green(sub_ts: float, ref_now: float) -> bool:
+    age = (ref_now - sub_ts) if sub_ts else 1e9
+    return age < float(HEARTBEAT_RED_S)
+
+
+def _format_hb_sub_line(
+    sub_ts: float, sub_id: str, alias: str, label: str, ref_now: float
+) -> Tuple[str, bool]:
+    is_green = _hb_sub_is_green(sub_ts, ref_now)
+    try:
+        hhmmss = (
+            datetime.fromtimestamp(sub_ts).strftime("%H:%M:%S")
+            if sub_ts
+            else "--:--:--"
+        )
+    except Exception:
+        hhmmss = "--:--:--"
+    dot = "🟢" if is_green else "🔴"
+    parts = [dot, f"[{sub_id}]", hhmmss]
+    if alias and alias != sub_id:
+        parts.append(alias)
+    if label:
+        parts.append(label)
+    line = "  ".join(parts)
+    return line, is_green
+
+
+def _record_heartbeat_history(inst: InstanceState, data: dict, now_ts: float) -> None:
+    """Append une ligne par sous-contrôleur (dédupliqué, sans I/O disque)."""
+    if not hb_history_storage_enabled():
+        return
+
+    label = str(
+        data.get("label") or data.get("status") or data.get("message") or ""
+    ).strip()
+
+    sub_rows: List[Tuple[str, str, float]] = []
+    if "subcontrollers" in data:
+        parsed = _parse_subcontrollers(data.get("subcontrollers"), now_ts)
+        for sid, info in parsed.items():
+            alias = (
+                str(info.get("alias") or sid)
+                if isinstance(info, dict)
+                else str(sid)
+            )
+            try:
+                sub_ts = (
+                    float(info.get("ts"))
+                    if isinstance(info, dict) and info.get("ts") is not None
+                    else float(now_ts)
+                )
+            except Exception:
+                sub_ts = float(now_ts)
+            sub_rows.append((str(sid), alias, sub_ts))
+    elif inst.sub_map:
+        for sid, info in inst.sub_map.items():
+            alias = (
+                str(info.get("alias") or sid)
+                if isinstance(info, dict)
+                else str(sid)
+            )
+            try:
+                sub_ts = (
+                    float(info.get("ts"))
+                    if isinstance(info, dict) and info.get("ts") is not None
+                    else float(now_ts)
+                )
+            except Exception:
+                sub_ts = float(now_ts)
+            sub_rows.append((str(sid), alias, sub_ts))
+
+    if not sub_rows:
+        sub_rows = [("Master", "Master", float(now_ts))]
+
+    dedup_key = tuple(
+        sorted((sid, alias, round(sub_ts, 3), label) for sid, alias, sub_ts in sub_rows)
+    )
+    last_key = getattr(inst, "_hb_dedup_key", None)
+    last_ts = float(getattr(inst, "_hb_dedup_ts", 0.0) or 0.0)
+    if last_key == dedup_key and (now_ts - last_ts) < HEARTBEAT_HISTORY_DEDUP_S:
+        return
+
+    inst._hb_dedup_key = dedup_key
+    inst._hb_dedup_ts = now_ts
+
+    for sid, alias, sub_ts in sub_rows:
+        line_text, is_green = _format_hb_sub_line(
+            sub_ts, sid, alias, label, now_ts
+        )
+        inst.hb_history.append(
+            HeartbeatSubLine(
+                now_ts, sid, alias, sub_ts, label, is_green, line_text
+            )
+        )
+
+
+def _record_instance_reset_history(title: str, now_ts: Optional[float] = None) -> None:
+    """Ajoute un marqueur « Reset de l'instance » (onglet All uniquement)."""
+    if not hb_history_storage_enabled():
+        return
+    now_ts = float(now_ts or time.time())
+    try:
+        hhmmss = datetime.fromtimestamp(now_ts).strftime("%H:%M:%S")
+    except Exception:
+        hhmmss = "--:--:--"
+    line_text = f"Reset de l'instance  {hhmmss}"
+    with _state_lock:
+        inst = _instances.get(title)
+        if not inst:
+            return
+        inst.hb_history.append(
+            HeartbeatSubLine(
+                now_ts,
+                "",
+                "",
+                now_ts,
+                "",
+                False,
+                line_text,
+                is_reset=True,
+                show_in_launch_tab=False,
+            )
+        )
 
 
 _instances: Dict[str, InstanceState] = {}
@@ -3725,6 +3908,8 @@ def api_heartbeat():
         # si c'était marqué restauré, on le retire pour repasser au vert
         if getattr(inst, "restored_recently", False):
             inst.restored_recently = False
+
+        _record_heartbeat_history(inst, data, now_ts)
 
         # sauvegarde dans le state global
         _instances[title] = inst
@@ -6629,11 +6814,331 @@ class CollapsibleGroupBox(QWidget):
         self._content_layout.addStretch(stretch)
 
 
+class HeartbeatHistoryDialog(QDialog):
+    """Historique heartbeats d'une instance — refresh manuel, filtres via setHidden (pas de rebuild texte)."""
+
+    _HB_LIST_STYLE = """
+        QListWidget#HbHistoryList {
+            background-color: #0b1220;
+            color: #cbd5e1;
+            border: 1px solid rgba(148,163,184,0.28);
+            border-radius: 8px;
+            font-family: Consolas, 'Courier New', monospace;
+            font-size: 12px;
+            outline: 0;
+        }
+        QListWidget#HbHistoryList::item {
+            padding: 2px 8px;
+            border: none;
+        }
+        QListWidget#HbHistoryList::item:selected {
+            background-color: rgba(37,99,235,0.35);
+            color: #f8fafc;
+        }
+    """
+
+    def __init__(self, parent, title: str):
+        super().__init__(parent)
+        self.title = title
+        self.setObjectName("HeartbeatHistoryDialog")
+        self.setWindowTitle(f"Heartbeats — {title}")
+        self.setMinimumSize(760, 480)
+        self._sub_filter_boxes: Dict[str, QCheckBox] = {}
+        self._filter_subs_key: Optional[frozenset] = None
+        self._building_filters = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        filter_group = QGroupBox("Filtres sous-contrôleurs")
+        filter_group.setObjectName("HbFilterGroup")
+        filter_outer = QVBoxLayout(filter_group)
+        filter_outer.setContentsMargins(8, 8, 8, 8)
+        filter_outer.setSpacing(6)
+
+        all_row = QHBoxLayout()
+        self.chk_filter_all = QCheckBox("Tous")
+        self.chk_filter_all.setChecked(True)
+        self.chk_filter_all.setCursor(Qt.PointingHandCursor)
+        self.chk_filter_all.stateChanged.connect(self._on_filter_all_changed)
+        all_row.addWidget(self.chk_filter_all)
+        all_row.addStretch(1)
+        filter_outer.addLayout(all_row)
+
+        self._filter_scroll = QScrollArea()
+        self._filter_scroll.setWidgetResizable(True)
+        self._filter_scroll.setFrameShape(QFrame.NoFrame)
+        self._filter_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._filter_scroll.setMaximumHeight(72)
+        self._filter_host = QWidget()
+        self._filter_layout = QHBoxLayout(self._filter_host)
+        self._filter_layout.setContentsMargins(0, 0, 0, 0)
+        self._filter_layout.setSpacing(8)
+        self._filter_layout.addStretch(1)
+        self._filter_scroll.setWidget(self._filter_host)
+        filter_outer.addWidget(self._filter_scroll)
+        root.addWidget(filter_group)
+
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("HbHistoryTabs")
+        self.list_launch = self._make_history_list()
+        self.list_session = self._make_history_list()
+        self.tabs.addTab(self.list_launch, "Dernière instance")
+        self.tabs.addTab(self.list_session, "All")
+        root.addWidget(self.tabs, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self.btn_refresh = QPushButton("Actualiser")
+        self.btn_clear = QPushButton("Vider l'historique")
+        self.btn_close = QPushButton("Fermer")
+        for b in (self.btn_refresh, self.btn_clear, self.btn_close):
+            b.setCursor(Qt.PointingHandCursor)
+        self.btn_refresh.clicked.connect(self.refresh)
+        self.btn_clear.clicked.connect(self.clear_history)
+        self.btn_close.clicked.connect(self.close)
+        btn_row.addWidget(self.btn_refresh)
+        btn_row.addWidget(self.btn_clear)
+        btn_row.addWidget(self.btn_close)
+        root.addLayout(btn_row)
+
+        self.setStyleSheet(
+            """
+            QDialog#HeartbeatHistoryDialog {
+                background-color: #0f172a;
+            }
+            QGroupBox#HbFilterGroup {
+                color: #94a3b8;
+                border: 1px solid rgba(148,163,184,0.28);
+                border-radius: 8px;
+                margin-top: 8px;
+                font-weight: 600;
+            }
+            QGroupBox#HbFilterGroup::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 4px;
+            }
+            QTabWidget#HbHistoryTabs::pane {
+                border: 1px solid rgba(59,130,246,0.45);
+                border-radius: 8px;
+                background: #0b1220;
+                top: -1px;
+            }
+            QTabWidget#HbHistoryTabs QTabBar::tab {
+                background: #1e293b;
+                color: #94a3b8;
+                border: 1px solid rgba(148,163,184,0.22);
+                border-bottom: none;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                padding: 5px 12px;
+                margin-right: 4px;
+                min-width: 0;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QTabWidget#HbHistoryTabs QTabBar::tab:selected {
+                background: #2563eb;
+                color: #ffffff;
+                border: 1px solid #3b82f6;
+                border-bottom: 2px solid #60a5fa;
+            }
+            QTabWidget#HbHistoryTabs QTabBar::tab:hover:!selected {
+                background: #334155;
+                color: #e2e8f0;
+            }
+            """
+            + self._HB_LIST_STYLE
+        )
+        self.refresh()
+
+    @staticmethod
+    def _make_history_list() -> QListWidget:
+        lst = QListWidget()
+        lst.setObjectName("HbHistoryList")
+        lst.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        lst.setUniformItemSizes(True)
+        lst.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        lst.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        return lst
+
+    def _make_list_item(self, line: HeartbeatSubLine) -> QListWidgetItem:
+        it = QListWidgetItem(line.line_text)
+        it.setData(Qt.UserRole, line)
+        if line.is_reset:
+            it.setForeground(QColor(CLR_YELLOW))
+        else:
+            it.setForeground(QColor(CLR_GREEN if line.is_green else CLR_RED))
+        return it
+
+    def _collect_subs_from_lines(self, lines: List[HeartbeatSubLine]) -> List[str]:
+        subs: set = set()
+        for ln in lines:
+            if ln.is_reset:
+                continue
+            if ln.filter_key:
+                subs.add(ln.filter_key)
+        return sorted(subs, key=str.lower)
+
+    def _sync_filter_checkboxes(self, lines: List[HeartbeatSubLine]) -> None:
+        subs = self._collect_subs_from_lines(lines)
+        new_key = frozenset(subs)
+        if new_key == self._filter_subs_key:
+            return
+        self._filter_subs_key = new_key
+        self._building_filters = True
+        try:
+            while self._filter_layout.count() > 1:
+                item = self._filter_layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.deleteLater()
+            self._sub_filter_boxes.clear()
+            default_checked = self.chk_filter_all.isChecked()
+            for sub in subs:
+                chk = QCheckBox(sub)
+                chk.setChecked(default_checked)
+                chk.setCursor(Qt.PointingHandCursor)
+                chk.stateChanged.connect(self._on_sub_filter_changed)
+                self._sub_filter_boxes[sub] = chk
+                self._filter_layout.insertWidget(
+                    self._filter_layout.count() - 1, chk
+                )
+            self.chk_filter_all.setEnabled(bool(subs))
+            if not subs:
+                self.chk_filter_all.setChecked(True)
+        finally:
+            self._building_filters = False
+
+    def _selected_sub_filters(self) -> Optional[frozenset]:
+        if self.chk_filter_all.isChecked() or not self._sub_filter_boxes:
+            return None
+        selected = {
+            name for name, chk in self._sub_filter_boxes.items() if chk.isChecked()
+        }
+        return frozenset(selected) if selected else frozenset()
+
+    def _line_visible(self, line: HeartbeatSubLine, allowed: Optional[frozenset]) -> bool:
+        if line.is_reset:
+            return True
+        if allowed is None:
+            return True
+        if not allowed:
+            return False
+        return line.filter_key in allowed
+
+    def _apply_filters(self) -> None:
+        if self._building_filters:
+            return
+        allowed = self._selected_sub_filters()
+        for lst in (self.list_launch, self.list_session):
+            for i in range(lst.count()):
+                it = lst.item(i)
+                line = it.data(Qt.UserRole)
+                if isinstance(line, HeartbeatSubLine):
+                    it.setHidden(not self._line_visible(line, allowed))
+
+    def _on_sub_filter_changed(self, _state=0) -> None:
+        if self._building_filters:
+            return
+        if self._sub_filter_boxes:
+            all_checked = all(c.isChecked() for c in self._sub_filter_boxes.values())
+            self._building_filters = True
+            try:
+                self.chk_filter_all.blockSignals(True)
+                self.chk_filter_all.setChecked(all_checked)
+                self.chk_filter_all.blockSignals(False)
+            finally:
+                self._building_filters = False
+        self._apply_filters()
+
+    def _on_filter_all_changed(self, _state) -> None:
+        all_on = self.chk_filter_all.isChecked()
+        self._building_filters = True
+        try:
+            for chk in self._sub_filter_boxes.values():
+                chk.blockSignals(True)
+                chk.setEnabled(True)
+                chk.setChecked(all_on)
+                chk.blockSignals(False)
+        finally:
+            self._building_filters = False
+        self._apply_filters()
+
+    def _scroll_lists_to_bottom(self) -> None:
+        for lst in (self.list_launch, self.list_session):
+            if lst.count() > 0:
+                lst.scrollToItem(lst.item(lst.count() - 1))
+
+    def refresh(self) -> None:
+        with _state_lock:
+            inst = _instances.get(self.title)
+            if not inst:
+                lines: List[HeartbeatSubLine] = []
+                last_reset = 0.0
+            else:
+                lines = list(inst.hb_history)
+                last_reset = float(getattr(inst, "last_reset", 0.0) or 0.0)
+
+        self._sync_filter_checkboxes(lines)
+
+        display_lines = lines[-HEARTBEAT_HISTORY_DISPLAY_MAX:]
+
+        self.list_launch.clear()
+        self.list_session.clear()
+
+        for ln in display_lines:
+            self.list_session.addItem(self._make_list_item(ln))
+            if ln.show_in_launch_tab and ln.batch_ts >= last_reset:
+                self.list_launch.addItem(self._make_list_item(ln))
+
+        if not display_lines:
+            placeholder = "Aucun heartbeat enregistré — cliquez sur Actualiser après réception."
+            for lst in (self.list_launch, self.list_session):
+                ph = QListWidgetItem(placeholder)
+                ph.setFlags(Qt.NoItemFlags)
+                ph.setForeground(QColor("#64748b"))
+                lst.addItem(ph)
+        else:
+            self._apply_filters()
+            self._scroll_lists_to_bottom()
+
+    def clear_history(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Vider l'historique",
+            f"Effacer tout l'historique heartbeats de « {self.title} » ?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        with _state_lock:
+            inst = _instances.get(self.title)
+            if inst:
+                inst.hb_history.clear()
+                inst._hb_dedup_key = None
+                inst._hb_dedup_ts = 0.0
+        self._filter_subs_key = None
+        self._sync_filter_checkboxes([])
+        self.list_launch.clear()
+        self.list_session.clear()
+        placeholder = "Historique vidé."
+        for lst in (self.list_launch, self.list_session):
+            ph = QListWidgetItem(placeholder)
+            ph.setFlags(Qt.NoItemFlags)
+            ph.setForeground(QColor("#64748b"))
+            lst.addItem(ph)
+
+
 class InstanceItemWidget(QWidget):
     requestFocus = Signal(str)
     requestRelaunch = Signal(str)
     requestKill = Signal(str)
     requestDelete = Signal(str)
+    requestHistory = Signal(str)
 
     def __init__(self, title: str):
         super().__init__()
@@ -6728,6 +7233,11 @@ class InstanceItemWidget(QWidget):
         )
         self.btn_kill.clicked.connect(lambda: self.requestKill.emit(self.title_id))
         self.btn_del.clicked.connect(lambda: self.requestDelete.emit(self.title_id))
+
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(
+            lambda _pos: self.requestHistory.emit(self.title_id)
+        )
 
     def _init_glow_widgets(self):
         """Crée l'effet d'ombre et l'animation (une seule fois par carte)."""
@@ -7361,6 +7871,7 @@ class SnowMasterGUI(QWidget):
         self._reddot_block_until: Dict[str, float] = {}  # title -> ts fin cooldown 30 min
         self._reddot_blocked_logged: set = set()  # évite de spammer les logs scan
         self._pending_resets: List[str] = []  # Queue de titres à reset
+        self._hb_history_dialogs: Dict[str, HeartbeatHistoryDialog] = {}
         self._init_reddot_log_state()
 
         # Autopilot state
@@ -7478,6 +7989,14 @@ class SnowMasterGUI(QWidget):
             self.on_toggle_auto_reddot_relaunch
         )
 
+        self.chk_hb_history = QCheckBox("Stocker historique")
+        self.chk_hb_history.setChecked(hb_history_storage_enabled())
+        self.chk_hb_history.setToolTip(
+            "Coché : enregistre l'historique heartbeats en mémoire (popup clic droit).\n"
+            "Décoché : aucun stockage — léger gain si vous n'utilisez pas cette fonction."
+        )
+        self.chk_hb_history.stateChanged.connect(self.on_toggle_hb_history)
+
         # Lecture initiale des prefs pour les instances
         instances_prefs = _prefs.get("instances", {})
         default_delay = int(instances_prefs.get("launch_delay", 1))
@@ -7590,6 +8109,7 @@ class SnowMasterGUI(QWidget):
         )
 
         inst_group_collapsible.addWidget(self.chk_auto_reddot_relaunch)
+        inst_group_collapsible.addWidget(self.chk_hb_history)
         # inst_group_collapsible.addWidget(self.btn_save_cfg)
         # inst_group_collapsible.addWidget(self.btn_load_cfg)
         # Checkbox: overwrite existing instances when loading a config
@@ -8801,6 +9321,7 @@ class SnowMasterGUI(QWidget):
             card.requestRelaunch.connect(self.on_card_relaunch)
             card.requestKill.connect(self.on_card_kill)
             card.requestDelete.connect(self.on_card_delete)
+            card.requestHistory.connect(self.on_card_show_history)
 
             self.list.addItem(it)
             self.list.setItemWidget(it, card)
@@ -8808,6 +9329,9 @@ class SnowMasterGUI(QWidget):
 
         card: InstanceItemWidget = self.list.itemWidget(it)
         if card:
+            if not getattr(card, "_hb_history_connected", False):
+                card.requestHistory.connect(self.on_card_show_history)
+                card._hb_history_connected = True
             card.set_title(inst.title)
             color = self.instance_color(inst)
             extra = self.fmt_last_update(
@@ -9275,9 +9799,36 @@ class SnowMasterGUI(QWidget):
             ),
         )
 
+    def on_card_show_history(self, title: str):
+        """Ouvre la popup d'historique heartbeats (une fenêtre par titre, refresh manuel)."""
+        if not title:
+            return
+        dlg = self._hb_history_dialogs.get(title)
+        if dlg is None:
+            dlg = HeartbeatHistoryDialog(self, title)
+            self._hb_history_dialogs[title] = dlg
+
+            def _on_closed(_result=None, t=title):
+                if self._hb_history_dialogs.get(t) is dlg:
+                    self._hb_history_dialogs.pop(t, None)
+
+            dlg.finished.connect(_on_closed)
+        else:
+            dlg.refresh()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
     def on_card_delete(self, title: str):
         if not title:
             return
+
+        dlg = self._hb_history_dialogs.pop(title, None)
+        if dlg is not None:
+            try:
+                dlg.close()
+            except Exception:
+                pass
 
         # tenter d'arrêter proprement (best-effort) via la méthode existante
         try:
@@ -10704,6 +11255,7 @@ class SnowMasterGUI(QWidget):
 
         for title in resets_to_process:
             try:
+                _record_instance_reset_history(title)
                 # Kill le processus
                 self._kill_instance_sync(title)
                 # Émettre le signal pour relancer dans le thread UI
@@ -11108,6 +11660,14 @@ class SnowMasterGUI(QWidget):
             "Relance auto reddot "
             f"{'activée' if self.auto_reddot_relaunch_enabled else 'désactivée'} "
             "— instances actives remises resettable"
+        )
+
+    def on_toggle_hb_history(self, _state):
+        val = bool(self.chk_hb_history.isChecked())
+        _prefs["hb_history_enabled"] = val
+        save_prefs(_prefs)
+        app_log_info(
+            f"Stockage historique heartbeats {'activé' if val else 'désactivé'}"
         )
 
     def on_change_reddot_relaunch_delay(self, value: int):
