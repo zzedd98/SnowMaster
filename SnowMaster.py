@@ -336,6 +336,9 @@ AUTO_RELAUNCH_DEFAULT = True  # relance crash toujours active (plus de case à c
 AUTO_RELAUNCH_COOLDOWN_S = 10  # anti-spam par instance
 AUTO_REDDOT_RELAUNCH_DEFAULT = False
 AUTO_REDDOT_RELAUNCH_DELAY_DEFAULT = 300  # secondes en reddot avant reset
+REDDOT_SECOND_RESET_COOLDOWN_S = 30 * 60  # pas de 2e reset auto avant 30 min
+REDDOT_LOG_BASENAME = "reddot.log"
+REDDOT_LOG_LINE_RE = re.compile(r"^(.+):(\d{2}/\d{2}/\d{4}) (\d{2})h(\d{2})$")
 
 # ======== SERVER DISPLAY ORDER ========
 SERVER_KAMAS_DISPLAY_ORDER = [
@@ -435,6 +438,79 @@ def static_shadows_enabled() -> bool:
         return bool(_prefs.get("ui", {}).get("static_shadows_enabled", True))
     except Exception:
         return True
+
+
+_reddot_log_lock = threading.Lock()
+
+
+def reddot_log_path() -> str:
+    return os.path.join(ANKADIR, REDDOT_LOG_BASENAME)
+
+
+def _parse_reddot_log_line(line: str) -> Optional[Tuple[str, float]]:
+    line = (line or "").strip()
+    if not line:
+        return None
+    m = REDDOT_LOG_LINE_RE.match(line)
+    if not m:
+        return None
+    title = m.group(1).strip()
+    date_str = f"{m.group(2)} {m.group(3)}h{m.group(4)}"
+    try:
+        dt = datetime.strptime(date_str, "%d/%m/%Y %Hh%M")
+        return title, dt.timestamp()
+    except ValueError:
+        return None
+
+
+def load_reddot_log_entries() -> Dict[str, float]:
+    """Charge reddot.log en mémoire (title -> timestamp unix du dernier reset reddot)."""
+    entries: Dict[str, float] = {}
+    path = reddot_log_path()
+    if not os.path.exists(path):
+        return entries
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                parsed = _parse_reddot_log_line(line)
+                if not parsed:
+                    continue
+                title, ts = parsed
+                entries[title] = max(entries.get(title, 0.0), ts)
+    except Exception as e:
+        app_log_warn(f"Impossible de lire {REDDOT_LOG_BASENAME}: {e}")
+    return entries
+
+
+def save_reddot_log_entries(entries: Dict[str, float]) -> None:
+    """Réécrit reddot.log depuis le cache mémoire."""
+    path = reddot_log_path()
+    try:
+        lines = []
+        for title in sorted(entries.keys()):
+            ts = entries[title]
+            dt_str = datetime.fromtimestamp(ts).strftime("%d/%m/%Y %Hh%M")
+            lines.append(f"{title}:{dt_str}")
+        content = "\n".join(lines)
+        if content:
+            content += "\n"
+        with _reddot_log_lock:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp, path)
+    except Exception as e:
+        app_log_error(f"Impossible d'écrire {REDDOT_LOG_BASENAME}: {e}")
+
+
+def record_reddot_reset_in_log(
+    entries_cache: Dict[str, float], title: str, when: Optional[float] = None
+) -> float:
+    """Enregistre un reset reddot dans le cache + reddot.log."""
+    when = float(when or time.time())
+    entries_cache[title] = when
+    save_reddot_log_entries(entries_cache)
+    return when
 
 
 def _sub_map_fingerprint(sub_map: dict) -> str:
@@ -2984,6 +3060,7 @@ class InstanceState:
         self.ratio: float = 0.5
         self.restored_recently: bool = False  # <--- nouveau flag
         self.manual_empty: bool = False
+        self.reddot_resettable: bool = True  # False après 1er reset auto reddot (cooldown 30 min)
 
 
 _instances: Dict[str, InstanceState] = {}
@@ -7280,7 +7357,11 @@ class SnowMasterGUI(QWidget):
         self._last_auto_relaunch_attempt: Dict[str, float] = {}  # title -> ts
         self._last_auto_reddot_relaunch_attempt: Dict[str, float] = {}  # title -> ts
         self._reddot_since: Dict[str, float] = {}  # title -> ts début reddot
+        self._reddot_log_cache: Dict[str, float] = {}  # title -> ts dernier reset reddot (miroir reddot.log)
+        self._reddot_block_until: Dict[str, float] = {}  # title -> ts fin cooldown 30 min
+        self._reddot_blocked_logged: set = set()  # évite de spammer les logs scan
         self._pending_resets: List[str] = []  # Queue de titres à reset
+        self._init_reddot_log_state()
 
         # Autopilot state
         ap = _prefs.get("autopilot", {})
@@ -10267,6 +10348,40 @@ class SnowMasterGUI(QWidget):
             return False
         return self.instance_color(inst) == CLR_RED
 
+    def _init_reddot_log_state(self):
+        """Charge reddot.log une fois au démarrage et restaure les cooldowns 30 min en mémoire."""
+        self._reddot_log_cache = load_reddot_log_entries()
+        now = time.time()
+        for title, ts in self._reddot_log_cache.items():
+            block_until = ts + REDDOT_SECOND_RESET_COOLDOWN_S
+            if now < block_until:
+                self._reddot_block_until[title] = block_until
+
+    def _reddot_reset_cooldown_active(self, title: str, now: float) -> bool:
+        """True si un reset auto reddot est encore bloqué (30 min depuis le dernier reset)."""
+        block_until = self._reddot_block_until.get(title)
+        if block_until is None:
+            return False
+        if now < block_until:
+            return True
+        self._reddot_block_until.pop(title, None)
+        self._reddot_blocked_logged.discard(title)
+        with _state_lock:
+            inst = _instances.get(title)
+            if inst:
+                inst.reddot_resettable = True
+        return False
+
+    def _mark_reddot_reset_done(self, title: str, now: float):
+        """Enregistre le reset dans reddot.log et bloque un 2e reset pendant 30 min."""
+        block_ts = record_reddot_reset_in_log(self._reddot_log_cache, title, now)
+        self._reddot_block_until[title] = block_ts + REDDOT_SECOND_RESET_COOLDOWN_S
+        self._reddot_blocked_logged.discard(title)
+        with _state_lock:
+            inst = _instances.get(title)
+            if inst:
+                inst.reddot_resettable = False
+
     def _check_reddot_relaunch(self):
         """Reset les instances restées en reddot plus longtemps que le délai configuré."""
         if not self.auto_reddot_relaunch_enabled:
@@ -10285,11 +10400,29 @@ class SnowMasterGUI(QWidget):
         for title, inst in instances:
             if inst.stopped:
                 self._reddot_since.pop(title, None)
+                self._reddot_blocked_logged.discard(title)
                 continue
 
             if not self._is_instance_reddot(inst):
                 self._reddot_since.pop(title, None)
+                self._reddot_blocked_logged.discard(title)
                 continue
+
+            if self._reddot_reset_cooldown_active(title, now):
+                with _state_lock:
+                    inst.reddot_resettable = False
+                if title not in self._reddot_blocked_logged:
+                    remaining = int(self._reddot_block_until.get(title, now) - now)
+                    scan_log(
+                        f"[REDDOT_RELAUNCH] '{title}': reset bloqué "
+                        f"({remaining}s restants, cooldown 30 min)"
+                    )
+                    self._reddot_blocked_logged.add(title)
+                continue
+
+            if not getattr(inst, "reddot_resettable", True):
+                with _state_lock:
+                    inst.reddot_resettable = True
 
             since = self._reddot_since.get(title)
             if since is None:
@@ -10318,6 +10451,7 @@ class SnowMasterGUI(QWidget):
             )
             self._last_auto_reddot_relaunch_attempt[title] = now
             self._reddot_since.pop(title, None)
+            self._mark_reddot_reset_done(title, now)
             with _state_lock:
                 if title not in self._pending_resets:
                     self._pending_resets.append(title)
@@ -10954,12 +11088,27 @@ class SnowMasterGUI(QWidget):
     def on_bus_remove(self, title: str):
         pass
 
+    def _reset_all_active_reddot_resettable(self):
+        """Remet reddot_resettable=True sur toutes les instances actives (action UI)."""
+        with _state_lock:
+            for title, inst in _instances.items():
+                if inst.stopped:
+                    continue
+                inst.reddot_resettable = True
+                self._reddot_block_until.pop(title, None)
+        self._reddot_since.clear()
+        self._reddot_blocked_logged.clear()
+
     def on_toggle_auto_reddot_relaunch(self, _state):
         self.auto_reddot_relaunch_enabled = self.chk_auto_reddot_relaunch.isChecked()
         _prefs["autoReddotRelaunch"] = bool(self.auto_reddot_relaunch_enabled)
         save_prefs(_prefs)
-        if not self.auto_reddot_relaunch_enabled:
-            self._reddot_since.clear()
+        self._reset_all_active_reddot_resettable()
+        app_log_info(
+            "Relance auto reddot "
+            f"{'activée' if self.auto_reddot_relaunch_enabled else 'désactivée'} "
+            "— instances actives remises resettable"
+        )
 
     def on_change_reddot_relaunch_delay(self, value: int):
         """Met à jour le délai avant reset auto d'une instance en reddot."""
