@@ -294,9 +294,9 @@ HEARTBEAT_RED_S = 480  # Délai par défaut avant qu'un voyant passe au rouge (8
 # Contrôleur utilisé par le bouton PANIC (chemin vers le script contrôleur global)
 PANIC_CONTROLLER_PATH = ""
 MAX_LOGS_PER_INSTANCE = 1000
-MAX_HEARTBEAT_HISTORY = 800  # buffer RAM par widget (deque)
+MAX_HEARTBEAT_HISTORY = 1000  # buffer RAM par widget (deque)
 HEARTBEAT_HISTORY_DEDUP_S = 8  # ignore HB identiques rapprochés
-HEARTBEAT_HISTORY_DISPLAY_MAX = 400  # lignes max affichées dans la popup
+HEARTBEAT_HISTORY_DISPLAY_DEFAULT = 500  # lignes affichées par défaut dans la popup
 CARD_HEIGHT = 62  # compact
 CARD_WIDTH = 320
 
@@ -6817,6 +6817,8 @@ class CollapsibleGroupBox(QWidget):
 class HeartbeatHistoryDialog(QDialog):
     """Historique heartbeats d'une instance — refresh manuel, filtres via setHidden (pas de rebuild texte)."""
 
+    _HB_ROW_H = 17  # hauteur fixe compacte (indépendante du thème OS)
+
     _HB_LIST_STYLE = """
         QListWidget#HbHistoryList {
             background-color: #0b1220;
@@ -6828,12 +6830,24 @@ class HeartbeatHistoryDialog(QDialog):
             outline: 0;
         }
         QListWidget#HbHistoryList::item {
-            padding: 2px 8px;
+            padding: 0px 6px;
+            margin: 0px;
             border: none;
+            border-radius: 0px;
+            min-height: 17px;
+            max-height: 17px;
         }
         QListWidget#HbHistoryList::item:selected {
             background-color: rgba(37,99,235,0.35);
             color: #f8fafc;
+            border-radius: 0px;
+        }
+        QListWidget#HbHistoryList::item:selected:!active {
+            background-color: rgba(37,99,235,0.35);
+            border-radius: 0px;
+        }
+        QListWidget#HbHistoryList::item:focus {
+            outline: none;
         }
     """
 
@@ -6846,6 +6860,9 @@ class HeartbeatHistoryDialog(QDialog):
         self._sub_filter_boxes: Dict[str, QCheckBox] = {}
         self._filter_subs_key: Optional[frozenset] = None
         self._building_filters = False
+        self._show_all_history = False
+        self._show_all_anim = None
+        self._lbl_range_default_style = "color: #94a3b8; font-size: 12px;"
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -6880,6 +6897,23 @@ class HeartbeatHistoryDialog(QDialog):
         filter_outer.addWidget(self._filter_scroll)
         root.addWidget(filter_group)
 
+        hist_header = QHBoxLayout()
+        hist_header.setSpacing(8)
+        self.lbl_range = QLabel("—")
+        self.lbl_range.setObjectName("HbRangeLabel")
+        self.lbl_range.setStyleSheet(self._lbl_range_default_style)
+        self.btn_show_all = QPushButton("Afficher TOUT")
+        self.btn_show_all.setCheckable(True)
+        self.btn_show_all.setCursor(Qt.PointingHandCursor)
+        self.btn_show_all.setToolTip(
+            "Affiche l'intégralité de l'historique en mémoire (max 1000 lignes).\n"
+            "Par défaut seules les 500 dernières sont chargées (plus léger)."
+        )
+        self.btn_show_all.toggled.connect(self._on_show_all_toggled)
+        hist_header.addWidget(self.lbl_range, 1)
+        hist_header.addWidget(self.btn_show_all, 0)
+        root.addLayout(hist_header)
+
         self.tabs = QTabWidget()
         self.tabs.setObjectName("HbHistoryTabs")
         self.list_launch = self._make_history_list()
@@ -6892,14 +6926,16 @@ class HeartbeatHistoryDialog(QDialog):
         btn_row.addStretch(1)
         self.btn_refresh = QPushButton("Actualiser")
         self.btn_clear = QPushButton("Vider l'historique")
+        self.btn_clear.setObjectName("HbClearBtn")
         self.btn_close = QPushButton("Fermer")
         for b in (self.btn_refresh, self.btn_clear, self.btn_close):
             b.setCursor(Qt.PointingHandCursor)
+        self.btn_clear.setToolTip("Efface définitivement l'historique en mémoire (irréversible).")
         self.btn_refresh.clicked.connect(self.refresh)
         self.btn_clear.clicked.connect(self.clear_history)
         self.btn_close.clicked.connect(self.close)
-        btn_row.addWidget(self.btn_refresh)
         btn_row.addWidget(self.btn_clear)
+        btn_row.addWidget(self.btn_refresh)
         btn_row.addWidget(self.btn_close)
         root.addLayout(btn_row)
 
@@ -6949,9 +6985,28 @@ class HeartbeatHistoryDialog(QDialog):
                 background: #334155;
                 color: #e2e8f0;
             }
+            QPushButton#HbShowAllBtn:checked {
+                background-color: #1d4ed8;
+                border: 1px solid #60a5fa;
+            }
+            QPushButton#HbClearBtn {
+                background-color: #dc2626;
+                color: #fef2f2;
+                border: none;
+                border-radius: 10px;
+                padding: 6px 10px;
+                font-weight: 600;
+            }
+            QPushButton#HbClearBtn:hover {
+                background-color: #ef4444;
+            }
+            QPushButton#HbClearBtn:pressed {
+                background-color: #b91c1c;
+            }
             """
             + self._HB_LIST_STYLE
         )
+        self.btn_show_all.setObjectName("HbShowAllBtn")
         self.refresh()
 
     @staticmethod
@@ -6960,6 +7015,7 @@ class HeartbeatHistoryDialog(QDialog):
         lst.setObjectName("HbHistoryList")
         lst.setSelectionMode(QAbstractItemView.ExtendedSelection)
         lst.setUniformItemSizes(True)
+        lst.setSpacing(0)
         lst.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         lst.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         return lst
@@ -6967,6 +7023,7 @@ class HeartbeatHistoryDialog(QDialog):
     def _make_list_item(self, line: HeartbeatSubLine) -> QListWidgetItem:
         it = QListWidgetItem(line.line_text)
         it.setData(Qt.UserRole, line)
+        it.setSizeHint(QSize(0, self._HB_ROW_H))
         if line.is_reset:
             it.setForeground(QColor(CLR_YELLOW))
         else:
@@ -7072,7 +7129,73 @@ class HeartbeatHistoryDialog(QDialog):
             if lst.count() > 0:
                 lst.scrollToItem(lst.item(lst.count() - 1))
 
-    def refresh(self) -> None:
+    @staticmethod
+    def _pick_display_lines(
+        lines: List[HeartbeatSubLine], show_all: bool
+    ) -> Tuple[List[HeartbeatSubLine], str]:
+        total = len(lines)
+        if total == 0:
+            return [], "Aucune ligne en mémoire"
+
+        if show_all or total <= HEARTBEAT_HISTORY_DISPLAY_DEFAULT:
+            start = 1
+            end = total
+            if show_all and total > HEARTBEAT_HISTORY_DISPLAY_DEFAULT:
+                text = f"1-{end} toutes les lignes ({total} au total)"
+            else:
+                text = f"{start}-{end} dernières lignes ({total} au total)"
+            return lines, text
+
+        chunk = lines[-HEARTBEAT_HISTORY_DISPLAY_DEFAULT:]
+        start = total - len(chunk) + 1
+        end = total
+        text = f"{start}-{end} dernières lignes ({total} au total)"
+        return chunk, text
+
+    def _update_show_all_button(self, total: int) -> None:
+        can_expand = total > HEARTBEAT_HISTORY_DISPLAY_DEFAULT
+        self.btn_show_all.blockSignals(True)
+        if not can_expand:
+            self._show_all_history = False
+            self.btn_show_all.setChecked(False)
+        self.btn_show_all.setEnabled(can_expand)
+        self.btn_show_all.blockSignals(False)
+
+    def _reset_range_label_style(self) -> None:
+        self.lbl_range.setStyleSheet(self._lbl_range_default_style)
+
+    def _play_show_all_animation(self) -> None:
+        """Flash léger du compteur + fondu court de la liste (uniquement au clic « TOUT »)."""
+        self.lbl_range.setStyleSheet(
+            "color: #34d399; font-size: 12px; font-weight: 600;"
+        )
+        QTimer.singleShot(450, self._reset_range_label_style)
+
+        target = self.tabs
+        eff = QGraphicsOpacityEffect(target)
+        eff.setOpacity(0.4)
+        target.setGraphicsEffect(eff)
+        anim = QPropertyAnimation(eff, b"opacity", self)
+        anim.setDuration(320)
+        anim.setStartValue(0.4)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+
+        def _cleanup():
+            try:
+                target.setGraphicsEffect(None)
+            except Exception:
+                pass
+
+        anim.finished.connect(_cleanup)
+        self._show_all_anim = anim
+        anim.start()
+
+    def _on_show_all_toggled(self, checked: bool) -> None:
+        self._show_all_history = bool(checked)
+        self.refresh(animate_show_all=checked)
+
+    def refresh(self, *, animate_show_all: bool = False) -> None:
         with _state_lock:
             inst = _instances.get(self.title)
             if not inst:
@@ -7082,9 +7205,14 @@ class HeartbeatHistoryDialog(QDialog):
                 lines = list(inst.hb_history)
                 last_reset = float(getattr(inst, "last_reset", 0.0) or 0.0)
 
+        total = len(lines)
+        self._update_show_all_button(total)
         self._sync_filter_checkboxes(lines)
 
-        display_lines = lines[-HEARTBEAT_HISTORY_DISPLAY_MAX:]
+        display_lines, range_text = self._pick_display_lines(
+            lines, self._show_all_history
+        )
+        self.lbl_range.setText(range_text)
 
         self.list_launch.clear()
         self.list_session.clear()
@@ -7095,6 +7223,7 @@ class HeartbeatHistoryDialog(QDialog):
                 self.list_launch.addItem(self._make_list_item(ln))
 
         if not display_lines:
+            self.lbl_range.setText("Aucune ligne en mémoire")
             placeholder = "Aucun heartbeat enregistré — cliquez sur Actualiser après réception."
             for lst in (self.list_launch, self.list_session):
                 ph = QListWidgetItem(placeholder)
@@ -7104,6 +7233,8 @@ class HeartbeatHistoryDialog(QDialog):
         else:
             self._apply_filters()
             self._scroll_lists_to_bottom()
+            if animate_show_all:
+                QTimer.singleShot(0, self._play_show_all_animation)
 
     def clear_history(self) -> None:
         reply = QMessageBox.question(
@@ -7122,7 +7253,12 @@ class HeartbeatHistoryDialog(QDialog):
                 inst._hb_dedup_key = None
                 inst._hb_dedup_ts = 0.0
         self._filter_subs_key = None
+        self._show_all_history = False
+        self.btn_show_all.blockSignals(True)
+        self.btn_show_all.setChecked(False)
+        self.btn_show_all.blockSignals(False)
         self._sync_filter_checkboxes([])
+        self.lbl_range.setText("Aucune ligne en mémoire")
         self.list_launch.clear()
         self.list_session.clear()
         placeholder = "Historique vidé."
