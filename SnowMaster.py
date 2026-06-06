@@ -332,8 +332,10 @@ SERVER_SCRAPE_NAME = {
 }
 
 # ======== AUTO RELAUNCH CONFIG ========
-AUTO_RELAUNCH_DEFAULT = True
+AUTO_RELAUNCH_DEFAULT = True  # relance crash toujours active (plus de case à cocher)
 AUTO_RELAUNCH_COOLDOWN_S = 10  # anti-spam par instance
+AUTO_REDDOT_RELAUNCH_DEFAULT = False
+AUTO_REDDOT_RELAUNCH_DELAY_DEFAULT = 300  # secondes en reddot avant reset
 
 # ======== SERVER DISPLAY ORDER ========
 SERVER_KAMAS_DISPLAY_ORDER = [
@@ -372,7 +374,9 @@ DEFAULT_PREFS = {
     # Client orchestré : "snowbot" (app = SnowMaster) ou "ankabot" (app = AnkaMaster)
     # Valeurs supportées : "snowbot" | "ankabot"
     "appVariant": "snowbot",
-    "autoRelaunch": True,
+    "autoRelaunch": True,  # conservé pour compat ; relance crash toujours active dans le code
+    "autoReddotRelaunch": False,
+    "reddotRelaunchDelay": 300,  # secondes en reddot avant reset automatique
     "autopilot": {"enabled": False, "mode": "load_only", "schedules": []},
     "instances": {
         "launch_delay": 1,  # délai par défaut en secondes entre les relances
@@ -418,7 +422,7 @@ DEFAULT_PREFS = {
 
 
 def card_animations_enabled() -> bool:
-    """Préférence UI : ombre animée sur les cartes d'instance (sinon bordure statique uniquement)."""
+    """Préférence UI (settings.json → ui.card_animations_enabled) : ombre animée sur les cartes."""
     try:
         return bool(_prefs.get("ui", {}).get("card_animations_enabled", True))
     except Exception:
@@ -426,6 +430,7 @@ def card_animations_enabled() -> bool:
 
 
 def static_shadows_enabled() -> bool:
+    """Préférence UI (settings.json → ui.static_shadows_enabled) : ombres fixes panneau €."""
     try:
         return bool(_prefs.get("ui", {}).get("static_shadows_enabled", True))
     except Exception:
@@ -7262,13 +7267,19 @@ class SnowMasterGUI(QWidget):
             self._tray_icon = None
 
         # Flags / state
-        self.auto_relaunch_enabled = bool(
-            _prefs.get("autoRelaunch", AUTO_RELAUNCH_DEFAULT)
+        self.auto_relaunch_enabled = True  # relance crash toujours active
+        self.auto_reddot_relaunch_enabled = bool(
+            _prefs.get("autoReddotRelaunch", AUTO_REDDOT_RELAUNCH_DEFAULT)
         )
-        # Discord alert config (voyant global rouge)
+        self.reddot_relaunch_delay_s = int(
+            _prefs.get("reddotRelaunchDelay", AUTO_REDDOT_RELAUNCH_DELAY_DEFAULT)
+        )
+        # Discord alert (voyant global rouge) : piloté par discord.enabled dans settings.json
         discord_cfg = _prefs.get("discord", {})
         self.discord_alert_enabled = bool(discord_cfg.get("enabled", False))
         self._last_auto_relaunch_attempt: Dict[str, float] = {}  # title -> ts
+        self._last_auto_reddot_relaunch_attempt: Dict[str, float] = {}  # title -> ts
+        self._reddot_since: Dict[str, float] = {}  # title -> ts début reddot
         self._pending_resets: List[str] = []  # Queue de titres à reset
 
         # Autopilot state
@@ -7376,47 +7387,15 @@ class SnowMasterGUI(QWidget):
         self.btn_save_cfg.clicked.connect(self.on_save_config)
         self.btn_load_cfg.clicked.connect(self.on_load_config)
 
-        self.chk_auto_relaunch = QCheckBox("Relance auto crash")
-        self.chk_auto_relaunch.setChecked(self.auto_relaunch_enabled)
-        self.chk_auto_relaunch.setToolTip(
-            "Si coché : scan PID régulier pour détecter et relancer les instances crashées"
+        self.chk_auto_reddot_relaunch = QCheckBox("Relance auto reddot")
+        self.chk_auto_reddot_relaunch.setChecked(self.auto_reddot_relaunch_enabled)
+        self.chk_auto_reddot_relaunch.setToolTip(
+            "Si coché : reset automatique des instances dont le voyant est rouge "
+            "depuis plus longtemps que le délai configuré."
         )
-        self.chk_auto_relaunch.stateChanged.connect(self.on_toggle_auto_relaunch)
-
-        # Checkbox : envoi d'un Discord hook quand le voyant global passe au rouge
-        self.chk_discord_alert = QCheckBox("Discord alert (voyant rouge)")
-        self.chk_discord_alert.setChecked(self.discord_alert_enabled)
-        self.chk_discord_alert.setToolTip(
-            f"Si coché : envoie un webhook Discord quand le voyant global {APP_DISPLAY_NAME} passe au ROUGE."
+        self.chk_auto_reddot_relaunch.stateChanged.connect(
+            self.on_toggle_auto_reddot_relaunch
         )
-        self.chk_discord_alert.stateChanged.connect(self.on_toggle_discord_alert)
-
-        self.chk_card_animations = QCheckBox("Animations des cartes")
-        try:
-            init_card_anim = bool(
-                _prefs.get("ui", {}).get("card_animations_enabled", True)
-            )
-        except Exception:
-            init_card_anim = True
-        self.chk_card_animations.setChecked(init_card_anim)
-        self.chk_card_animations.setToolTip(
-            "Coché : bordure colorée + ombre pulsée.\n"
-            "Décoché : bordure colorée statique uniquement (moins de charge CPU)."
-        )
-        self.chk_card_animations.stateChanged.connect(self.on_toggle_card_animations)
-
-        self.chk_static_shadows = QCheckBox("Ombres UI (panneau €)")
-        try:
-            init_static_shadows = bool(
-                _prefs.get("ui", {}).get("static_shadows_enabled", True)
-            )
-        except Exception:
-            init_static_shadows = True
-        self.chk_static_shadows.setChecked(init_static_shadows)
-        self.chk_static_shadows.setToolTip(
-            "Désactivé : retire les ombres portées fixes (léger gain CPU/GPU)."
-        )
-        self.chk_static_shadows.stateChanged.connect(self.on_toggle_static_shadows)
 
         # Lecture initiale des prefs pour les instances
         instances_prefs = _prefs.get("instances", {})
@@ -7441,6 +7420,24 @@ class SnowMasterGUI(QWidget):
             "Délai avant qu'un voyant passe au ROUGE en l'absence de heartbeat (en secondes). Utilisez la molette de la souris pour modifier."
         )
         self.spin_reddot.valueChanged.connect(self.on_change_reddot)
+
+        default_reddot_relaunch_delay = int(
+            _prefs.get("reddotRelaunchDelay", AUTO_REDDOT_RELAUNCH_DELAY_DEFAULT)
+        )
+        self.spin_reddot_relaunch_delay = CustomSpinBox(
+            self,
+            min_value=60,
+            max_value=3600,
+            initial_value=default_reddot_relaunch_delay,
+            suffix="",
+        )
+        self.spin_reddot_relaunch_delay.setToolTip(
+            "Délai (en secondes) pendant lequel une instance peut rester en reddot "
+            "avant d'être reset automatiquement. Utilisez la molette de la souris pour modifier."
+        )
+        self.spin_reddot_relaunch_delay.valueChanged.connect(
+            self.on_change_reddot_relaunch_delay
+        )
 
         # ComboBox : Mode pour le chargement d'une config (load_only / load_and_launch)
         self.chk_instance_launch = QCheckBox("Load and launch")
@@ -7511,10 +7508,7 @@ class SnowMasterGUI(QWidget):
             )
         )
 
-        inst_group_collapsible.addWidget(self.chk_auto_relaunch)
-        inst_group_collapsible.addWidget(self.chk_discord_alert)
-        inst_group_collapsible.addWidget(self.chk_card_animations)
-        inst_group_collapsible.addWidget(self.chk_static_shadows)
+        inst_group_collapsible.addWidget(self.chk_auto_reddot_relaunch)
         # inst_group_collapsible.addWidget(self.btn_save_cfg)
         # inst_group_collapsible.addWidget(self.btn_load_cfg)
         # Checkbox: overwrite existing instances when loading a config
@@ -7537,6 +7531,8 @@ class SnowMasterGUI(QWidget):
         inst_group_collapsible.addWidget(self.spin_launch_delay)
         inst_group_collapsible.addWidget(QLabel("Délai reddot (60s minimum) :"))
         inst_group_collapsible.addWidget(self.spin_reddot)
+        inst_group_collapsible.addWidget(QLabel("Délai relance reddot (s) :"))
+        inst_group_collapsible.addWidget(self.spin_reddot_relaunch_delay)
         # inst_group_collapsible.addWidget(self.chk_instance_launch)
 
         ap_group_collapsible = CollapsibleGroupBox("Autopilote")
@@ -7868,8 +7864,7 @@ class SnowMasterGUI(QWidget):
         scan_ms = int(_prefs.get("instances", {}).get("scan_pid_interval_ms", 30000))
         self.timer_pid_scan = QTimer(self)
         self.timer_pid_scan.timeout.connect(self._scan_pids_periodic)
-        if self.auto_relaunch_enabled:
-            self.timer_pid_scan.start(max(5000, scan_ms))
+        self.timer_pid_scan.start(max(5000, scan_ms))
 
         coalesce_ms = int(_prefs.get("ui", {}).get("bus_coalesce_ms", 300))
         self._bus_coalesce_timer = QTimer(self)
@@ -10260,10 +10255,78 @@ class SnowMasterGUI(QWidget):
         # Le nouveau système vérifie directement les PID toutes les minutes, indépendamment du heartbeat
         pass
 
+    def _is_instance_reddot(self, inst: InstanceState) -> bool:
+        """True si le voyant de l'instance est rouge (heartbeat timeout)."""
+        if inst.stopped:
+            return False
+        if getattr(inst, "manual_empty", False):
+            return False
+        if inst.awaiting_first_hb:
+            return False
+        if getattr(inst, "restored_recently", False):
+            return False
+        return self.instance_color(inst) == CLR_RED
+
+    def _check_reddot_relaunch(self):
+        """Reset les instances restées en reddot plus longtemps que le délai configuré."""
+        if not self.auto_reddot_relaunch_enabled:
+            return
+
+        delay = int(self.reddot_relaunch_delay_s or 0)
+        if delay <= 0:
+            return
+
+        now = time.time()
+        to_reset: List[str] = []
+
+        with _state_lock:
+            instances = list(_instances.items())
+
+        for title, inst in instances:
+            if inst.stopped:
+                self._reddot_since.pop(title, None)
+                continue
+
+            if not self._is_instance_reddot(inst):
+                self._reddot_since.pop(title, None)
+                continue
+
+            since = self._reddot_since.get(title)
+            if since is None:
+                self._reddot_since[title] = now
+                scan_log(
+                    f"[REDDOT_RELAUNCH] '{title}': reddot détecté, début du délai ({delay}s)"
+                )
+                continue
+
+            elapsed = now - since
+            if elapsed < delay:
+                scan_log(
+                    f"[REDDOT_RELAUNCH] '{title}': reddot depuis {elapsed:.0f}s / {delay}s"
+                )
+                continue
+
+            last = self._last_auto_reddot_relaunch_attempt.get(title, 0.0)
+            if now - last < AUTO_RELAUNCH_COOLDOWN_S:
+                continue
+
+            to_reset.append(title)
+
+        for title in to_reset:
+            scan_log(
+                f"[REDDOT_RELAUNCH] '{title}': délai dépassé ({delay}s), reset planifié"
+            )
+            self._last_auto_reddot_relaunch_attempt[title] = now
+            self._reddot_since.pop(title, None)
+            with _state_lock:
+                if title not in self._pending_resets:
+                    self._pending_resets.append(title)
+
+        if to_reset:
+            self._process_pending_resets()
+
     def _scan_pids_periodic(self):
         """Scan périodique : léger (PID/HWND) + complet (doublons) tous les N ticks."""
-        if not self.auto_relaunch_enabled:
-            return
         self._scan_pid_light_counter = getattr(self, "_scan_pid_light_counter", 0) + 1
         full_every = max(
             1, int(_prefs.get("instances", {}).get("scan_pid_full_every", 4))
@@ -10279,6 +10342,7 @@ class SnowMasterGUI(QWidget):
             )
 
             self._process_pending_resets()
+            self._check_reddot_relaunch()
 
             processes_by_title: Dict[str, List[dict]] = {}
             if do_full:
@@ -10890,47 +10954,19 @@ class SnowMasterGUI(QWidget):
     def on_bus_remove(self, title: str):
         pass
 
-    def on_toggle_auto_relaunch(self, _state):
-        self.auto_relaunch_enabled = self.chk_auto_relaunch.isChecked()
-        _prefs["autoRelaunch"] = bool(self.auto_relaunch_enabled)
+    def on_toggle_auto_reddot_relaunch(self, _state):
+        self.auto_reddot_relaunch_enabled = self.chk_auto_reddot_relaunch.isChecked()
+        _prefs["autoReddotRelaunch"] = bool(self.auto_reddot_relaunch_enabled)
         save_prefs(_prefs)
-        if self.auto_relaunch_enabled:
-            scan_ms = max(
-                5000, int(_prefs.get("instances", {}).get("scan_pid_interval_ms", 30000))
-            )
-            self.timer_pid_scan.start(scan_ms)
-        else:
-            self.timer_pid_scan.stop()
+        if not self.auto_reddot_relaunch_enabled:
+            self._reddot_since.clear()
 
-    def on_toggle_discord_alert(self, _state):
-        """Met à jour la préférence 'discord.enabled' lorsque l'utilisateur change la checkbox."""
-        self.discord_alert_enabled = self.chk_discord_alert.isChecked()
-        _prefs.setdefault("discord", {})["enabled"] = bool(self.discord_alert_enabled)
+    def on_change_reddot_relaunch_delay(self, value: int):
+        """Met à jour le délai avant reset auto d'une instance en reddot."""
+        self.reddot_relaunch_delay_s = int(value)
+        _prefs["reddotRelaunchDelay"] = int(value)
         save_prefs(_prefs)
-
-    def on_toggle_card_animations(self, _state):
-        """Active/désactive les ombres animées sur les cartes d'instance."""
-        val = bool(self.chk_card_animations.isChecked())
-        _prefs.setdefault("ui", {})["card_animations_enabled"] = val
-        save_prefs(_prefs)
-        self._refresh_all_instance_card_styles()
-
-    def on_toggle_static_shadows(self, _state):
-        val = bool(self.chk_static_shadows.isChecked())
-        _prefs.setdefault("ui", {})["static_shadows_enabled"] = val
-        save_prefs(_prefs)
-        try:
-            if val:
-                shadow = QGraphicsDropShadowEffect(self.panel_euros)
-                shadow.setBlurRadius(24)
-                shadow.setXOffset(0)
-                shadow.setYOffset(8)
-                shadow.setColor(QColor(16, 185, 129, 90))
-                self.panel_euros.setGraphicsEffect(shadow)
-            else:
-                self.panel_euros.setGraphicsEffect(None)
-        except Exception:
-            pass
+        app_log_info(f"Délai relance reddot mis à jour : {value}s")
 
     def _refresh_all_instance_card_styles(self):
         """Réapplique voyant + style (bordure / glow) sur toutes les cartes visibles."""
