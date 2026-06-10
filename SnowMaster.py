@@ -40,7 +40,7 @@ import tempfile
 import subprocess
 import ctypes
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Deque, Optional, List, Tuple
 import shlex
 import logging
@@ -299,6 +299,7 @@ HEARTBEAT_HISTORY_DEDUP_S = 8  # ignore HB identiques rapprochés
 HEARTBEAT_HISTORY_DISPLAY_DEFAULT = 500  # lignes affichées par défaut dans la popup
 CARD_HEIGHT = 62  # compact
 CARD_WIDTH = 320
+INSTANCES_H_SCROLL_WHEEL_STEP = 36  # px par cran molette (scroll horizontal fluide)
 
 # ===== Persistence des holdings (kamas) =====
 
@@ -399,6 +400,7 @@ DEFAULT_PREFS = {
         "enabled": False,  # si True : envoi des hooks Discord activé
         "webhook": "",  # URL du webhook Discord à renseigner dans Settings.json
         "silent_notifications": False,  # si True : les messages Discord n'envoient PAS de notifications (pas de petite bulle blanche)
+        "webhookstate": "",  # webhook horaire : total € + reddots
     },
     # Configuration pour le bot Discord qui efface les messages au passage au vert
     "discord_bot": {
@@ -7635,8 +7637,7 @@ class SubctrlItemWidget(QWidget):
 
 class ItemPerWidgetList(QListWidget):
     """
-    QListWidget qui scroll widget-par-widget quand l'utilisateur utilise la molette.
-    On utilise CARD_HEIGHT pour avancer/reculer d'un item à chaque 'crantage'.
+    QListWidget des instances : molette = défilement horizontal fluide (px par cran).
     """
 
     orderChanged = Signal(list)
@@ -7653,20 +7654,17 @@ class ItemPerWidgetList(QListWidget):
         self.setDropIndicatorShown(True)
 
     def wheelEvent(self, event):
-        delta = event.angleDelta().y()
-        if delta == 0:
-            event.ignore()
-            return
-        steps = int(delta / 120) if abs(delta) >= 120 else (1 if delta > 0 else -1)
+        pixel = event.pixelDelta().y()
+        if pixel != 0:
+            delta_px = -pixel
+        else:
+            angle = event.angleDelta().y()
+            if angle == 0:
+                event.ignore()
+                return
+            delta_px = -(angle / 120.0) * INSTANCES_H_SCROLL_WHEEL_STEP
         sb = self.horizontalScrollBar()
-        try:
-            if self.count() > 0 and self.item(0) is not None:
-                col_w = max(80, self.item(0).sizeHint().width())
-            else:
-                col_w = max(80, int(self.viewport().width() / 2))
-        except Exception:
-            col_w = 300
-        new_val = sb.value() - steps * col_w
+        new_val = int(sb.value() + delta_px)
         new_val = max(sb.minimum(), min(sb.maximum(), new_val))
         sb.setValue(new_val)
         event.accept()
@@ -8096,6 +8094,7 @@ class SnowMasterGUI(QWidget):
         # self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.list.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.list.horizontalScrollBar().setSingleStep(INSTANCES_H_SCROLL_WHEEL_STEP)
 
         self.list.currentItemChanged.connect(self.on_select_instance)
         self.list.installEventFilter(self)
@@ -8587,6 +8586,9 @@ class SnowMasterGUI(QWidget):
         self._subs_list_fp: Optional[str] = None
         self._details_cache_key: Optional[tuple] = None
         self._instances_count_cache: Optional[str] = None
+        self._cached_total_eur: float = 0.0
+        self._cached_active_count: int = 0
+        self._cached_reddot_count: int = 0
         self._pending_bus_titles: set = set()
         self._scan_pid_light_counter = 0
 
@@ -8709,6 +8711,8 @@ class SnowMasterGUI(QWidget):
 
         except Exception as e:
             print("Autoload instances failed:", e)
+
+        self._start_hourly_state_webhook_scheduler()
 
         # Démarrage du bot Discord si activé dans les préférences
         try:
@@ -9266,12 +9270,18 @@ class SnowMasterGUI(QWidget):
             instances_snapshot = []
 
         active = 0
+        reddot = 0
         for inst in instances_snapshot:
             try:
                 if self._is_instance_running(inst):
                     active += 1
+                if self._is_instance_reddot(inst):
+                    reddot += 1
             except Exception:
                 continue
+
+        self._cached_active_count = active
+        self._cached_reddot_count = reddot
 
         active_label = "instance" if active == 1 else "instances"
         txt = f"{active} {active_label}"
@@ -9303,9 +9313,32 @@ class SnowMasterGUI(QWidget):
                 )
                 total += qty * p
 
+            self._cached_total_eur = total
             self.panel_euros.setText(f"{total:.2f} €")
         except Exception:
+            self._cached_total_eur = 0.0
             self.panel_euros.setText("0 €")
+
+    def _start_hourly_state_webhook_scheduler(self):
+        """Planifie l'envoi du webhook état à chaque heure pile."""
+        self._schedule_next_hourly_state_webhook()
+
+    def _schedule_next_hourly_state_webhook(self):
+        now = datetime.now()
+        next_tick = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        delay_ms = max(1000, int((next_tick - now).total_seconds() * 1000))
+        QTimer.singleShot(delay_ms, self._on_hourly_state_webhook_tick)
+
+    def _on_hourly_state_webhook_tick(self):
+        try:
+            send_discord_hook_state(
+                self._cached_total_eur,
+                self._cached_active_count,
+                self._cached_reddot_count,
+            )
+        except Exception as e:
+            print(f"[DISCORD STATE] tick failed: {e}")
+        self._schedule_next_hourly_state_webhook()
 
     def open_revenue_window(self):
         """Ouvre la fenêtre de détails €."""
@@ -12511,6 +12544,77 @@ def _post_json(path: str, payload: dict, timeout=2.0):
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def send_discord_hook_state(total_eur: float, active_count: int, red_count: int):
+    """
+    Webhook horaire : état des lieux compact (total € + actives + reddots).
+    Reçoit les valeurs déjà calculées par l'UI (update_revenue_counter / update_instances_count).
+    """
+    try:
+        discord_cfg = _prefs.get("discord", {})
+    except Exception:
+        discord_cfg = {}
+
+    enabled = bool(discord_cfg.get("enabled", False))
+    webhook_url = str(discord_cfg.get("webhookstate") or "").strip()
+
+    if not enabled:
+        return
+    if not webhook_url:
+        print("[DISCORD STATE] Webhook non configuré.")
+        return
+
+    amount_txt = (
+        f"{total_eur:,.2f}".replace(",", "\x00").replace(".", ",").replace("\x00", " ")
+        + " €"
+    )
+
+    active_txt = (
+        f"🟢 **{active_count}** active"
+        if active_count == 1
+        else f"🟢 **{active_count}** actives"
+    )
+
+    desc_parts = [active_txt]
+    if red_count > 0:
+        desc_parts.append(
+            f"🔴 **{red_count}** reddot"
+            if red_count == 1
+            else f"🔴 **{red_count}** reddots"
+        )
+
+    if red_count == 0:
+        color = 0x10B981
+    elif red_count == 1:
+        color = 0xF59E0B
+    else:
+        color = 0xEF4444
+
+    payload = {
+        "embeds": [
+            {
+                "title": amount_txt,
+                "description": "\n".join(desc_parts),
+                "color": color,
+            }
+        ]
+    }
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            webhook_url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": DISCORD_WEBHOOK_USER_AGENT,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            print(f"[DISCORD STATE] ✓ Envoyé (HTTP {resp.getcode()})")
+    except Exception as e:
+        print(f"[DISCORD STATE] ✗ Erreur envoi : {e}")
 
 
 def send_discord_hook_success():
