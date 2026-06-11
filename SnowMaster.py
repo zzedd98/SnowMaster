@@ -12569,6 +12569,7 @@ def send_discord_hook_state(total_eur: float, active_count: int, red_count: int)
         f"{total_eur:,.2f}".replace(",", "\x00").replace(".", ",").replace("\x00", " ")
         + " €"
     )
+    time_txt = datetime.now().strftime("%H:%M")
 
     active_txt = (
         f"🟢 **{active_count}** active"
@@ -12576,7 +12577,7 @@ def send_discord_hook_state(total_eur: float, active_count: int, red_count: int)
         else f"🟢 **{active_count}** actives"
     )
 
-    desc_parts = [active_txt]
+    desc_parts = [time_txt, f"**{amount_txt}**", active_txt]
     if red_count > 0:
         desc_parts.append(
             f"🔴 **{red_count}** reddot"
@@ -12594,7 +12595,6 @@ def send_discord_hook_state(total_eur: float, active_count: int, red_count: int)
     payload = {
         "embeds": [
             {
-                "title": amount_txt,
                 "description": "\n".join(desc_parts),
                 "color": color,
             }
