@@ -9320,12 +9320,14 @@ class SnowMasterGUI(QWidget):
             self.panel_euros.setText("0 €")
 
     def _start_hourly_state_webhook_scheduler(self):
-        """Planifie l'envoi du webhook état à chaque heure pile."""
+        """Planifie l'envoi du webhook état à chaque heure à :01."""
         self._schedule_next_hourly_state_webhook()
 
     def _schedule_next_hourly_state_webhook(self):
         now = datetime.now()
-        next_tick = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        next_tick = now.replace(minute=1, second=0, microsecond=0)
+        if now >= next_tick:
+            next_tick += timedelta(hours=1)
         delay_ms = max(1000, int((next_tick - now).total_seconds() * 1000))
         QTimer.singleShot(delay_ms, self._on_hourly_state_webhook_tick)
 
@@ -12569,7 +12571,6 @@ def send_discord_hook_state(total_eur: float, active_count: int, red_count: int)
         f"{total_eur:,.2f}".replace(",", "\x00").replace(".", ",").replace("\x00", " ")
         + " €"
     )
-    time_txt = datetime.now().strftime("%H:%M")
 
     active_txt = (
         f"🟢 **{active_count}** active"
@@ -12577,7 +12578,7 @@ def send_discord_hook_state(total_eur: float, active_count: int, red_count: int)
         else f"🟢 **{active_count}** actives"
     )
 
-    desc_parts = [time_txt, f"**{amount_txt}**", active_txt]
+    desc_parts = [active_txt]
     if red_count > 0:
         desc_parts.append(
             f"🔴 **{red_count}** reddot"
@@ -12595,6 +12596,7 @@ def send_discord_hook_state(total_eur: float, active_count: int, red_count: int)
     payload = {
         "embeds": [
             {
+                "title": amount_txt,
                 "description": "\n".join(desc_parts),
                 "color": color,
             }
