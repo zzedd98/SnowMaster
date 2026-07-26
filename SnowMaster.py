@@ -425,6 +425,7 @@ DEFAULT_PREFS = {
         # Animations pulsées (ombre) sur les cartes d'instance ; si False : bordure QSS statique seulement
         "card_animations_enabled": True,
         "static_shadows_enabled": True,  # ombres fixes (panneau €, etc.)
+        "euro_counter_visible": True,  # afficher le bouton vert € en bas du dock config
         "refresh_interval_active_ms": 1000,
         "refresh_interval_inactive_ms": 2500,  # fenêtre inactive / minimisée
         "bus_coalesce_ms": 300,  # regroupement des heartbeats avant refresh UI
@@ -444,6 +445,14 @@ def static_shadows_enabled() -> bool:
     """Préférence UI (settings.json → ui.static_shadows_enabled) : ombres fixes panneau €."""
     try:
         return bool(_prefs.get("ui", {}).get("static_shadows_enabled", True))
+    except Exception:
+        return True
+
+
+def euro_counter_visible() -> bool:
+    """Préférence UI (settings.json → ui.euro_counter_visible) : bouton vert € du dock config."""
+    try:
+        return bool(_prefs.get("ui", {}).get("euro_counter_visible", True))
     except Exception:
         return True
 
@@ -8132,6 +8141,14 @@ class SnowMasterGUI(QWidget):
         )
         self.chk_hb_history.stateChanged.connect(self.on_toggle_hb_history)
 
+        self.chk_euro_counter = QCheckBox("Afficher bouton €")
+        self.chk_euro_counter.setChecked(euro_counter_visible())
+        self.chk_euro_counter.setToolTip(
+            "Coché : affiche le bouton vert des revenus (€) en bas du panneau config.\n"
+            "Décoché : le masque pour travailler sans distraction."
+        )
+        self.chk_euro_counter.stateChanged.connect(self.on_toggle_euro_counter)
+
         # Lecture initiale des prefs pour les instances
         instances_prefs = _prefs.get("instances", {})
         default_delay = int(instances_prefs.get("launch_delay", 1))
@@ -8245,6 +8262,7 @@ class SnowMasterGUI(QWidget):
 
         inst_group_collapsible.addWidget(self.chk_auto_reddot_relaunch)
         inst_group_collapsible.addWidget(self.chk_hb_history)
+        inst_group_collapsible.addWidget(self.chk_euro_counter)
         # inst_group_collapsible.addWidget(self.btn_save_cfg)
         # inst_group_collapsible.addWidget(self.btn_load_cfg)
         # Checkbox: overwrite existing instances when loading a config
@@ -8427,8 +8445,9 @@ class SnowMasterGUI(QWidget):
             except Exception:
                 pass
 
-        # Bouton argent (fixe en bas)
+        # Bouton argent (fixe en bas) — visibilité pilotée par ui.euro_counter_visible
         cfg_v.addWidget(self.panel_euros)
+        self.panel_euros.setVisible(euro_counter_visible())
 
         # ----- Données & remplissage -----
         # On utilise le store global _revenue_data (protégé par _revenue_lock)
@@ -11840,6 +11859,16 @@ class SnowMasterGUI(QWidget):
         app_log_info(
             f"Stockage historique heartbeats {'activé' if val else 'désactivé'}"
         )
+
+    def on_toggle_euro_counter(self, _state):
+        val = bool(self.chk_euro_counter.isChecked())
+        _prefs.setdefault("ui", {})["euro_counter_visible"] = val
+        save_prefs(_prefs)
+        try:
+            self.panel_euros.setVisible(val)
+        except Exception:
+            pass
+        app_log_info(f"Bouton € {'affiché' if val else 'masqué'}")
 
     def on_change_reddot_relaunch_delay(self, value: int):
         """Met à jour le délai avant reset auto d'une instance en reddot."""
