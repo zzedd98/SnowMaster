@@ -428,6 +428,9 @@ DEFAULT_PREFS = {
         "card_animations_enabled": True,
         "static_shadows_enabled": True,  # ombres fixes (panneau €, etc.)
         "euro_counter_visible": True,  # afficher le bouton vert € en bas du dock config
+        "config_panel_visible": True,  # panneau central Configs / Boutons
+        "right_panel_visible": True,  # panneau droite Sous-contrôleurs / détails
+        "always_on_top": False,  # garder SnowMaster au-dessus des autres fenêtres
         "refresh_interval_active_ms": 1000,
         "refresh_interval_inactive_ms": 2500,  # fenêtre inactive / minimisée
         "bus_coalesce_ms": 300,  # regroupement des heartbeats avant refresh UI
@@ -5200,8 +5203,10 @@ def apply_dark_blue_style(app: QApplication):
 class StatusDot(QLabel):
     def __init__(self, diameter=10, color=CLR_GREY):
         super().__init__()
-        self.d = diameter
-        self.setFixedSize(QSize(diameter, diameter))
+        self.d = int(diameter)
+        # Taille strictement fixe : un cercle net, jamais écrasé par le layout
+        self.setFixedSize(QSize(self.d, self.d))
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.set_color(color)
 
     def set_color(self, color_hex: str):
@@ -5210,8 +5215,13 @@ class StatusDot(QLabel):
         if getattr(self, "_last_color", None) == color_hex:
             return
         self._last_color = color_hex
+        r = max(1, self.d // 2)
         self.setStyleSheet(
-            f"background-color:{color_hex}; border-radius:{self.d//2}px;"
+            f"background-color:{color_hex};"
+            f"border-radius:{r}px;"
+            f"border:1px solid rgba(255,255,255,0.22);"
+            f"min-width:{self.d}px; max-width:{self.d}px;"
+            f"min-height:{self.d}px; max-height:{self.d}px;"
         )
 
 
@@ -7407,6 +7417,15 @@ class InstanceItemWidget(QWidget):
         self.customContextMenuRequested.connect(
             lambda _pos: self.requestHistory.emit(self.title_id)
         )
+        # Évite que la carte impose ~320px de largeur min à toute la fenêtre
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def minimumSizeHint(self):
+        return QSize(0, CARD_HEIGHT)
+
+    def sizeHint(self):
+        return QSize(CARD_WIDTH, CARD_HEIGHT)
 
     def _init_glow_widgets(self):
         """Crée l'effet d'ombre et l'animation (une seule fois par carte)."""
@@ -7676,6 +7695,8 @@ class ItemPerWidgetList(QListWidget):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # DnD natif pour réordonner
         self.setDragEnabled(True)
@@ -7683,6 +7704,13 @@ class ItemPerWidgetList(QListWidget):
         self.setDefaultDropAction(Qt.MoveAction)
         self.setDragDropMode(QAbstractItemView.InternalMove)
         self.setDropIndicatorShown(True)
+
+    def minimumSizeHint(self):
+        # Ne pas bloquer le rétrécissement de la fenêtre sur la largeur des cartes
+        return QSize(0, 0)
+
+    def sizeHint(self):
+        return QSize(200, 200)
 
     def wheelEvent(self, event):
         pixel = event.pixelDelta().y()
@@ -7992,6 +8020,8 @@ class SnowMasterGUI(QWidget):
         # self.setWindowTitle("❄️ SnowMaster")
         self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1440, 850)  # +62 pour afficher une instance de plus
+        # Pas de taille minimale bloquante : la fenêtre peut se rétracter librement
+        self.setMinimumSize(0, 0)
 
         # --- État interne pour le voyant global / alertes ---
         self._last_global_color = CLR_GREY  # dernière couleur vue du voyant global
@@ -8049,6 +8079,7 @@ class SnowMasterGUI(QWidget):
 
         # Header
         header = QHBoxLayout()
+        header.setSizeConstraint(QHBoxLayout.SetNoConstraint)
         self.title_label = QLabel(f"❄️ {APP_DISPLAY_NAME}")
         self.title_label.setObjectName("TitleLabel")
         self.global_dot = StatusDot(12, CLR_GREY)
@@ -8086,20 +8117,92 @@ class SnowMasterGUI(QWidget):
         self.btn_all_kill.clicked.connect(self.on_bulk_kill)
         self.btn_all_del.clicked.connect(self.on_bulk_delete)
 
-        header.addWidget(self.title_label)
-        header.addWidget(self.global_dot)
+        # Toggles panneaux (config centrale / droite)
+        try:
+            cfg_visible = bool(_prefs.get("ui", {}).get("config_panel_visible", True))
+        except Exception:
+            cfg_visible = True
+        try:
+            right_visible = bool(_prefs.get("ui", {}).get("right_panel_visible", True))
+        except Exception:
+            right_visible = True
+
+        self.btn_toggle_config = QPushButton("⚙ Config")
+        self.btn_toggle_config.setCheckable(True)
+        self.btn_toggle_config.setChecked(cfg_visible)
+        self.btn_toggle_config.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_config.setToolTip("Afficher / masquer le panneau Configs & Boutons")
+        self.btn_toggle_config.toggled.connect(self.on_toggle_config_panel)
+
+        self.btn_toggle_right = QPushButton("☰ Détails")
+        self.btn_toggle_right.setCheckable(True)
+        self.btn_toggle_right.setChecked(right_visible)
+        self.btn_toggle_right.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_right.setToolTip(
+            "Afficher / masquer le panneau Sous-contrôleurs & détails"
+        )
+        self.btn_toggle_right.toggled.connect(self.on_toggle_right_panel)
+
+        _panel_toggle_ss = """
+            QPushButton {
+                background-color: #1e293b;
+                color: #94a3b8;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 4px 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #e2e8f0;
+            }
+            QPushButton:checked {
+                background-color: #1d4ed8;
+                color: #f8fafc;
+                border-color: #2563eb;
+            }
+        """
+        self.btn_toggle_config.setStyleSheet(_panel_toggle_ss)
+        self.btn_toggle_right.setStyleSheet(_panel_toggle_ss)
+
+        # Pas de largeur min sur le header (sauf le voyant, taille fixe)
+        for w in (
+            self.title_label,
+            self.btn_toggle_config,
+            self.btn_toggle_right,
+            self.btn_new,
+            self.btn_all_reload,
+            self.btn_all_kill,
+            self.btn_all_del,
+        ):
+            w.setMinimumWidth(0)
+            try:
+                w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            except Exception:
+                pass
+
+        # Titre + voyant + boutons groupés à gauche (stretch à droite pour ne pas les coller au bord)
+        header.addWidget(self.title_label, 0, Qt.AlignVCenter)
+        header.addWidget(self.global_dot, 0, Qt.AlignVCenter)
+        header.addSpacing(10)
+        header.addWidget(self.btn_toggle_config, 0, Qt.AlignVCenter)
+        header.addWidget(self.btn_toggle_right, 0, Qt.AlignVCenter)
+        header.addWidget(self.btn_new, 0, Qt.AlignVCenter)
+        header.addWidget(self.btn_all_reload, 0, Qt.AlignVCenter)
+        header.addWidget(self.btn_all_kill, 0, Qt.AlignVCenter)
+        header.addWidget(self.btn_all_del, 0, Qt.AlignVCenter)
         header.addStretch(1)
-        header.addWidget(self.btn_new)
-        header.addWidget(self.btn_all_reload)
-        header.addWidget(self.btn_all_kill)
-        header.addWidget(self.btn_all_del)
 
         # Left column
         left_col = QVBoxLayout()
+        left_col.setSizeConstraint(QVBoxLayout.SetNoConstraint)
         left_col.addLayout(header)
 
         group = QGroupBox("Instances actives")
+        group.setMinimumWidth(0)
+        group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         group_layout = QVBoxLayout(group)
+        group_layout.setSizeConstraint(QVBoxLayout.SetNoConstraint)
         # Marges internes : on supprime la marge droite pour maximiser l'espace horizontal des cartes
         group_layout.setContentsMargins(8, 8, 0, 8)
         group_layout.setSpacing(6)
@@ -8134,8 +8237,8 @@ class SnowMasterGUI(QWidget):
         left_col.addWidget(group, 3)
         left_w = QWidget()
         left_w.setLayout(left_col)
-        left_w.setMinimumWidth(500)
-        left_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        left_w.setMinimumWidth(0)
+        left_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # Dock config (modifié : ajoute "délai entre lancements" + "mode")
         self.btn_save_cfg = QPushButton("💾 Enregistrer config")
@@ -8170,6 +8273,18 @@ class SnowMasterGUI(QWidget):
             "Décoché : le masque pour travailler sans distraction."
         )
         self.chk_euro_counter.stateChanged.connect(self.on_toggle_euro_counter)
+
+        try:
+            always_on_top = bool(_prefs.get("ui", {}).get("always_on_top", False))
+        except Exception:
+            always_on_top = False
+        self.chk_always_on_top = QCheckBox("Épingler au premier plan")
+        self.chk_always_on_top.setChecked(always_on_top)
+        self.chk_always_on_top.setToolTip(
+            "Coché : SnowMaster reste au-dessus des autres fenêtres.\n"
+            "Décoché : comportement Windows normal."
+        )
+        self.chk_always_on_top.stateChanged.connect(self.on_toggle_always_on_top)
 
         # Lecture initiale des prefs pour les instances
         instances_prefs = _prefs.get("instances", {})
@@ -8299,6 +8414,7 @@ class SnowMasterGUI(QWidget):
         inst_group_collapsible.addWidget(self.chk_auto_reddot_relaunch)
         inst_group_collapsible.addWidget(self.chk_hb_history)
         inst_group_collapsible.addWidget(self.chk_euro_counter)
+        inst_group_collapsible.addWidget(self.chk_always_on_top)
         # inst_group_collapsible.addWidget(self.btn_save_cfg)
         # inst_group_collapsible.addWidget(self.btn_load_cfg)
         # Checkbox: overwrite existing instances when loading a config
@@ -8519,8 +8635,8 @@ class SnowMasterGUI(QWidget):
         # Calcul initial
         self.update_revenue_counter()
 
-        self.configDock.setFixedWidth(208)
-        self.configDock.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.configDock.setMinimumWidth(0)
+        self.configDock.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.configDock.setStyleSheet(
             "#ConfigDock QPushButton { padding:5px 8px; font-size:13px; } "
             # "#ConfigDock QLabel:not(#EuroBigCounter) { font-size:13px; } "
@@ -8579,7 +8695,7 @@ class SnowMasterGUI(QWidget):
 
         for b in (self.btn_focus_d, self.btn_reload_d, self.btn_kill_d, self.btn_del_d):
             b.setCursor(Qt.PointingHandCursor)
-            b.setMinimumWidth(120)
+            b.setMinimumWidth(0)
             b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         # Appliquer les icônes configurables aux boutons de détail (si disponibles)
@@ -8617,24 +8733,32 @@ class SnowMasterGUI(QWidget):
 
         right_w = QWidget()
         right_w.setLayout(right)
-        right_w.setFixedWidth(288)
-        right_w.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        right_w.setMinimumWidth(0)
+        right_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.right_panel = right_w
 
         # Splitter
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_w)
-        splitter.addWidget(self.configDock)
-        splitter.addWidget(right_w)
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.addWidget(left_w)
+        self.main_splitter.addWidget(self.configDock)
+        self.main_splitter.addWidget(right_w)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setStretchFactor(2, 0)
-        splitter.setCollapsible(1, False)
-        splitter.setCollapsible(2, False)
-        splitter.setSizes([1200, 208, 288])
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 0)
+        self.main_splitter.setStretchFactor(2, 0)
+        self.main_splitter.setCollapsible(0, True)
+        self.main_splitter.setCollapsible(1, True)
+        self.main_splitter.setCollapsible(2, True)
+        self.main_splitter.setSizes([1200, 208, 288])
+
+        # Appliquer la visibilité des panneaux (prefs / boutons header)
+        self.configDock.setVisible(self.btn_toggle_config.isChecked())
+        self.right_panel.setVisible(self.btn_toggle_right.isChecked())
 
         root = QVBoxLayout(self)
-        root.addWidget(splitter)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSizeConstraint(QVBoxLayout.SetNoConstraint)
+        root.addWidget(self.main_splitter)
 
         # Timer / autopilot
         self._list_widths_dirty = True
@@ -8788,6 +8912,17 @@ class SnowMasterGUI(QWidget):
                     )
         except Exception as e:
             app_log_error(f"Erreur lors du démarrage du bot Discord: {e}")
+
+        # Appliquer l'épingle au premier plan si demandé (avant le premier show)
+        if self.chk_always_on_top.isChecked():
+            try:
+                self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+            except Exception:
+                pass
+
+    def minimumSizeHint(self):
+        """Autorise une rétraction quasi libre de la fenêtre principale."""
+        return QSize(0, 0)
 
     def eventFilter(self, obj, event):
         if obj is self.list and event.type() == QEvent.Resize:
@@ -11907,6 +12042,70 @@ class SnowMasterGUI(QWidget):
         except Exception:
             pass
         app_log_info(f"Bouton € {'affiché' if val else 'masqué'}")
+
+    def on_toggle_config_panel(self, checked: bool):
+        """Affiche / masque le panneau central Configs & Boutons."""
+        try:
+            self.configDock.setVisible(bool(checked))
+        except Exception:
+            pass
+        _prefs.setdefault("ui", {})["config_panel_visible"] = bool(checked)
+        save_prefs(_prefs)
+
+    def on_toggle_right_panel(self, checked: bool):
+        """Affiche / masque le panneau Sous-contrôleurs & détails."""
+        try:
+            self.right_panel.setVisible(bool(checked))
+        except Exception:
+            pass
+        _prefs.setdefault("ui", {})["right_panel_visible"] = bool(checked)
+        save_prefs(_prefs)
+
+    def on_toggle_always_on_top(self, _state):
+        """Épingle / désépingle la fenêtre SnowMaster au-dessus des autres."""
+        enabled = bool(self.chk_always_on_top.isChecked())
+        _prefs.setdefault("ui", {})["always_on_top"] = enabled
+        save_prefs(_prefs)
+        self._apply_always_on_top(enabled)
+        app_log_info(
+            f"SnowMaster {'épinglé' if enabled else 'désépinglé'} au premier plan"
+        )
+
+    def _apply_always_on_top(self, enabled: bool):
+        """Applique Qt.WindowStaysOnTopHint (+ renfort Win32) sans perdre l'état utile."""
+        try:
+            was_visible = self.isVisible()
+            flags = self.windowFlags()
+            if enabled:
+                new_flags = flags | Qt.WindowStaysOnTopHint
+            else:
+                new_flags = flags & ~Qt.WindowStaysOnTopHint
+            if new_flags != flags:
+                self.setWindowFlags(new_flags)
+                if was_visible:
+                    self.show()
+            # Renfort Win32 (fiable une fois le HWND créé)
+            try:
+                hwnd = int(self.winId())
+                if hwnd:
+                    insert_after = (
+                        win32con.HWND_TOPMOST if enabled else win32con.HWND_NOTOPMOST
+                    )
+                    win32gui.SetWindowPos(
+                        hwnd,
+                        insert_after,
+                        0,
+                        0,
+                        0,
+                        0,
+                        win32con.SWP_NOMOVE
+                        | win32con.SWP_NOSIZE
+                        | win32con.SWP_NOACTIVATE,
+                    )
+            except Exception:
+                pass
+        except Exception as e:
+            app_log_warn(f"Impossible d'appliquer always-on-top: {e}")
 
     def on_change_reddot_relaunch_delay(self, value: int):
         """Met à jour le délai avant reset auto d'une instance en reddot."""
