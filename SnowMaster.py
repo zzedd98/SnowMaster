@@ -412,6 +412,8 @@ DEFAULT_PREFS = {
     },
     # Délai avant qu'un voyant passe au rouge (en secondes)
     "reddot": 480,  # Heartbeat timeout par défaut : 8 minutes
+    # Écran pour "mettre au premier plan" : 1 = tout à gauche, 2 = suivant à droite, etc.
+    "screen_to_use": 1,
     # Contrôleur global utilisé par le bouton PANIC (chemin complet du script)
     "panic_controller": "",
     # Icônes UI : noms de fichiers sous SnowMaster/images/ (ex: "play.png") ou chemin absolu
@@ -455,6 +457,14 @@ def euro_counter_visible() -> bool:
         return bool(_prefs.get("ui", {}).get("euro_counter_visible", True))
     except Exception:
         return True
+
+
+def screen_to_use() -> int:
+    """Préférence (settings.json → screen_to_use) : n° d'écran pour le premier plan (1 = gauche)."""
+    try:
+        return max(1, int(_prefs.get("screen_to_use", 1)))
+    except Exception:
+        return 1
 
 
 def hb_history_storage_enabled() -> bool:
@@ -2739,16 +2749,13 @@ def match_autopilot_schedule(prefs: dict) -> Optional[dict]:
 
 # ======================= WIN32 UTILS ======================
 def bring_to_front(hwnd):
-    """Met la fenêtre au premier plan sur l'écran le plus à gauche."""
+    """Met la fenêtre au premier plan sur l'écran configuré (screen_to_use)."""
     try:
-        # D'abord, déplacer la fenêtre sur l'écran de gauche
-        monitor = get_leftmost_monitor()
+        monitor = get_monitor_by_screen_number(screen_to_use())
         screen_left = monitor["left"]
         screen_top = monitor["top"]
-        screen_width = monitor["width"]
-        screen_height = monitor["height"]
 
-        # Placer au coin en haut à gauche de l'écran de gauche
+        # Placer au coin en haut à gauche de l'écran choisi
         x = screen_left
         y = screen_top
 
@@ -2756,7 +2763,7 @@ def bring_to_front(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         time.sleep(0.05)
 
-        # Déplacer vers l'écran de gauche
+        # Déplacer vers l'écran choisi
         win32gui.SetWindowPos(
             hwnd,
             win32con.HWND_TOP,
@@ -2835,16 +2842,24 @@ def force_window_on_left_screen_no_activate(hwnd):
         return False
 
 
-def get_leftmost_monitor():
-    """Retourne les coordonnées et dimensions du moniteur le plus à gauche (non principal)."""
-    try:
-        # EnumDisplayMonitors retourne directement une liste de moniteurs
-        # Format: [(hMonitor, hdcMonitor, (left, top, right, bottom)), ...]
-        monitors_info = win32api.EnumDisplayMonitors()
+def _fallback_primary_monitor():
+    return {
+        "left": 0,
+        "top": 0,
+        "width": win32api.GetSystemMetrics(0),
+        "height": win32api.GetSystemMetrics(1),
+        "right": win32api.GetSystemMetrics(0),
+        "bottom": win32api.GetSystemMetrics(1),
+    }
 
+
+def get_monitors_sorted_left_to_right():
+    """Liste des moniteurs triés de gauche à droite (index 0 = écran n°1)."""
+    try:
+        # EnumDisplayMonitors : [(hMonitor, hdcMonitor, (left, top, right, bottom)), ...]
+        monitors_info = win32api.EnumDisplayMonitors()
         monitors = []
         for monitor_data in monitors_info:
-            # monitor_data[2] contient (left, top, right, bottom)
             rect = monitor_data[2]
             monitors.append(
                 {
@@ -2856,26 +2871,33 @@ def get_leftmost_monitor():
                     "height": rect[3] - rect[1],
                 }
             )
-
         if monitors:
-            # Trier par coordonnée left (X) pour trouver l'écran le plus à gauche
-            leftmost = min(monitors, key=lambda m: m["left"])
-            print(
-                f"✓ Écran le plus à gauche trouvé: position ({leftmost['left']}, {leftmost['top']}), taille {leftmost['width']}x{leftmost['height']}"
-            )
-            return leftmost
+            monitors.sort(key=lambda m: (m["left"], m["top"]))
+            return monitors
     except Exception as e:
-        print(f"Erreur get_leftmost_monitor: {e}")
+        print(f"Erreur get_monitors_sorted_left_to_right: {e}")
+    return [_fallback_primary_monitor()]
 
-    # Fallback : écran principal
-    return {
-        "left": 0,
-        "top": 0,
-        "width": win32api.GetSystemMetrics(0),
-        "height": win32api.GetSystemMetrics(1),
-        "right": win32api.GetSystemMetrics(0),
-        "bottom": win32api.GetSystemMetrics(1),
-    }
+
+def get_monitor_by_screen_number(screen_num: int):
+    """
+    Retourne le moniteur pour le n° d'écran (1 = tout à gauche, 2 = suivant, …).
+    Hors plage : clamp sur le moniteur le plus proche disponible.
+    """
+    monitors = get_monitors_sorted_left_to_right()
+    try:
+        n = int(screen_num)
+    except Exception:
+        n = 1
+    if n < 1:
+        n = 1
+    idx = min(n - 1, len(monitors) - 1)
+    return monitors[idx]
+
+
+def get_leftmost_monitor():
+    """Retourne les coordonnées et dimensions du moniteur le plus à gauche."""
+    return get_monitor_by_screen_number(1)
 
 
 def center_window_on_first_screen(hwnd):
@@ -8191,6 +8213,20 @@ class SnowMasterGUI(QWidget):
             self.on_change_reddot_relaunch_delay
         )
 
+        default_screen_to_use = screen_to_use()
+        self.spin_screen_to_use = CustomSpinBox(
+            self,
+            min_value=1,
+            max_value=16,
+            initial_value=default_screen_to_use,
+            suffix="",
+        )
+        self.spin_screen_to_use.setToolTip(
+            "Numéro d'écran pour « Mettre au premier plan ».\n"
+            "1 = écran tout à gauche, 2 = celui à sa droite, etc."
+        )
+        self.spin_screen_to_use.valueChanged.connect(self.on_change_screen_to_use)
+
         # ComboBox : Mode pour le chargement d'une config (load_only / load_and_launch)
         self.chk_instance_launch = QCheckBox("Load and launch")
         self.chk_instance_launch.setChecked(str(default_inst_mode) == "load_and_launch")
@@ -8287,6 +8323,8 @@ class SnowMasterGUI(QWidget):
         inst_group_collapsible.addWidget(self.spin_reddot)
         inst_group_collapsible.addWidget(QLabel("Délai relance reddot (s) :"))
         inst_group_collapsible.addWidget(self.spin_reddot_relaunch_delay)
+        inst_group_collapsible.addWidget(QLabel("Écran premier plan :"))
+        inst_group_collapsible.addWidget(self.spin_screen_to_use)
         # inst_group_collapsible.addWidget(self.chk_instance_launch)
 
         ap_group_collapsible = CollapsibleGroupBox("Autopilote")
@@ -11876,6 +11914,13 @@ class SnowMasterGUI(QWidget):
         _prefs["reddotRelaunchDelay"] = int(value)
         save_prefs(_prefs)
         app_log_info(f"Délai relance reddot mis à jour : {value}s")
+
+    def on_change_screen_to_use(self, value: int):
+        """Met à jour l'écran utilisé pour « Mettre au premier plan »."""
+        n = max(1, int(value))
+        _prefs["screen_to_use"] = n
+        save_prefs(_prefs)
+        app_log_info(f"Écran premier plan mis à jour : {n}")
 
     def _refresh_all_instance_card_styles(self):
         """Réapplique voyant + style (bordure / glow) sur toutes les cartes visibles."""
