@@ -162,12 +162,14 @@ from PySide6.QtWidgets import (
     QFrame,
     QComboBox,
     QTabWidget,
+    QTabBar,
     QScrollArea,
+    QMenu,
 )
-from PySide6.QtGui import QIcon, QColor
+from PySide6.QtGui import QIcon, QColor, QAction
 from PySide6.QtWidgets import QStyledItemDelegate
-from PySide6.QtGui import QPainter
-from PySide6.QtWidgets import QStyle
+from PySide6.QtGui import QPainter, QPainterPath, QPen, QBrush
+from PySide6.QtWidgets import QStyle, QStyleOptionTab
 from PySide6.QtGui import QIcon, QMouseEvent
 
 
@@ -299,6 +301,7 @@ HEARTBEAT_HISTORY_DEDUP_S = 8  # ignore HB identiques rapprochés
 HEARTBEAT_HISTORY_DISPLAY_DEFAULT = 500  # lignes affichées par défaut dans la popup
 CARD_HEIGHT = 62  # compact
 CARD_WIDTH = 320
+CARD_WIDTH_COMPACT = 160  # mode compact (sans boutons d'action)
 INSTANCES_H_SCROLL_WHEEL_STEP = 36  # px par cran molette (scroll horizontal fluide)
 
 # ===== Persistence des holdings (kamas) =====
@@ -430,6 +433,7 @@ DEFAULT_PREFS = {
         "euro_counter_visible": True,  # afficher le bouton vert € en bas du dock config
         "config_panel_visible": True,  # panneau central Configs / Boutons
         "right_panel_visible": True,  # panneau droite Sous-contrôleurs / détails
+        "compact_instances": False,  # cartes instances sans boutons (plus étroites)
         "always_on_top": False,  # garder SnowMaster au-dessus des autres fenêtres
         "refresh_interval_active_ms": 1000,
         "refresh_interval_inactive_ms": 2500,  # fenêtre inactive / minimisée
@@ -4907,6 +4911,51 @@ def apply_dark_blue_style(app: QApplication):
         QGroupBox { background-color:#111827; border:1px solid #1f2937; border-radius:10px; margin-top:4px; padding:4px; }
         QGroupBox::title { subcontrol-origin:margin; subcontrol-position:top left; padding:0 6px; color:#93c5fd; }
 
+        /* Onglets filtre instances (style Chrome compact) */
+        QWidget#InstancesPanel {
+            background-color:#111827;
+            border:1px solid #1f2937;
+            border-radius:10px;
+        }
+        QTabBar#InstancesFilterTabs {
+            background: transparent;
+        }
+        QTabBar#InstancesFilterTabs::tab {
+            background: #0b1220;
+            color: #94a3b8;
+            border: 1px solid rgba(148,163,184,0.22);
+            border-bottom: none;
+            border-top-left-radius: 9px;
+            border-top-right-radius: 9px;
+            padding: 4px 12px;
+            margin-right: 3px;
+            margin-top: 1px;
+            min-width: 0;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        QTabBar#InstancesFilterTabs::tab:selected {
+            background: #1e3a5f;
+            color: #f8fafc;
+            border: 1px solid rgba(96,165,250,0.55);
+            border-bottom: 2px solid #60a5fa;
+        }
+        QTabBar#InstancesFilterTabs[filterMode="active"][hasRunning="true"]::tab:selected {
+            background: #14532d;
+            color: #ecfdf5;
+            border: 1px solid rgba(74,222,128,0.55);
+            border-bottom: 2px solid #4ade80;
+        }
+        QTabBar#InstancesFilterTabs::tab:hover:!selected {
+            background: #1e293b;
+            color: #e2e8f0;
+        }
+        QFrame#InstancesPanelBody {
+            background: transparent;
+            border: none;
+            border-top: 1px solid rgba(148,163,184,0.18);
+        }
+
         QPushButton { background-color:#2563eb; color:#e5e7eb; border:none; border-radius:10px; padding:6px 10px; font-weight:600; }
         QPushButton:hover { background-color:#3b82f6; }
         QPushButton:pressed { background-color:#1e40af; }
@@ -7339,6 +7388,7 @@ class InstanceItemWidget(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(10, 6, 10, 6)
         lay.setSpacing(8)
+        self._compact = False
 
         self.dot = StatusDot(10)
         lay.addWidget(self.dot, 0, Qt.AlignVCenter)
@@ -7353,7 +7403,10 @@ class InstanceItemWidget(QWidget):
         textcol.addWidget(self.lbl_extra)
         lay.addLayout(textcol, 1)
 
-        btns = QHBoxLayout()
+        self.btns_host = QWidget()
+        self.btns_host.setObjectName("InstanceCardButtons")
+        btns = QHBoxLayout(self.btns_host)
+        btns.setContentsMargins(0, 0, 0, 0)
         btns.setSpacing(5)
         # Boutons actions : on privilégie les icônes (issues des prefs),
         # avec fallback en emojis si les fichiers ne sont pas disponibles.
@@ -7404,7 +7457,7 @@ class InstanceItemWidget(QWidget):
         btns.addWidget(self.btn_reload)
         btns.addWidget(self.btn_kill)
         btns.addWidget(self.btn_del)
-        lay.addLayout(btns, 0)
+        lay.addWidget(self.btns_host, 0)
 
         self.btn_focus.clicked.connect(lambda: self.requestFocus.emit(self.title_id))
         self.btn_reload.clicked.connect(
@@ -7414,18 +7467,101 @@ class InstanceItemWidget(QWidget):
         self.btn_del.clicked.connect(lambda: self.requestDelete.emit(self.title_id))
 
         self.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.customContextMenuRequested.connect(
-            lambda _pos: self.requestHistory.emit(self.title_id)
-        )
+        self.customContextMenuRequested.connect(self._show_context_menu)
         # Évite que la carte impose ~320px de largeur min à toute la fenêtre
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def _show_context_menu(self, pos):
+        """Menu clic droit : actions de la carte + historique heartbeats."""
+        menu = QMenu(self)
+        menu.setObjectName("InstanceCardMenu")
+        menu.setStyleSheet(
+            """
+            QMenu#InstanceCardMenu {
+                background-color: #0f172a;
+                color: #e2e8f0;
+                border: 1px solid rgba(148,163,184,0.35);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu#InstanceCardMenu::item {
+                padding: 6px 18px 6px 10px;
+                border-radius: 5px;
+                background: transparent;
+            }
+            QMenu#InstanceCardMenu::item:selected {
+                background-color: rgba(37,99,235,0.45);
+                color: #f8fafc;
+            }
+            QMenu#InstanceCardMenu::item:disabled {
+                color: #64748b;
+            }
+            QMenu#InstanceCardMenu::separator {
+                height: 1px;
+                background: rgba(148,163,184,0.25);
+                margin: 4px 6px;
+            }
+            """
+        )
+
+        def _icon_or_empty(key: str) -> QIcon:
+            try:
+                ic = get_icon(key)
+                return ic if ic is not None and not ic.isNull() else QIcon()
+            except Exception:
+                return QIcon()
+
+        act_focus = QAction(_icon_or_empty("focus"), "Mettre au premier plan", menu)
+        act_focus.triggered.connect(lambda: self.requestFocus.emit(self.title_id))
+
+        act_reload = QAction(_icon_or_empty("play"), "Relancer l'instance", menu)
+        act_reload.setEnabled(self.btn_reload.isEnabled())
+        act_reload.setToolTip(self.btn_reload.toolTip() or "")
+        act_reload.triggered.connect(lambda: self.requestRelaunch.emit(self.title_id))
+
+        act_kill = QAction(_icon_or_empty("stop"), "Terminer le processus", menu)
+        act_kill.triggered.connect(lambda: self.requestKill.emit(self.title_id))
+
+        act_del = QAction(_icon_or_empty("trash"), "Supprimer le widget", menu)
+        act_del.triggered.connect(lambda: self.requestDelete.emit(self.title_id))
+
+        act_history = QAction("Historique heartbeats", menu)
+        act_history.triggered.connect(lambda: self.requestHistory.emit(self.title_id))
+
+        menu.addAction(act_focus)
+        menu.addAction(act_reload)
+        menu.addAction(act_kill)
+        menu.addAction(act_del)
+        menu.addSeparator()
+        menu.addAction(act_history)
+        menu.exec(self.mapToGlobal(pos))
+
+    def set_compact_mode(self, compact: bool):
+        """Masque les boutons d'action et réduit la largeur utile de la carte."""
+        compact = bool(compact)
+        if self._compact == compact:
+            return
+        self._compact = compact
+        self.btns_host.setVisible(not compact)
+        lay = self.layout()
+        if lay is not None:
+            if compact:
+                lay.setContentsMargins(8, 6, 8, 6)
+                lay.setSpacing(6)
+            else:
+                lay.setContentsMargins(10, 6, 10, 6)
+                lay.setSpacing(8)
+        self.updateGeometry()
+
+    def card_width(self) -> int:
+        return CARD_WIDTH_COMPACT if self._compact else CARD_WIDTH
 
     def minimumSizeHint(self):
         return QSize(0, CARD_HEIGHT)
 
     def sizeHint(self):
-        return QSize(CARD_WIDTH, CARD_HEIGHT)
+        return QSize(self.card_width(), CARD_HEIGHT)
 
     def _init_glow_widgets(self):
         """Crée l'effet d'ombre et l'animation (une seule fois par carte)."""
@@ -7685,6 +7821,64 @@ class SubctrlItemWidget(QWidget):
         self.dot.set_color(color_hex)
 
 
+class InstancesFilterTabBar(QTabBar):
+    """Barre d'onglets instances : Actives se teinte en vert s'il y a ≥1 instance active."""
+
+    def __init__(self, parent=None, *, active_tab_index: int = 1):
+        super().__init__(parent)
+        self._active_tab_index = int(active_tab_index)
+        self._has_running = False
+        self.setProperty("hasRunning", "false")
+
+    def set_has_running(self, value: bool) -> bool:
+        value = bool(value)
+        if self._has_running == value:
+            return False
+        self._has_running = value
+        self.setProperty("hasRunning", "true" if value else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+        return True
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        option = QStyleOptionTab()
+        for index in range(self.count()):
+            self.initStyleOption(option, index)
+            if (
+                index == self._active_tab_index
+                and index != self.currentIndex()
+                and self._has_running
+            ):
+                self._paint_active_tab_idle(painter, option)
+            else:
+                self.style().drawControl(QStyle.CE_TabBarTab, option, painter, self)
+
+    def _paint_active_tab_idle(self, painter: QPainter, option: QStyleOptionTab):
+        """Fond vert + libellé via le style Qt (même police que les autres onglets)."""
+        rect = option.rect.adjusted(0, 1, -1, 0)
+        radius = 9.0
+        path = QPainterPath()
+        path.moveTo(rect.left(), rect.bottom())
+        path.lineTo(rect.left(), rect.top() + radius)
+        path.quadTo(rect.left(), rect.top(), rect.left() + radius, rect.top())
+        path.lineTo(rect.right() - radius, rect.top())
+        path.quadTo(rect.right(), rect.top(), rect.right(), rect.top() + radius)
+        path.lineTo(rect.right(), rect.bottom())
+        path.closeSubpath()
+
+        hovered = bool(option.state & QStyle.State_MouseOver)
+        fill = QColor(22, 70, 40) if hovered else QColor(15, 46, 28)
+        painter.fillPath(path, QBrush(fill))
+        painter.setPen(QPen(QColor(74, 222, 128, 130 if hovered else 100), 1.0))
+        painter.drawPath(path)
+
+        # Même rendu de texte que les autres onglets (police / graisse QSS)
+        self.style().drawControl(QStyle.CE_TabBarTabLabel, option, painter, self)
+
+
 class ItemPerWidgetList(QListWidget):
     """
     QListWidget des instances : molette = défilement horizontal fluide (px par cran).
@@ -7769,128 +7963,120 @@ class ItemPerWidgetList(QListWidget):
 
 # ======================== Custom Widgets =============================
 class CustomSpinBox(QWidget):
-    """Widget personnalisé pour remplacer QSpinBox avec des boutons + et - bien visibles."""
+    """Stepper compact horizontal : [−] valeur [+] (hauteur réduite, largeur limitée)."""
 
     valueChanged = Signal(int)
+
+    _BTN_W = 26
+    _H = 26
+    _MAX_W = 118
 
     def __init__(
         self, parent=None, min_value=0, max_value=600, initial_value=0, suffix=""
     ):
         super().__init__(parent)
+        self.setObjectName("CompactSpinBox")
         self._min = min_value
         self._max = max_value
         self._value = initial_value
         self._suffix = suffix
-        self._is_processing = False  # Flag pour éviter la double exécution
+        self._is_processing = False
 
-        # Layout horizontal
+        self.setFixedHeight(self._H)
+        self.setMaximumWidth(self._MAX_W)
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Champ de texte éditable pour afficher et saisir la valeur
+        self.btn_minus = QPushButton("−")
+        self.btn_minus.setObjectName("CompactSpinMinus")
+        self.btn_minus.setFixedSize(self._BTN_W, self._H)
+        self.btn_minus.setCursor(Qt.PointingHandCursor)
+        self.btn_minus.setFocusPolicy(Qt.NoFocus)
+        self.btn_minus.clicked.connect(self._decrement)
+
         self.value_edit = QLineEdit()
         self.value_edit.setAlignment(Qt.AlignCenter)
         self.value_edit.setValidator(QIntValidator(min_value, max_value))
-        self.value_edit.setStyleSheet(
-            """
-            QLineEdit {
-                background: rgba(15,23,42,0.42);
-                border: 1px solid rgba(255,255,255,0.12);
-                border-top-left-radius: 8px;
-                border-bottom-left-radius: 8px;
-                border-right: none;
-                padding: 6px 12px;
-                min-height: 28px;
-                color: #e5e7eb;
-                font-size: 14px;
-            }
-            QLineEdit:focus {
-                border: 1px solid rgba(59,130,246,0.6);
-                background: rgba(15,23,42,0.6);
-            }
-        """
-        )
-        self._update_display()
-        # Connecter le signal returnPressed (touche Entrée)
-        self.value_edit.returnPressed.connect(self._on_manual_input)
-        # Connecter aussi editingFinished (perte de focus)
-        self.value_edit.editingFinished.connect(self._on_editing_finished)
-        layout.addWidget(self.value_edit)
+        self.value_edit.setFixedHeight(self._H)
+        self.value_edit.setMinimumWidth(40)
+        self.value_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        # Container pour les boutons
-        buttons_container = QWidget()
-        buttons_container.setFixedWidth(24)
-        buttons_layout = QVBoxLayout(buttons_container)
-        buttons_layout.setContentsMargins(0, 0, 0, 0)
-        buttons_layout.setSpacing(0)
-
-        # Bouton +
-        self.btn_plus = QPushButton("▲")
-        self.btn_plus.setFixedSize(24, 14)
+        self.btn_plus = QPushButton("+")
+        self.btn_plus.setObjectName("CompactSpinPlus")
+        self.btn_plus.setFixedSize(self._BTN_W, self._H)
         self.btn_plus.setCursor(Qt.PointingHandCursor)
-        self.btn_plus.setStyleSheet(
-            """
-            QPushButton {
-                background-color: rgba(37,99,235,0.6);
-                color: #ffffff;
-                border: none;
-                border-top-right-radius: 8px;
-                border-bottom-right-radius: 0px;
-                font-weight: bold;
-                font-size: 9px;
-                padding: 0px;
-            }
-            QPushButton:hover {
-                background-color: rgba(59,130,246,0.8);
-            }
-            QPushButton:pressed {
-                background-color: rgba(30,64,175,0.9);
-            }
-            QPushButton:disabled {
-                background-color: rgba(30,58,138,0.4);
-                color: #94a3b8;
-            }
-        """
-        )
+        self.btn_plus.setFocusPolicy(Qt.NoFocus)
         self.btn_plus.clicked.connect(self._increment)
-        buttons_layout.addWidget(self.btn_plus)
 
-        # Bouton -
-        self.btn_minus = QPushButton("▼")
-        self.btn_minus.setFixedSize(24, 14)
-        self.btn_minus.setCursor(Qt.PointingHandCursor)
-        self.btn_minus.setStyleSheet(
+        self.setStyleSheet(
             """
-            QPushButton {
-                background-color: rgba(37,99,235,0.6);
-                color: #ffffff;
-                border: none;
-                border-top-right-radius: 0px;
-                border-bottom-right-radius: 8px;
-                border-top: 1px solid rgba(255,255,255,0.08);
-                font-weight: bold;
-                font-size: 9px;
+            QWidget#CompactSpinBox {
+                background: transparent;
+            }
+            QWidget#CompactSpinBox QLineEdit {
+                background: rgba(15,23,42,0.55);
+                border: 1px solid rgba(148,163,184,0.28);
+                border-left: none;
+                border-right: none;
+                border-radius: 0px;
+                padding: 0px 4px;
+                color: #e5e7eb;
+                font-size: 12px;
+                font-weight: 600;
+                selection-background-color: #2563eb;
+            }
+            QWidget#CompactSpinBox QLineEdit:focus {
+                background: rgba(15,23,42,0.75);
+                border-top: 1px solid rgba(59,130,246,0.65);
+                border-bottom: 1px solid rgba(59,130,246,0.65);
+            }
+            QWidget#CompactSpinBox QPushButton {
+                background-color: rgba(37,99,235,0.72);
+                color: #f8fafc;
+                border: 1px solid rgba(59,130,246,0.45);
+                font-size: 14px;
+                font-weight: 700;
                 padding: 0px;
             }
-            QPushButton:hover {
-                background-color: rgba(59,130,246,0.8);
+            QWidget#CompactSpinBox QPushButton#CompactSpinMinus {
+                border-top-left-radius: 7px;
+                border-bottom-left-radius: 7px;
+                border-top-right-radius: 0px;
+                border-bottom-right-radius: 0px;
+                border-right: none;
             }
-            QPushButton:pressed {
-                background-color: rgba(30,64,175,0.9);
+            QWidget#CompactSpinBox QPushButton#CompactSpinPlus {
+                border-top-left-radius: 0px;
+                border-bottom-left-radius: 0px;
+                border-top-right-radius: 7px;
+                border-bottom-right-radius: 7px;
+                border-left: none;
             }
-            QPushButton:disabled {
-                background-color: rgba(30,58,138,0.4);
-                color: #94a3b8;
+            QWidget#CompactSpinBox QPushButton:hover {
+                background-color: rgba(59,130,246,0.92);
             }
-        """
+            QWidget#CompactSpinBox QPushButton:pressed {
+                background-color: rgba(30,64,175,0.95);
+            }
+            QWidget#CompactSpinBox QPushButton:disabled {
+                background-color: rgba(30,58,138,0.35);
+                color: #64748b;
+                border-color: rgba(148,163,184,0.18);
+            }
+            """
         )
-        self.btn_minus.clicked.connect(self._decrement)
-        buttons_layout.addWidget(self.btn_minus)
 
-        layout.addWidget(buttons_container)
+        self._update_display()
+        self.value_edit.returnPressed.connect(self._on_manual_input)
+        self.value_edit.editingFinished.connect(self._on_editing_finished)
 
-        # Activer le scroll de la souris
+        layout.addWidget(self.btn_minus)
+        layout.addWidget(self.value_edit, 1)
+        layout.addWidget(self.btn_plus)
+
         self.setMouseTracking(True)
         self._update_buttons_state()
 
@@ -7901,7 +8087,6 @@ class CustomSpinBox(QWidget):
 
     def _on_manual_input(self):
         """Gère la saisie manuelle de la valeur (touche Entrée)."""
-        # Éviter la double exécution si déjà en cours de traitement
         if self._is_processing:
             return
 
@@ -7909,14 +8094,11 @@ class CustomSpinBox(QWidget):
 
         try:
             text = self.value_edit.text().strip()
-            # Enlever le suffixe si présent
             if self._suffix and text.endswith(self._suffix):
                 text = text[: -len(self._suffix)].strip()
 
-            # Tenter de convertir en entier
             try:
                 new_value = int(text)
-                # Contraindre dans les limites
                 new_value = max(self._min, min(self._max, new_value))
 
                 if new_value != self._value:
@@ -7925,18 +8107,14 @@ class CustomSpinBox(QWidget):
                     self._update_buttons_state()
                     self.valueChanged.emit(self._value)
                 else:
-                    # Même valeur, mais réafficher avec le bon format
                     self._update_display()
             except ValueError:
-                # Si la conversion échoue, remettre l'ancienne valeur
                 self._update_display()
         finally:
-            # Réinitialiser le flag après un court délai pour permettre les prochaines modifications
             QTimer.singleShot(100, self._reset_processing_flag)
 
     def _on_editing_finished(self):
         """Gère la perte de focus du champ (mais pas si Entrée a déjà été pressée)."""
-        # Si on traite déjà une entrée (via returnPressed), ne rien faire
         if not self._is_processing:
             self._on_manual_input()
 
@@ -7991,7 +8169,6 @@ class CustomSpinBox(QWidget):
         """Définit les limites min et max."""
         self._min = int(min_value)
         self._max = int(max_value)
-        # Mettre à jour le validator
         self.value_edit.setValidator(QIntValidator(self._min, self._max))
         self._value = max(self._min, min(self._max, self._value))
         self._update_display()
@@ -8126,6 +8303,13 @@ class SnowMasterGUI(QWidget):
             right_visible = bool(_prefs.get("ui", {}).get("right_panel_visible", True))
         except Exception:
             right_visible = True
+        try:
+            compact_instances = bool(
+                _prefs.get("ui", {}).get("compact_instances", False)
+            )
+        except Exception:
+            compact_instances = False
+        self._compact_instances = compact_instances
 
         self.btn_toggle_config = QPushButton("⚙ Config")
         self.btn_toggle_config.setCheckable(True)
@@ -8142,6 +8326,15 @@ class SnowMasterGUI(QWidget):
             "Afficher / masquer le panneau Sous-contrôleurs & détails"
         )
         self.btn_toggle_right.toggled.connect(self.on_toggle_right_panel)
+
+        self.btn_toggle_compact = QPushButton("▣ Compact")
+        self.btn_toggle_compact.setCheckable(True)
+        self.btn_toggle_compact.setChecked(compact_instances)
+        self.btn_toggle_compact.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_compact.setToolTip(
+            "Mode compact : masque les boutons des cartes pour afficher plus d'instances"
+        )
+        self.btn_toggle_compact.toggled.connect(self.on_toggle_compact_instances)
 
         _panel_toggle_ss = """
             QPushButton {
@@ -8164,12 +8357,14 @@ class SnowMasterGUI(QWidget):
         """
         self.btn_toggle_config.setStyleSheet(_panel_toggle_ss)
         self.btn_toggle_right.setStyleSheet(_panel_toggle_ss)
+        self.btn_toggle_compact.setStyleSheet(_panel_toggle_ss)
 
         # Pas de largeur min sur le header (sauf le voyant, taille fixe)
         for w in (
             self.title_label,
             self.btn_toggle_config,
             self.btn_toggle_right,
+            self.btn_toggle_compact,
             self.btn_new,
             self.btn_all_reload,
             self.btn_all_kill,
@@ -8187,10 +8382,11 @@ class SnowMasterGUI(QWidget):
         header.addSpacing(10)
         header.addWidget(self.btn_toggle_config, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_toggle_right, 0, Qt.AlignVCenter)
-        header.addWidget(self.btn_new, 0, Qt.AlignVCenter)
+        header.addWidget(self.btn_toggle_compact, 0, Qt.AlignVCenter)
+        # header.addWidget(self.btn_new, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_all_reload, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_all_kill, 0, Qt.AlignVCenter)
-        header.addWidget(self.btn_all_del, 0, Qt.AlignVCenter)
+        # header.addWidget(self.btn_all_del, 0, Qt.AlignVCenter)
         header.addStretch(1)
 
         # Left column
@@ -8198,14 +8394,53 @@ class SnowMasterGUI(QWidget):
         left_col.setSizeConstraint(QVBoxLayout.SetNoConstraint)
         left_col.addLayout(header)
 
-        group = QGroupBox("Instances actives")
+        group = QWidget()
+        group.setObjectName("InstancesPanel")
         group.setMinimumWidth(0)
         group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         group_layout = QVBoxLayout(group)
         group_layout.setSizeConstraint(QVBoxLayout.SetNoConstraint)
         # Marges internes : on supprime la marge droite pour maximiser l'espace horizontal des cartes
-        group_layout.setContentsMargins(8, 8, 0, 8)
-        group_layout.setSpacing(6)
+        group_layout.setContentsMargins(8, 4, 0, 8)
+        group_layout.setSpacing(0)
+
+        tabs_row = QHBoxLayout()
+        tabs_row.setContentsMargins(0, 0, 8, 0)
+        tabs_row.setSpacing(0)
+        self.instances_filter_tabs = InstancesFilterTabBar(active_tab_index=1)
+        self.instances_filter_tabs.setObjectName("InstancesFilterTabs")
+        self.instances_filter_tabs.setExpanding(False)
+        self.instances_filter_tabs.setDrawBase(False)
+        self.instances_filter_tabs.setUsesScrollButtons(False)
+        self.instances_filter_tabs.setCursor(Qt.PointingHandCursor)
+        self.instances_filter_tabs.addTab("Tout")
+        self.instances_filter_tabs.addTab("Actives")
+        self.instances_filter_tabs.addTab("Auto")
+        self.instances_filter_tabs.addTab("Manuel")
+        self.instances_filter_tabs.setTabToolTip(0, "Toutes les instances")
+        self.instances_filter_tabs.setTabToolTip(
+            1, "Instances actives (auto ou manuelles)"
+        )
+        self.instances_filter_tabs.setTabToolTip(
+            2, "Instances avec un chemin de contrôleur configuré"
+        )
+        self.instances_filter_tabs.setTabToolTip(
+            3, "Instances vides ouvertes à la main"
+        )
+        self.instances_filter_tabs.setProperty("filterMode", "all")
+        self.instances_filter_tabs.currentChanged.connect(
+            self._on_instances_filter_changed
+        )
+        tabs_row.addWidget(self.instances_filter_tabs, 0, Qt.AlignLeft | Qt.AlignBottom)
+        tabs_row.addStretch(1)
+        group_layout.addLayout(tabs_row)
+
+        body = QFrame()
+        body.setObjectName("InstancesPanelBody")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 6, 0, 0)
+        body_layout.setSpacing(0)
+
         # self.list = QListWidget()
         self.list = ItemPerWidgetList()
         self.list.setObjectName("instancesList")
@@ -8232,7 +8467,8 @@ class SnowMasterGUI(QWidget):
 
         self.list.currentItemChanged.connect(self.on_select_instance)
         self.list.installEventFilter(self)
-        group_layout.addWidget(self.list)
+        body_layout.addWidget(self.list)
+        group_layout.addWidget(body, 1)
 
         left_col.addWidget(group, 3)
         left_w = QWidget()
@@ -8432,15 +8668,22 @@ class SnowMasterGUI(QWidget):
         # )
         # inst_group_collapsible.addWidget(self.chk_overwrite_instances)
 
-        # nouveaux champs pour instances
-        inst_group_collapsible.addWidget(QLabel("Délai entre lancements (s) :"))
-        inst_group_collapsible.addWidget(self.spin_launch_delay)
-        inst_group_collapsible.addWidget(QLabel("Délai reddot (60s minimum) :"))
-        inst_group_collapsible.addWidget(self.spin_reddot)
-        inst_group_collapsible.addWidget(QLabel("Délai relance reddot (s) :"))
-        inst_group_collapsible.addWidget(self.spin_reddot_relaunch_delay)
-        inst_group_collapsible.addWidget(QLabel("Écran premier plan :"))
-        inst_group_collapsible.addWidget(self.spin_screen_to_use)
+        # nouveaux champs pour instances (label + stepper sur une seule ligne)
+        def _add_spin_row(label_text: str, spin: CustomSpinBox):
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet("color:#cbd5e1; font-size:12px;")
+            lbl.setWordWrap(False)
+            row.addWidget(lbl, 1)
+            row.addWidget(spin, 0, Qt.AlignRight | Qt.AlignVCenter)
+            inst_group_collapsible.addLayout(row)
+
+        _add_spin_row("Délai entre lancements (s)", self.spin_launch_delay)
+        _add_spin_row("Délai reddot (min. 60s)", self.spin_reddot)
+        _add_spin_row("Délai relance reddot (s)", self.spin_reddot_relaunch_delay)
+        _add_spin_row("Écran premier plan", self.spin_screen_to_use)
         # inst_group_collapsible.addWidget(self.chk_instance_launch)
 
         ap_group_collapsible = CollapsibleGroupBox("Autopilote")
@@ -9032,14 +9275,22 @@ class SnowMasterGUI(QWidget):
         _prefs.setdefault("instances", {})["order"] = []
         save_prefs(_prefs)
 
+    def _card_width(self) -> int:
+        return (
+            CARD_WIDTH_COMPACT
+            if getattr(self, "_compact_instances", False)
+            else CARD_WIDTH
+        )
+
     def _adjust_item_widths(self):
         if not getattr(self, "_list_widths_dirty", True):
             return
         self._list_widths_dirty = False
+        w = self._card_width()
         for i in range(self.list.count()):
             it = self.list.item(i)
             if it:
-                it.setSizeHint(QSize(CARD_WIDTH, CARD_HEIGHT))
+                it.setSizeHint(QSize(w, CARD_HEIGHT))
 
     def _sync_refresh_timer_interval(self):
         try:
@@ -9474,6 +9725,7 @@ class SnowMasterGUI(QWidget):
 
         self._cached_active_count = active
         self._cached_reddot_count = reddot
+        self._sync_actives_tab_highlight(active > 0)
 
         active_label = "instance" if active == 1 else "instances"
         txt = f"{active} {active_label}"
@@ -9485,6 +9737,22 @@ class SnowMasterGUI(QWidget):
             self.lbl_instances_big.setText(txt)
         except Exception:
             pass
+
+    def _sync_actives_tab_highlight(self, has_running: bool):
+        """Vert sur l'onglet Actives seulement s'il existe ≥1 instance active."""
+        bar = getattr(self, "instances_filter_tabs", None)
+        if bar is None:
+            return
+        if isinstance(bar, InstancesFilterTabBar):
+            bar.set_has_running(has_running)
+            return
+        flag = "true" if has_running else "false"
+        if str(bar.property("hasRunning")) == flag:
+            return
+        bar.setProperty("hasRunning", flag)
+        bar.style().unpolish(bar)
+        bar.style().polish(bar)
+        bar.update()
 
     def update_revenue_counter(self):
         """Total € = Σ (kamas_TS + kamas_M) × prix_moyen_EUR/M (moyenne des sites scrapés)."""
@@ -9551,14 +9819,98 @@ class SnowMasterGUI(QWidget):
                 return it
         return None
 
+    def _instances_filter_mode(self) -> str:
+        """Retourne 'all' | 'active' | 'auto' | 'manual' selon l'onglet actif."""
+        try:
+            idx = int(self.instances_filter_tabs.currentIndex())
+        except Exception:
+            return "all"
+        return (
+            ("all", "active", "auto", "manual")[idx] if 0 <= idx <= 3 else "all"
+        )
+
+    def _sync_instances_filter_tab_style(self):
+        """Applique le style vert sélectionné seulement si Actives + ≥1 instance active."""
+        bar = getattr(self, "instances_filter_tabs", None)
+        if bar is None:
+            return
+        mode = self._instances_filter_mode()
+        has_running = bool(getattr(self, "_cached_active_count", 0))
+        if isinstance(bar, InstancesFilterTabBar):
+            has_running = bool(bar._has_running)
+        bar.setProperty("filterMode", mode)
+        bar.setProperty("hasRunning", "true" if has_running else "false")
+        # Force le recalcul du QSS (propriété dynamique)
+        bar.style().unpolish(bar)
+        bar.style().polish(bar)
+        bar.update()
+
+    def _instance_matches_filter(
+        self, inst: Optional[InstanceState], mode: Optional[str] = None
+    ) -> bool:
+        if not inst:
+            return False
+        if mode is None:
+            mode = self._instances_filter_mode()
+        if mode == "all":
+            return True
+        if mode == "active":
+            try:
+                return self._is_instance_running(inst)
+            except Exception:
+                return False
+        is_manual = bool(getattr(inst, "manual_empty", False))
+        if mode == "manual":
+            return is_manual
+        # auto : chemin de contrôleur déjà configuré
+        ctrl = getattr(inst, "controller_path", None)
+        return bool(ctrl) and not is_manual
+
+    def _apply_instances_filter(self):
+        """Affiche/masque les cartes selon l'onglet Tout / Actives / Auto / Manuel."""
+        if not hasattr(self, "list") or self.list is None:
+            return
+        mode = self._instances_filter_mode()
+        titles = []
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it and it.data(Qt.UserRole):
+                titles.append(it.data(Qt.UserRole))
+        with _state_lock:
+            snap = {t: _instances.get(t) for t in titles}
+        changed = False
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if not it:
+                continue
+            title = it.data(Qt.UserRole)
+            visible = self._instance_matches_filter(snap.get(title), mode)
+            if it.isHidden() == (not visible):
+                continue
+            it.setHidden(not visible)
+            changed = True
+            if not visible and it.isSelected():
+                it.setSelected(False)
+        if changed:
+            self._list_widths_dirty = True
+
+    def _on_instances_filter_changed(self, _index: int = 0):
+        self._sync_instances_filter_tab_style()
+        self._apply_instances_filter()
+        self._adjust_item_widths()
+        self.update_card_selection_styles()
+        self.update_selected_details()
+        self.update_sub_list()
+
     def _ensure_item(self, title: str, inst: InstanceState):
         it = self._get_item_by_title(title)
         if it is None:
             it = QListWidgetItem()
             it.setData(Qt.UserRole, title)
-            it.setSizeHint(QSize(CARD_WIDTH, CARD_HEIGHT))
+            it.setSizeHint(QSize(self._card_width(), CARD_HEIGHT))
 
             card = InstanceItemWidget(title=inst.title)
+            card.set_compact_mode(getattr(self, "_compact_instances", False))
 
             # def _bind_click(ev, _it=it, _card=card):
             #     if ev.button() == Qt.LeftButton:
@@ -9703,6 +10055,8 @@ class SnowMasterGUI(QWidget):
             card.update_status(color, extra)
             self._update_card_buttons_state(title, inst, card)
 
+        it.setHidden(not self._instance_matches_filter(inst))
+
         if title not in self.instance_order:
             self.instance_order.append(title)
             _prefs.setdefault("instances", {})["order"] = list(self.instance_order)
@@ -9749,6 +10103,7 @@ class SnowMasterGUI(QWidget):
             if not w:
                 continue
             w.set_selected(it.isSelected())
+        self._apply_instances_filter()
         self._adjust_item_widths()
         self.update_selected_details()
         self.update_sub_list()
@@ -12060,6 +12415,33 @@ class SnowMasterGUI(QWidget):
             pass
         _prefs.setdefault("ui", {})["right_panel_visible"] = bool(checked)
         save_prefs(_prefs)
+
+    def on_toggle_compact_instances(self, checked: bool):
+        """Active / désactive le mode compact des cartes d'instances."""
+        self._compact_instances = bool(checked)
+        _prefs.setdefault("ui", {})["compact_instances"] = self._compact_instances
+        save_prefs(_prefs)
+        self._apply_compact_instances_mode()
+
+    def _apply_compact_instances_mode(self):
+        """Applique le mode compact à toutes les cartes déjà créées."""
+        compact = bool(getattr(self, "_compact_instances", False))
+        w = self._card_width()
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if not it:
+                continue
+            card = self.list.itemWidget(it)
+            if card is not None and hasattr(card, "set_compact_mode"):
+                card.set_compact_mode(compact)
+            it.setSizeHint(QSize(w, CARD_HEIGHT))
+        self._list_widths_dirty = True
+        self._adjust_item_widths()
+        try:
+            self.list.doItemsLayout()
+        except Exception:
+            pass
+        self.list.update()
 
     def on_toggle_always_on_top(self, _state):
         """Épingle / désépingle la fenêtre SnowMaster au-dessus des autres."""
