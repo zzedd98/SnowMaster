@@ -8383,7 +8383,7 @@ class SnowMasterGUI(QWidget):
         header.addWidget(self.btn_toggle_config, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_toggle_right, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_toggle_compact, 0, Qt.AlignVCenter)
-        ## header.addWidget(self.btn_new, 0, Qt.AlignVCenter)
+        header.addWidget(self.btn_new, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_all_reload, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_all_kill, 0, Qt.AlignVCenter)
         # header.addWidget(self.btn_all_del, 0, Qt.AlignVCenter)
