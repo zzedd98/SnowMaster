@@ -344,6 +344,9 @@ SERVER_SCRAPE_NAME = {
 # ======== AUTO RELAUNCH CONFIG ========
 AUTO_RELAUNCH_DEFAULT = True  # relance crash toujours active (plus de case à cocher)
 AUTO_RELAUNCH_COOLDOWN_S = 10  # anti-spam par instance
+# Lancement (voyant jaune) sans PID/HWND : au-delà → relance auto (pas de passage au gris)
+# Aligné sur le timeout fenêtre de run_snowbot_flow (~120s)
+AWAITING_LAUNCH_TIMEOUT_S = 120
 AUTO_REDDOT_RELAUNCH_DEFAULT = False
 AUTO_REDDOT_RELAUNCH_DELAY_DEFAULT = 300  # secondes en reddot avant reset
 REDDOT_SECOND_RESET_COOLDOWN_S = 30 * 60  # pas de 2e reset auto avant 30 min
@@ -3942,8 +3945,13 @@ def api_register():
             inst.sub_map = _parse_subcontrollers(data["subcontrollers"], time.time())
         if data.get("touch", True):
             now_ts = time.time()
-            inst.last_heartbeat = now_ts
             inst.last_reset = now_ts  # <-- NOUVEAU : marquer le lancement
+            # Ne pas inventer un heartbeat « vivant » si aucun process n'est encore là
+            # (sinon l'UI affiche une MAJ + _is_instance_running croit l'instance active).
+            pid_ok = bool(inst.pid) and int(inst.pid) != 0
+            hwnd_ok = bool(inst.hwnd) and int(inst.hwnd) != 0
+            if pid_ok or hwnd_ok:
+                inst.last_heartbeat = now_ts
         inst.restored_recently = False  # si un register arrive, on lève le flag
         _instances[title] = inst
     bus.new_instance.emit(title)
@@ -9523,6 +9531,10 @@ class SnowMasterGUI(QWidget):
             else:
                 pid_ok = _is_pid_alive_ui(inst.pid)
                 hwnd_ok = _is_hwnd_valid_ui(inst.hwnd)
+            # Pendant le lancement (jaune) : seul un vrai process compte.
+            # Un /register pré-lancement ne doit pas bloquer une relance via un HB fictif.
+            if getattr(inst, "awaiting_first_hb", False):
+                return bool(pid_ok or hwnd_ok)
             hb_ok = False
             if inst.last_heartbeat and inst.last_heartbeat > 0:
                 hb_ok = (time.time() - float(inst.last_heartbeat)) < float(
@@ -11877,6 +11889,8 @@ class SnowMasterGUI(QWidget):
 
             # 3) Récupérer snapshot des instances (copie pour éviter les locks prolongés)
             instances_snapshot = []
+            # Jaunes timeout sans PID → relance auto (hors lock, via actions_to_perform)
+            yellow_timeout_relaunches = []
             with _state_lock:
                 for title, inst in _instances.items():
                     if inst.stopped:
@@ -11886,10 +11900,27 @@ class SnowMasterGUI(QWidget):
                     pid = inst.pid
                     hwnd = inst.hwnd
                     if (not pid or pid == 0) and (not hwnd or hwnd == 0):
-                        # En cours de lancement : ne pas marquer stoppée (sinon reset/relance cassés)
+                        # En cours de lancement : laisser le temps au process d'apparaître
                         if getattr(inst, "awaiting_first_hb", False):
+                            launch_ts = float(
+                                getattr(inst, "last_reset", 0.0) or 0.0
+                            ) or float(getattr(inst, "last_heartbeat", 0.0) or 0.0)
+                            age = (time.time() - launch_ts) if launch_ts > 0 else 1e9
+                            if age < float(AWAITING_LAUNCH_TIMEOUT_S):
+                                scan_log(
+                                    f"[SCAN_PIDS] '{title}': PID/HWND absents mais awaiting_first_hb "
+                                    f"(âge={age:.0f}s < {AWAITING_LAUNCH_TIMEOUT_S}s) — ignore"
+                                )
+                                continue
                             scan_log(
-                                f"[SCAN_PIDS] '{title}': PID/HWND absents mais awaiting_first_hb — ignore"
+                                f"[SCAN_PIDS] '{title}': lancement jaune timeout "
+                                f"({age:.0f}s sans PID) — relance auto"
+                            )
+                            yellow_timeout_relaunches.append(
+                                {
+                                    "title": title,
+                                    "controller_path": inst.controller_path,
+                                }
                             )
                             continue
                         scan_log(
@@ -11925,10 +11956,11 @@ class SnowMasterGUI(QWidget):
                     )
 
             scan_log(
-                f"[SCAN_PIDS] {len(instances_snapshot)} instances actives à vérifier"
+                f"[SCAN_PIDS] {len(instances_snapshot)} instances actives à vérifier, "
+                f"{len(yellow_timeout_relaunches)} jaune(s) en timeout"
             )
 
-            if not instances_snapshot:
+            if not instances_snapshot and not yellow_timeout_relaunches:
                 scan_log(f"[SCAN_PIDS] Aucune instance active, fin du scan")
                 return
 
@@ -11937,6 +11969,31 @@ class SnowMasterGUI(QWidget):
                 []
             )  # Liste de (action_type, title, controller_path, reason)
             now = time.time()
+
+            for yt in yellow_timeout_relaunches:
+                title = yt["title"]
+                last = self._last_auto_relaunch_attempt.get(title, 0.0)
+                cooldown_remaining = AUTO_RELAUNCH_COOLDOWN_S - (now - last)
+                if cooldown_remaining > 0:
+                    scan_log(
+                        f"[SCAN_PIDS] '{title}': jaune timeout mais cooldown "
+                        f"({cooldown_remaining:.1f}s restants)"
+                    )
+                    continue
+                controller_path = self._resolve_controller_path(
+                    title, yt.get("controller_path")
+                )
+                if controller_path:
+                    actions_to_perform.append(
+                        ("relaunch", title, controller_path, "jaune_timeout")
+                    )
+                else:
+                    scan_log(
+                        f"[SCAN_PIDS] '{title}': ✗ jaune timeout mais controller introuvable"
+                    )
+                    app_log_error(
+                        f"[SCAN_PIDS] '{title}': Timeout lancement jaune sans controller_path"
+                    )
 
             for inst_data in instances_snapshot:
                 try:
@@ -12031,7 +12088,9 @@ class SnowMasterGUI(QWidget):
                         f"[SCAN_PIDS] '{title}': Planification relance (raison: {reason})"
                     )
                     self._last_auto_relaunch_attempt[title] = now
-                    self._mark_instance_stopped(title)
+                    # Crash → stop propre avant relance. Jaune timeout → rester jaune.
+                    if reason != "jaune_timeout":
+                        self._mark_instance_stopped(title)
                     # Stocker temporairement le controller_path pour la relance
                     with _state_lock:
                         inst = _instances.get(title)
@@ -14209,6 +14268,21 @@ def run_snowbot_flow(
                 retries=2,
                 delay=0.2,
             )
+        except Exception:
+            pass
+        # Garder le jaune : le scan PID relancera auto après AWAITING_LAUNCH_TIMEOUT_S
+        try:
+            with _state_lock:
+                inst = _instances.get(title)
+                if inst and getattr(inst, "awaiting_first_hb", False):
+                    inst.pid = None
+                    inst.hwnd = None
+                    inst.stopped = False
+                    _instances[title] = inst
+            try:
+                bus.instance_updated.emit(title)
+            except Exception:
+                pass
         except Exception:
             pass
         return
