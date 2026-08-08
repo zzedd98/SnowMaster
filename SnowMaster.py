@@ -344,9 +344,9 @@ SERVER_SCRAPE_NAME = {
 # ======== AUTO RELAUNCH CONFIG ========
 AUTO_RELAUNCH_DEFAULT = True  # relance crash toujours active (plus de case à cocher)
 AUTO_RELAUNCH_COOLDOWN_S = 10  # anti-spam par instance
-# Lancement (voyant jaune) sans PID/HWND : au-delà → relance auto (pas de passage au gris)
-# Aligné sur le timeout fenêtre de run_snowbot_flow (~120s)
-AWAITING_LAUNCH_TIMEOUT_S = 120
+# Lancement (voyant jaune) sans aucun PID/HWND (pas même le launcher) :
+# au-delà → relance auto (pas de passage au gris)
+AWAITING_LAUNCH_TIMEOUT_S = 30
 AUTO_REDDOT_RELAUNCH_DEFAULT = False
 AUTO_REDDOT_RELAUNCH_DELAY_DEFAULT = 300  # secondes en reddot avant reset
 REDDOT_SECOND_RESET_COOLDOWN_S = 30 * 60  # pas de 2e reset auto avant 30 min
@@ -10118,6 +10118,8 @@ class SnowMasterGUI(QWidget):
                             self.list.setCurrentItem(_it)
                             self.update_card_selection_styles()
                             self.update_selected_details()
+                            # Jaune immédiat au clic, puis lancement
+                            self._mark_instance_launching_ui(title)
                             QTimer.singleShot(
                                 0, lambda t=title: self.on_card_relaunch(t)
                             )
@@ -10739,6 +10741,95 @@ class SnowMasterGUI(QWidget):
         )
         t.start()
 
+    def _mark_instance_launching_ui(self, title: str) -> bool:
+        """Passe immédiatement en jaune et rafraîchit la carte (feedback avant le spawn)."""
+        if not title:
+            return False
+        with _state_lock:
+            inst = _instances.get(title)
+            if not inst:
+                return False
+            inst.awaiting_first_hb = True
+            inst.stopped = False
+            inst.last_heartbeat = 0.0
+            inst.last_reset = time.time()
+            inst.pid = None
+            inst.hwnd = None
+        try:
+            self._refresh_one_card(title)
+            self.update_global_dot()
+            # Peindre tout de suite, avant un éventuel scan process / spawn lent
+            QApplication.processEvents()
+        except Exception:
+            pass
+        # Si aucun PID (même launcher) après le timeout → retenter sans attendre le scan périodique
+        try:
+            QTimer.singleShot(
+                int(float(AWAITING_LAUNCH_TIMEOUT_S) * 1000),
+                lambda t=title: self._check_yellow_no_pid_timeout(t),
+            )
+        except Exception:
+            pass
+        return True
+
+    def _check_yellow_no_pid_timeout(self, title: str):
+        """Après AWAITING_LAUNCH_TIMEOUT_S en jaune sans PID/HWND vivant → relance auto."""
+        if not title:
+            return
+        with _state_lock:
+            inst = _instances.get(title)
+            if not inst or inst.stopped:
+                return
+            if not getattr(inst, "awaiting_first_hb", False):
+                return
+            pid = inst.pid
+            hwnd = inst.hwnd
+            manual_empty = bool(getattr(inst, "manual_empty", False))
+            controller = inst.controller_path
+            launch_ts = float(getattr(inst, "last_reset", 0.0) or 0.0) or float(
+                inst.last_heartbeat or 0.0
+            )
+
+        # Un lancement plus récent a déjà reset le chrono
+        if launch_ts > 0 and (time.time() - launch_ts) < (
+            float(AWAITING_LAUNCH_TIMEOUT_S) - 0.5
+        ):
+            return
+
+        pid_ok = is_pid_alive(pid) if pid else False
+        hwnd_ok = is_hwnd_valid(hwnd) if hwnd else False
+        if pid_ok or hwnd_ok:
+            return
+
+        if not self._auto_relaunch_still_needed(title, "jaune_timeout"):
+            return
+
+        now = time.time()
+        last = self._last_auto_relaunch_attempt.get(title, 0.0)
+        if now - last < float(AUTO_RELAUNCH_COOLDOWN_S):
+            return
+
+        if manual_empty:
+            controller_path = None
+        else:
+            controller_path = self._resolve_controller_path(title, controller)
+            if not controller_path:
+                scan_log(
+                    f"[YELLOW_TIMEOUT] '{title}': 30s sans PID, controller introuvable"
+                )
+                return
+
+        scan_log(
+            f"[YELLOW_TIMEOUT] '{title}': {AWAITING_LAUNCH_TIMEOUT_S}s en jaune sans PID — relance"
+        )
+        self._last_auto_relaunch_attempt[title] = now
+        if controller_path:
+            with _state_lock:
+                inst2 = _instances.get(title)
+                if inst2:
+                    inst2.controller_path = controller_path
+        self.relaunch_requested.emit(title)
+
     def on_card_relaunch_force(self, title: str, controller_path: str):
         """Relance forcée d'une instance sans vérifier si elle est déjà running.
         Utilisé par le scan auto-relaunch après détection de crash."""
@@ -10761,6 +10852,9 @@ class SnowMasterGUI(QWidget):
             print(f"[DEBUG on_card_relaunch_force] {title}: pas de controller, ABORT")
             return
 
+        # Feedback jaune immédiat (avant le nettoyage / spawn)
+        self._mark_instance_launching_ui(title)
+
         # Killer les processus dupliqués si nécessaire
         if self._enforce_unique_title_processes(title):
             # print(f"[DEBUG on_card_relaunch_force] {title}: processus dupliqués tués")
@@ -10770,27 +10864,9 @@ class SnowMasterGUI(QWidget):
             if not inst:
                 # print(f"[DEBUG on_card_relaunch_force] {title}: inst None après enforce, return")
                 return
-
-        # PAS de check _is_instance_running - on force la relance
-        # print(f"[DEBUG on_card_relaunch_force] {title}: Marquage awaiting_first_hb=True, stopped=False")
-
-        # Marquer l'instance comme "en attente du premier heartbeat" (voyant jaune)
-        with _state_lock:
-            inst2 = _instances.get(title)
-            if inst2:
-                inst2.awaiting_first_hb = True
-                inst2.stopped = False
-                inst2.last_heartbeat = 0.0
-                inst2.pid = None  # Reset PID
-                inst2.hwnd = None  # Reset HWND
-                _instances[title] = inst2
-        try:
-            bus.instance_updated.emit(title)
-        except Exception:
-            pass
-
-        # Forcer la mise à jour immédiate de l'UI
-        QTimer.singleShot(0, lambda: self.refresh_cards_and_details())
+            if controller_path:
+                controller = controller_path
+            self._mark_instance_launching_ui(title)
 
         # print(f"[DEBUG on_card_relaunch_force] {title}: Envoi /register")
         try:
@@ -10831,6 +10907,15 @@ class SnowMasterGUI(QWidget):
             # print(f"[DEBUG on_card_relaunch] {title}: inst None, return")
             return
 
+        is_running = self._is_instance_running(inst, fresh=True)
+        # print(f"[DEBUG on_card_relaunch] {title}: _is_instance_running={is_running}, inst.stopped={inst.stopped}, inst.pid={inst.pid}, inst.hwnd={inst.hwnd}")
+        if is_running:
+            # print(f"[DEBUG on_card_relaunch] {title}: instance considérée running, ABORT relance")
+            return
+
+        # Jaune immédiat — avant scan doublons / spawn (évite le doute au clic)
+        self._mark_instance_launching_ui(title)
+
         if self._enforce_unique_title_processes(title):
             # print(f"[DEBUG on_card_relaunch] {title}: enforce_unique trouvé des doublons, re-fetch params")
             inst, controller, exe, images, ratio = self._get_instance_launch_params(
@@ -10839,27 +10924,10 @@ class SnowMasterGUI(QWidget):
             if not inst:
                 # print(f"[DEBUG on_card_relaunch] {title}: inst None après enforce, return")
                 return
+            self._mark_instance_launching_ui(title)
 
-        is_running = self._is_instance_running(inst, fresh=True)
-        # print(f"[DEBUG on_card_relaunch] {title}: _is_instance_running={is_running}, inst.stopped={inst.stopped}, inst.pid={inst.pid}, inst.hwnd={inst.hwnd}")
-        if is_running:
-            # print(f"[DEBUG on_card_relaunch] {title}: instance considérée running, ABORT relance")
-            return
         # --- Si c'est une "instance vide" lancée manuellement, on relance sans demander de controller ---
         if getattr(inst, "manual_empty", False):
-            with _state_lock:
-                inst.stopped = False
-                inst.awaiting_first_hb = True
-                now_ts = time.time()
-                inst.last_heartbeat = now_ts
-                inst.last_reset = now_ts
-                inst.pid = None
-                inst.hwnd = None
-                _instances[title] = inst
-            try:
-                bus.instance_updated.emit(title)
-            except Exception:
-                pass
 
             def _run_and_monitor_empty():
                 _log_empty(f"[{title}] Relance instance vide exe={exe!r}")
@@ -10981,31 +11049,12 @@ class SnowMasterGUI(QWidget):
                 "Exécutables / Scripts (*.exe *.bat *.cmd *.py *.lua);;Tous (*.*)",
             )
             if not controller:
-                # print(f"[DEBUG on_card_relaunch] {title}: utilisateur a annulé, return")
+                # Annulation : revenir au gris (on était déjà passé en jaune)
+                self._mark_instance_stopped(title)
                 return
             with _state_lock:
                 inst.controller_path = controller
                 _instances[title] = inst
-
-        # print(f"[DEBUG on_card_relaunch] {title}: Marquage awaiting_first_hb=True, stopped=False")
-        # Marquer l'instance comme "en attente du premier heartbeat" (voyant jaune)
-        with _state_lock:
-            inst2 = _instances.get(title)
-            if inst2:
-                inst2.awaiting_first_hb = True
-                inst2.stopped = False
-                inst2.last_heartbeat = 0.0  # Réinitialiser pour forcer le voyant jaune
-                # Purger l'ancien PID/HWND : sinon le scan voit un PID mort → faux "crash"
-                # et relance alors que le nouveau process vient de démarrer / d'envoyer un HB.
-                inst2.pid = None
-                inst2.hwnd = None
-                _instances[title] = inst2
-        try:
-            bus.instance_updated.emit(title)
-        except Exception:
-            pass
-        # Forcer la mise à jour immédiate de l'UI pour afficher le voyant jaune
-        QTimer.singleShot(0, lambda: self.refresh_cards_and_details())
 
         print(f"[DEBUG on_card_relaunch] {title}: Envoi /register")
         try:
@@ -11643,8 +11692,12 @@ class SnowMasterGUI(QWidget):
             bus.instance_updated.emit(title)
         except Exception:
             pass
-        # Forcer la mise à jour du voyant (bleu) après le prochain cycle Qt
-        QTimer.singleShot(50, lambda t=title: self._refresh_one_card(t))
+        self._refresh_one_card(title)
+        self.update_global_dot()
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
 
         # thread qui lance et surveille le process (--title + --empty pour restauration voyant bleu)
         def _run_and_monitor():
@@ -14065,6 +14118,20 @@ def wait_for_windows_with_early_register(
     app_log_info(
         "Launched PID=%s @ %s", p.pid, datetime.fromtimestamp(start_ts).isoformat()
     )
+    # Enregistrer tout de suite le PID launcher : évite un faux timeout « jaune sans PID »
+    # alors que le process tourne déjà (early register fenêtre peut arriver bien plus tard).
+    try:
+        with _state_lock:
+            inst = _instances.get(title_for_register)
+            if inst and getattr(inst, "awaiting_first_hb", False):
+                inst.pid = int(p.pid)
+                inst.stopped = False
+        try:
+            bus.instance_updated.emit(title_for_register)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
     scr_area, _ = screen_area(use_virtual_screen)
     threshold = scr_area * float(min_screen_ratio)
