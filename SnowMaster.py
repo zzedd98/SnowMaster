@@ -10928,6 +10928,10 @@ class SnowMasterGUI(QWidget):
                 inst2.awaiting_first_hb = True
                 inst2.stopped = False
                 inst2.last_heartbeat = 0.0  # Réinitialiser pour forcer le voyant jaune
+                # Purger l'ancien PID/HWND : sinon le scan voit un PID mort → faux "crash"
+                # et relance alors que le nouveau process vient de démarrer / d'envoyer un HB.
+                inst2.pid = None
+                inst2.hwnd = None
                 _instances[title] = inst2
         try:
             bus.instance_updated.emit(title)
@@ -10942,8 +10946,8 @@ class SnowMasterGUI(QWidget):
                 "/register",
                 {
                     "title": title,
-                    "pid": inst.pid or 0,
-                    "hwnd": inst.hwnd or 0,
+                    "pid": 0,
+                    "hwnd": 0,
                     "controller": controller,
                     "exe": exe,
                     "images": images,
@@ -11952,6 +11956,9 @@ class SnowMasterGUI(QWidget):
                             "pid": pid,
                             "hwnd": hwnd,
                             "controller_path": inst.controller_path,
+                            "awaiting_first_hb": bool(
+                                getattr(inst, "awaiting_first_hb", False)
+                            ),
                         }
                     )
 
@@ -12080,10 +12087,16 @@ class SnowMasterGUI(QWidget):
 
                     traceback.print_exc()
 
-            # 5) Exécuter les actions dans le thread UI via QTimer
+            # 5) Exécuter les actions — revalider juste avant (anti-course avec 1er HB)
             scan_log(f"[SCAN_PIDS] {len(actions_to_perform)} action(s) à exécuter")
             for action_type, title, controller_path, reason in actions_to_perform:
                 if action_type == "relaunch":
+                    if not self._auto_relaunch_still_needed(title, reason):
+                        scan_log(
+                            f"[SCAN_PIDS] '{title}': relance {reason} annulée "
+                            f"(instance déjà OK / plus en attente)"
+                        )
+                        continue
                     scan_log(
                         f"[SCAN_PIDS] '{title}': Planification relance (raison: {reason})"
                     )
@@ -12115,6 +12128,37 @@ class SnowMasterGUI(QWidget):
                 self._auto_relaunch_scan_lock.release()
             except Exception:
                 pass
+
+    def _auto_relaunch_still_needed(self, title: str, reason: str) -> bool:
+        """True si, à l'instant T, une relance auto a encore du sens (évite de tuer un lancement réussi)."""
+        with _state_lock:
+            inst = _instances.get(title)
+            if not inst:
+                return False
+            awaiting = bool(getattr(inst, "awaiting_first_hb", False))
+            stopped = bool(inst.stopped)
+            pid = inst.pid
+            hwnd = inst.hwnd
+            last_hb = float(inst.last_heartbeat or 0.0)
+
+        pid_ok = is_pid_alive(pid) if pid else False
+        hwnd_ok = is_hwnd_valid(hwnd) if hwnd else False
+        hb_fresh = last_hb > 0 and (time.time() - last_hb) < float(HEARTBEAT_RED_S)
+
+        if reason == "jaune_timeout":
+            # Seulement si toujours en lancement sans process réel
+            if stopped or not awaiting:
+                return False
+            if pid_ok or hwnd_ok:
+                return False
+            return True
+
+        # crash / doublons : ne pas toucher une instance saine (ex. 1er HB entre-temps)
+        if not stopped and (pid_ok or hwnd_ok):
+            return False
+        if not stopped and hb_fresh and not awaiting:
+            return False
+        return True
 
     def _process_pending_resets(self):
         """Traite les demandes de reset en attente."""
