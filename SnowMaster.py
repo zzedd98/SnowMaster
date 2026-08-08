@@ -3094,6 +3094,49 @@ def is_hwnd_valid(hwnd: Optional[int]) -> bool:
         return False
 
 
+# Cache court pour l'UI uniquement (évite psutil/win32 à chaque tick ~1s).
+# Le scan PID / relaunch continuent d'appeler is_pid_alive / is_hwnd_valid directement.
+_UI_PID_ALIVE_CACHE: Dict[int, tuple] = {}  # pid -> (monotonic_ts, bool)
+_UI_HWND_VALID_CACHE: Dict[int, tuple] = {}  # hwnd -> (monotonic_ts, bool)
+_UI_PROC_CACHE_TTL_S = 2.0
+
+
+def _is_pid_alive_ui(pid: Optional[int]) -> bool:
+    if not pid:
+        return False
+    try:
+        key = int(pid)
+    except Exception:
+        return False
+    now = time.monotonic()
+    cached = _UI_PID_ALIVE_CACHE.get(key)
+    if cached is not None and (now - cached[0]) < _UI_PROC_CACHE_TTL_S:
+        return cached[1]
+    alive = is_pid_alive(key)
+    _UI_PID_ALIVE_CACHE[key] = (now, alive)
+    if len(_UI_PID_ALIVE_CACHE) > 512:
+        _UI_PID_ALIVE_CACHE.clear()
+    return alive
+
+
+def _is_hwnd_valid_ui(hwnd: Optional[int]) -> bool:
+    if not hwnd:
+        return False
+    try:
+        key = int(hwnd)
+    except Exception:
+        return False
+    now = time.monotonic()
+    cached = _UI_HWND_VALID_CACHE.get(key)
+    if cached is not None and (now - cached[0]) < _UI_PROC_CACHE_TTL_S:
+        return cached[1]
+    valid = is_hwnd_valid(key)
+    _UI_HWND_VALID_CACHE[key] = (now, valid)
+    if len(_UI_HWND_VALID_CACHE) > 512:
+        _UI_HWND_VALID_CACHE.clear()
+    return valid
+
+
 # ===================== SHARED STATE =======================
 class InstanceState:
     def __init__(self, title: str):
@@ -9443,13 +9486,21 @@ class SnowMasterGUI(QWidget):
         age = (now - last_ts) if last_ts else 1e9
         return CLR_RED if self._age_to_red(age, stopped) else CLR_GREEN
 
-    def _is_instance_running(self, inst: InstanceState) -> bool:
-        """Considère l'instance 'en cours' si (non stoppée) et (PID/HWND vivants ou HB récent)."""
+    def _is_instance_running(self, inst: InstanceState, *, fresh: bool = False) -> bool:
+        """Considère l'instance 'en cours' si (non stoppée) et (PID/HWND vivants ou HB récent).
+
+        fresh=False (défaut) : cache UI ~2s pour ne pas saturer le thread Qt.
+        fresh=True : check immédiat (relance manuelle / décisions critiques).
+        """
         try:
             if inst.stopped:
                 return False
-            pid_ok = is_pid_alive(inst.pid)
-            hwnd_ok = is_hwnd_valid(inst.hwnd)
+            if fresh:
+                pid_ok = is_pid_alive(inst.pid)
+                hwnd_ok = is_hwnd_valid(inst.hwnd)
+            else:
+                pid_ok = _is_pid_alive_ui(inst.pid)
+                hwnd_ok = _is_hwnd_valid_ui(inst.hwnd)
             hb_ok = False
             if inst.last_heartbeat and inst.last_heartbeat > 0:
                 hb_ok = (time.time() - float(inst.last_heartbeat)) < float(
@@ -10692,7 +10743,7 @@ class SnowMasterGUI(QWidget):
                 # print(f"[DEBUG on_card_relaunch] {title}: inst None après enforce, return")
                 return
 
-        is_running = self._is_instance_running(inst)
+        is_running = self._is_instance_running(inst, fresh=True)
         # print(f"[DEBUG on_card_relaunch] {title}: _is_instance_running={is_running}, inst.stopped={inst.stopped}, inst.pid={inst.pid}, inst.hwnd={inst.hwnd}")
         if is_running:
             # print(f"[DEBUG on_card_relaunch] {title}: instance considérée running, ABORT relance")
@@ -11739,6 +11790,9 @@ class SnowMasterGUI(QWidget):
 
     def _scan_pids_worker(self, do_full: bool = True):
         """Worker thread pour le scan des PIDs - NE JAMAIS appeler directement depuis le thread UI."""
+        if not self._auto_relaunch_scan_lock.acquire(blocking=False):
+            scan_log("[SCAN_PIDS] Scan déjà en cours — skip")
+            return
         try:
             scan_log(
                 f"[SCAN_PIDS] ========== Début du scan ({'complet' if do_full else 'léger'}) =========="
@@ -11800,6 +11854,12 @@ class SnowMasterGUI(QWidget):
                     pid = inst.pid
                     hwnd = inst.hwnd
                     if (not pid or pid == 0) and (not hwnd or hwnd == 0):
+                        # En cours de lancement : ne pas marquer stoppée (sinon reset/relance cassés)
+                        if getattr(inst, "awaiting_first_hb", False):
+                            scan_log(
+                                f"[SCAN_PIDS] '{title}': PID/HWND absents mais awaiting_first_hb — ignore"
+                            )
+                            continue
                         scan_log(
                             f"[SCAN_PIDS] '{title}': Instance avec PID={pid}, HWND={hwnd} invalides détectée (stopped={inst.stopped})"
                         )
@@ -11959,6 +12019,11 @@ class SnowMasterGUI(QWidget):
             import traceback
 
             traceback.print_exc()
+        finally:
+            try:
+                self._auto_relaunch_scan_lock.release()
+            except Exception:
+                pass
 
     def _process_pending_resets(self):
         """Traite les demandes de reset en attente."""
