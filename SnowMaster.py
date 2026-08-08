@@ -167,7 +167,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QMenu,
 )
-from PySide6.QtGui import QIcon, QColor, QAction, QGuiApplication
+from PySide6.QtGui import QIcon, QColor, QAction, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import QStyledItemDelegate
 from PySide6.QtGui import QPainter, QPainterPath, QPen, QBrush
 from PySide6.QtWidgets import QStyle, QStyleOptionTab
@@ -7540,7 +7540,8 @@ class InstanceItemWidget(QWidget):
         self.customContextMenuRequested.connect(self._show_context_menu)
         self.setToolTip(
             "Double-clic : mettre au premier plan\n"
-            "Shift+clic (stoppée) : lancer l'instance"
+            "Shift+clic (stoppée) : lancer l'instance\n"
+            "Suppr : terminer le process"
         )
         # Évite que la carte impose ~320px de largeur min à toute la fenêtre
         self.setMinimumWidth(0)
@@ -8528,7 +8529,7 @@ class SnowMasterGUI(QWidget):
         self.list.setObjectName("instancesList")
         # s'assurer que les petits pas de la scrollbar sont ceux d'un widget
         self.list.verticalScrollBar().setSingleStep(CARD_HEIGHT)
-        self.list.setFocusPolicy(Qt.NoFocus)
+        self.list.setFocusPolicy(Qt.StrongFocus)
         # self.list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.list.setSelectionMode(
             QAbstractItemView.ExtendedSelection
@@ -8549,6 +8550,10 @@ class SnowMasterGUI(QWidget):
 
         self.list.currentItemChanged.connect(self.on_select_instance)
         self.list.installEventFilter(self)
+        # Suppr / Delete : terminer le(s) process des instances sélectionnées
+        self._sc_kill_selected = QShortcut(QKeySequence(Qt.Key_Delete), self.list)
+        self._sc_kill_selected.setContext(Qt.WidgetWithChildrenShortcut)
+        self._sc_kill_selected.activated.connect(self._on_delete_key_kill_selected)
         body_layout.addWidget(self.list)
         group_layout.addWidget(body, 1)
 
@@ -10073,6 +10078,11 @@ class SnowMasterGUI(QWidget):
 
             def _bind_click(ev, _it=it, _card=card, self=self):
                 if ev.button() == Qt.LeftButton:
+                    # Pour que Suppr/Delete atteigne la liste
+                    try:
+                        self.list.setFocus(Qt.MouseFocusReason)
+                    except Exception:
+                        pass
                     # 1) Sélection immédiate (sans attendre le cycle Qt)
                     mods = ev.modifiers()
                     sm = self.list.selectionModel()
@@ -10279,6 +10289,15 @@ class SnowMasterGUI(QWidget):
     def selected_titles(self) -> list:
         # Récupère le titre stocké dans Qt.UserRole pour chaque item sélectionné
         return [it.data(Qt.UserRole) for it in self.list.selectedItems() if it]
+
+    def _on_delete_key_kill_selected(self):
+        """Raccourci Suppr/Delete : terminer le process des instances sélectionnées."""
+        titles = self.selected_titles()
+        if not titles:
+            return
+        for t in titles:
+            self.on_card_kill(t)
+        self.update_global_dot()
 
     def on_select_instance(self, cur, prev):
         self.update_selected_details()
