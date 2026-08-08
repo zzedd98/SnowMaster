@@ -9459,6 +9459,23 @@ class SnowMasterGUI(QWidget):
         except Exception:
             return False
 
+    def _is_instance_active_ui(self, inst: InstanceState) -> bool:
+        """Check léger pour l'UI (pas de psutil/win32) — évite de saturer le thread Qt."""
+        try:
+            if not inst or inst.stopped:
+                return False
+            if getattr(inst, "awaiting_first_hb", False):
+                return True
+            if inst.pid or inst.hwnd:
+                return True
+            if inst.last_heartbeat and inst.last_heartbeat > 0:
+                return (time.time() - float(inst.last_heartbeat)) < float(
+                    HEARTBEAT_RED_S
+                )
+            return False
+        except Exception:
+            return False
+
     def instance_severity(self, inst: InstanceState) -> int:
         if inst.stopped:
             return 3
@@ -9716,7 +9733,7 @@ class SnowMasterGUI(QWidget):
         reddot = 0
         for inst in instances_snapshot:
             try:
-                if self._is_instance_running(inst):
+                if self._is_instance_active_ui(inst):
                     active += 1
                 if self._is_instance_reddot(inst):
                     reddot += 1
@@ -9856,7 +9873,7 @@ class SnowMasterGUI(QWidget):
             return True
         if mode == "active":
             try:
-                return self._is_instance_running(inst)
+                return self._is_instance_active_ui(inst)
             except Exception:
                 return False
         is_manual = bool(getattr(inst, "manual_empty", False))
@@ -10650,8 +10667,6 @@ class SnowMasterGUI(QWidget):
                 "/register",
                 {
                     "title": title,
-                    "pid": 0,
-                    "hwnd": 0,
                     "controller": controller,
                     "exe": exe,
                     "images": images,
@@ -10843,12 +10858,16 @@ class SnowMasterGUI(QWidget):
 
         print(f"[DEBUG on_card_relaunch] {title}: Envoi /register")
         try:
+            with _state_lock:
+                inst2 = _instances.get(title)
+                if inst2:
+                    inst2.pid = None
+                    inst2.hwnd = None
+                    _instances[title] = inst2
             _post_json(
                 "/register",
                 {
                     "title": title,
-                    "pid": inst.pid or 0,
-                    "hwnd": inst.hwnd or 0,
                     "controller": controller,
                     "exe": exe,
                     "images": images,
@@ -11739,6 +11758,9 @@ class SnowMasterGUI(QWidget):
 
     def _scan_pids_worker(self, do_full: bool = True):
         """Worker thread pour le scan des PIDs - NE JAMAIS appeler directement depuis le thread UI."""
+        if not self._auto_relaunch_scan_lock.acquire(blocking=False):
+            scan_log("[SCAN_PIDS] Scan déjà en cours — skip")
+            return
         try:
             scan_log(
                 f"[SCAN_PIDS] ========== Début du scan ({'complet' if do_full else 'léger'}) =========="
@@ -11795,40 +11817,36 @@ class SnowMasterGUI(QWidget):
                 for title, inst in _instances.items():
                     if inst.stopped:
                         continue
-                    # Détecter les instances avec PID et HWND invalides (0 ou None)
-                    # Ces instances sont considérées comme terminées même si stopped=False
+                    # En cours de lancement : pid/hwnd encore absents — ne pas toucher
+                    if getattr(inst, "awaiting_first_hb", False):
+                        continue
                     pid = inst.pid
                     hwnd = inst.hwnd
+                    # PID/HWND nuls = crash / process jamais attaché → laisser le chemin
+                    # relaunch décider (ne plus marquer stopped sans action).
                     if (not pid or pid == 0) and (not hwnd or hwnd == 0):
                         scan_log(
-                            f"[SCAN_PIDS] '{title}': Instance avec PID={pid}, HWND={hwnd} invalides détectée (stopped={inst.stopped})"
+                            f"[SCAN_PIDS] '{title}': PID/HWND absents → candidat relaunch"
                         )
-                        # Marquer l'instance comme stoppée si elle ne l'est pas déjà
-                        if not inst.stopped:
-                            scan_log(
-                                f"[SCAN_PIDS] '{title}': Marquage comme stoppée..."
-                            )
-                            inst.stopped = True
-                            inst.pid = None
-                            inst.hwnd = None
-                            inst.awaiting_first_hb = False
-                            inst.last_heartbeat = 0.0
-                            try:
-                                inst.sub_map.clear()
-                            except Exception:
-                                inst.sub_map = {}
-                            _instances[title] = inst
-                            scan_log(
-                                f"[SCAN_PIDS] '{title}': ✓ Instance marquée comme stoppée"
-                            )
+                        instances_snapshot.append(
+                            {
+                                "title": title,
+                                "pid": None,
+                                "hwnd": None,
+                                "controller_path": inst.controller_path,
+                                "manual_empty": bool(
+                                    getattr(inst, "manual_empty", False)
+                                ),
+                            }
+                        )
                         continue
-                    # Copier les valeurs nécessaires pour éviter les accès concurrents
                     instances_snapshot.append(
                         {
                             "title": title,
                             "pid": pid,
                             "hwnd": hwnd,
                             "controller_path": inst.controller_path,
+                            "manual_empty": bool(getattr(inst, "manual_empty", False)),
                         }
                     )
 
@@ -11902,6 +11920,12 @@ class SnowMasterGUI(QWidget):
                         scan_log(
                             f"[SCAN_PIDS] '{title}': ⚠️ CRASH détecté (PID={inst_data['pid']} mort, HWND={inst_data['hwnd']} invalide)"
                         )
+                        if inst_data.get("manual_empty"):
+                            # Instance vide : pas de controller — relance via le chemin dédié
+                            actions_to_perform.append(
+                                ("relaunch_empty", title, None, "crash_empty")
+                            )
+                            continue
                         controller_path = self._resolve_controller_path(
                             title, inst_data["controller_path"]
                         )
@@ -11919,6 +11943,7 @@ class SnowMasterGUI(QWidget):
                             app_log_error(
                                 f"[SCAN_PIDS] '{title}': Crash détecté mais controller_path introuvable"
                             )
+                            self._mark_instance_stopped(title)
 
                 except Exception as e:
                     scan_log(
@@ -11934,18 +11959,17 @@ class SnowMasterGUI(QWidget):
             # 5) Exécuter les actions dans le thread UI via QTimer
             scan_log(f"[SCAN_PIDS] {len(actions_to_perform)} action(s) à exécuter")
             for action_type, title, controller_path, reason in actions_to_perform:
-                if action_type == "relaunch":
+                if action_type in ("relaunch", "relaunch_empty"):
                     scan_log(
                         f"[SCAN_PIDS] '{title}': Planification relance (raison: {reason})"
                     )
                     self._last_auto_relaunch_attempt[title] = now
                     self._mark_instance_stopped(title)
-                    # Stocker temporairement le controller_path pour la relance
-                    with _state_lock:
-                        inst = _instances.get(title)
-                        if inst:
-                            inst.controller_path = controller_path
-                    # Utiliser le signal Qt (thread-safe) pour relancer depuis le thread principal
+                    if action_type == "relaunch" and controller_path:
+                        with _state_lock:
+                            inst = _instances.get(title)
+                            if inst:
+                                inst.controller_path = controller_path
                     scan_log(
                         f"[SCAN_PIDS] '{title}': Émission signal de relance (raison: {reason})"
                     )
@@ -11959,6 +11983,11 @@ class SnowMasterGUI(QWidget):
             import traceback
 
             traceback.print_exc()
+        finally:
+            try:
+                self._auto_relaunch_scan_lock.release()
+            except Exception:
+                pass
 
     def _process_pending_resets(self):
         """Traite les demandes de reset en attente."""
@@ -12304,12 +12333,32 @@ class SnowMasterGUI(QWidget):
         QTimer.singleShot(0, _refresh_ui)
 
     def _on_relaunch_requested(self, title: str):
-        """Slot appelé dans le thread principal via le signal, qui planifie on_card_relaunch de manière asynchrone."""
-        # Utiliser QTimer.singleShot pour planifier l'exécution dans le thread principal
-        # de manière asynchrone (non-bloquante car dans la queue d'événements Qt)
-        # Cela permet d'exécuter on_card_relaunch dans le thread principal (nécessaire pour QFileDialog)
-        # mais sans bloquer car c'est planifié dans la queue d'événements
-        QTimer.singleShot(0, lambda t=title: self.on_card_relaunch(t))
+        """Relance auto/API : force sans garde HB/PID (évite QFileDialog et abort silencieux)."""
+        if not title:
+            return
+
+        def _do(t=title):
+            try:
+                with _state_lock:
+                    inst = _instances.get(t)
+                    if not inst:
+                        return
+                    is_empty = bool(getattr(inst, "manual_empty", False))
+                    ctrl = inst.controller_path
+                if is_empty:
+                    self.on_card_relaunch(t)
+                    return
+                if not ctrl:
+                    ctrl = self._resolve_controller_path(t, None)
+                if ctrl:
+                    self._safe_relaunch(t, ctrl)
+                else:
+                    # Dernier recours (saisie manuelle du controller)
+                    self.on_card_relaunch(t)
+            except Exception as e:
+                app_log_error(f"[RELAUNCH] Échec relance '{t}': {e}")
+
+        QTimer.singleShot(0, _do)
 
     def on_bus_reset_instance(self, title: str):
         """Stoppe puis relance l'instance demandée via la queue de resets."""
