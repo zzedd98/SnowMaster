@@ -3930,6 +3930,12 @@ def api_register():
                 inst.hwnd = int(data["hwnd"])
             except:
                 pass
+        # Instance manuelle : un register avec PID/HWND réels = fenêtre OK → bleu (pas jaune)
+        if getattr(inst, "manual_empty", False):
+            pid_ok = bool(inst.pid) and int(inst.pid) != 0
+            hwnd_ok = bool(inst.hwnd) and int(inst.hwnd) != 0
+            if pid_ok or hwnd_ok:
+                inst.awaiting_first_hb = False
         if data.get("controller"):
             inst.controller_path = str(data["controller"])
         if data.get("exe"):
@@ -9535,6 +9541,10 @@ class SnowMasterGUI(QWidget):
             # Un /register pré-lancement ne doit pas bloquer une relance via un HB fictif.
             if getattr(inst, "awaiting_first_hb", False):
                 return bool(pid_ok or hwnd_ok)
+            # Instances manuelles : pas de vrais heartbeats — ne pas se fier à last_heartbeat
+            # (sinon une instance morte reste "running" ~8 min et refuse la relance).
+            if getattr(inst, "manual_empty", False):
+                return bool(pid_ok or hwnd_ok)
             hb_ok = False
             if inst.last_heartbeat and inst.last_heartbeat > 0:
                 hb_ok = (time.time() - float(inst.last_heartbeat)) < float(
@@ -10797,7 +10807,11 @@ class SnowMasterGUI(QWidget):
             with _state_lock:
                 inst.stopped = False
                 inst.awaiting_first_hb = True
-                inst.last_heartbeat = time.time()
+                now_ts = time.time()
+                inst.last_heartbeat = now_ts
+                inst.last_reset = now_ts
+                inst.pid = None
+                inst.hwnd = None
                 _instances[title] = inst
             try:
                 bus.instance_updated.emit(title)
@@ -10831,9 +10845,10 @@ class SnowMasterGUI(QWidget):
                     return
 
                 start_ts = time.time()
+                watch_pid = int(p.pid)
                 with _state_lock:
                     try:
-                        inst.pid = int(p.pid)
+                        inst.pid = watch_pid
                     except Exception:
                         inst.pid = inst.pid
                     _instances[title] = inst
@@ -10874,8 +10889,15 @@ class SnowMasterGUI(QWidget):
                     except Exception:
                         pass
                     _set_empty_instance_window_title(main_hwnd, title, log_prefix=title)
+                    if main_pid:
+                        watch_pid = int(main_pid)
                     with _state_lock:
                         inst.awaiting_first_hb = False
+                        try:
+                            inst.pid = watch_pid
+                            inst.hwnd = int(main_hwnd) if main_hwnd else inst.hwnd
+                        except Exception:
+                            pass
                         _instances[title] = inst
                     try:
                         bus.instance_updated.emit(title)
@@ -10884,13 +10906,15 @@ class SnowMasterGUI(QWidget):
                 except Exception as e:
                     _log_empty(f"[{title}] Relance wait_for_large_window: {e}")
 
-                p.wait()
+                # Attendre le process FENÊTRE (pas le launcher) — sinon stopped=True trop tôt
+                _wait_process_exit(watch_pid, fallback_proc=p)
                 with _state_lock:
                     inst.stopped = True
                     inst.awaiting_first_hb = False
                     inst.last_heartbeat = 0.0
                     try:
                         inst.pid = None
+                        inst.hwnd = None
                     except Exception:
                         pass
                     _instances[title] = inst
@@ -11608,12 +11632,13 @@ class SnowMasterGUI(QWidget):
                 return
 
             start_ts = time.time()
+            watch_pid = int(p.pid)
             _log_empty(
                 f"[{title}] PID={p.pid} démarrage ok, attente grande fenêtre (voyant jaune)"
             )
             with _state_lock:
                 try:
-                    inst.pid = int(p.pid)
+                    inst.pid = watch_pid
                     _instances[title] = inst
                 except Exception:
                     pass
@@ -11657,8 +11682,15 @@ class SnowMasterGUI(QWidget):
                 except Exception as e_reg:
                     _log_empty(f"[{title}] /register ÉCHEC: {e_reg}")
                 _set_empty_instance_window_title(main_hwnd, title, log_prefix=title)
+                if main_pid:
+                    watch_pid = int(main_pid)
                 with _state_lock:
                     inst.awaiting_first_hb = False
+                    try:
+                        inst.pid = watch_pid
+                        inst.hwnd = int(main_hwnd) if main_hwnd else inst.hwnd
+                    except Exception:
+                        pass
                     _instances[title] = inst
                 try:
                     bus.instance_updated.emit(title)
@@ -11671,12 +11703,15 @@ class SnowMasterGUI(QWidget):
 
                 _log_empty(traceback.format_exc())
 
-            # attente bloquante sur la fin du process (comme V3)
-            p.wait()
+            # Attendre le process FENÊTRE (main_pid), pas le launcher Popen —
+            # sinon le launcher peut se terminer tout de suite → stopped alors que la fenêtre vit.
+            _wait_process_exit(watch_pid, fallback_proc=p)
             with _state_lock:
                 inst.stopped = True
                 inst.awaiting_first_hb = False
                 inst.last_heartbeat = 0.0
+                inst.pid = None
+                inst.hwnd = None
                 _instances[title] = inst
             try:
                 bus.instance_updated.emit(title)
@@ -11924,6 +11959,9 @@ class SnowMasterGUI(QWidget):
                                 {
                                     "title": title,
                                     "controller_path": inst.controller_path,
+                                    "manual_empty": bool(
+                                        getattr(inst, "manual_empty", False)
+                                    ),
                                 }
                             )
                             continue
@@ -11959,6 +11997,9 @@ class SnowMasterGUI(QWidget):
                             "awaiting_first_hb": bool(
                                 getattr(inst, "awaiting_first_hb", False)
                             ),
+                            "manual_empty": bool(
+                                getattr(inst, "manual_empty", False)
+                            ),
                         }
                     )
 
@@ -11985,6 +12026,12 @@ class SnowMasterGUI(QWidget):
                     scan_log(
                         f"[SCAN_PIDS] '{title}': jaune timeout mais cooldown "
                         f"({cooldown_remaining:.1f}s restants)"
+                    )
+                    continue
+                if yt.get("manual_empty"):
+                    # Pas de controller : relance via le chemin instance vide
+                    actions_to_perform.append(
+                        ("relaunch", title, None, "jaune_timeout")
                     )
                     continue
                 controller_path = self._resolve_controller_path(
@@ -12027,6 +12074,11 @@ class SnowMasterGUI(QWidget):
                         scan_log(
                             f"[SCAN_PIDS] '{title}': Résolution du controller_path..."
                         )
+                        if inst_data.get("manual_empty"):
+                            actions_to_perform.append(
+                                ("relaunch", title, None, "doublons")
+                            )
+                            continue
                         controller_path = self._resolve_controller_path(
                             title, inst_data["controller_path"]
                         )
@@ -12058,6 +12110,12 @@ class SnowMasterGUI(QWidget):
                         scan_log(
                             f"[SCAN_PIDS] '{title}': ⚠️ CRASH détecté (PID={inst_data['pid']} mort, HWND={inst_data['hwnd']} invalide)"
                         )
+                        if inst_data.get("manual_empty"):
+                            # Instance manuelle : relancer sans controller
+                            actions_to_perform.append(
+                                ("relaunch", title, None, "crash")
+                            )
+                            continue
                         controller_path = self._resolve_controller_path(
                             title, inst_data["controller_path"]
                         )
@@ -12105,10 +12163,11 @@ class SnowMasterGUI(QWidget):
                     if reason != "jaune_timeout":
                         self._mark_instance_stopped(title)
                     # Stocker temporairement le controller_path pour la relance
-                    with _state_lock:
-                        inst = _instances.get(title)
-                        if inst:
-                            inst.controller_path = controller_path
+                    if controller_path:
+                        with _state_lock:
+                            inst = _instances.get(title)
+                            if inst:
+                                inst.controller_path = controller_path
                     # Utiliser le signal Qt (thread-safe) pour relancer depuis le thread principal
                     scan_log(
                         f"[SCAN_PIDS] '{title}': Émission signal de relance (raison: {reason})"
@@ -12137,6 +12196,7 @@ class SnowMasterGUI(QWidget):
                 return False
             awaiting = bool(getattr(inst, "awaiting_first_hb", False))
             stopped = bool(inst.stopped)
+            manual_empty = bool(getattr(inst, "manual_empty", False))
             pid = inst.pid
             hwnd = inst.hwnd
             last_hb = float(inst.last_heartbeat or 0.0)
@@ -12156,7 +12216,8 @@ class SnowMasterGUI(QWidget):
         # crash / doublons : ne pas toucher une instance saine (ex. 1er HB entre-temps)
         if not stopped and (pid_ok or hwnd_ok):
             return False
-        if not stopped and hb_fresh and not awaiting:
+        # Les manuelles n'ont pas de vrais HB : ignorer hb_fresh
+        if not stopped and hb_fresh and not awaiting and not manual_empty:
             return False
         return True
 
@@ -14096,6 +14157,29 @@ def _set_launch_window_title(hwnd, title):
             app_log_info(
                 "SetWindowText launch failed hwnd=%s title=%s err=%s", hwnd, title, e
             )
+        except Exception:
+            pass
+
+
+def _wait_process_exit(pid, fallback_proc=None, poll_interval: float = 0.5):
+    """Attend la fin d'un PID (fenêtre principale). Fallback: Popen.wait() si besoin."""
+    try:
+        pid_int = int(pid) if pid else 0
+    except Exception:
+        pid_int = 0
+    if pid_int:
+        try:
+            proc = psutil.Process(pid_int)
+            while proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                time.sleep(poll_interval)
+            return
+        except psutil.NoSuchProcess:
+            return
+        except Exception:
+            pass
+    if fallback_proc is not None:
+        try:
+            fallback_proc.wait()
         except Exception:
             pass
 
