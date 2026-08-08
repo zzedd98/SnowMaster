@@ -7538,7 +7538,10 @@ class InstanceItemWidget(QWidget):
 
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
-        self.setToolTip("Double-clic : mettre au premier plan")
+        self.setToolTip(
+            "Double-clic : mettre au premier plan\n"
+            "Shift+clic (stoppée) : lancer l'instance"
+        )
         # Évite que la carte impose ~320px de largeur min à toute la fenêtre
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -10090,7 +10093,28 @@ class SnowMasterGUI(QWidget):
                         return
 
                     if mods & Qt.ShiftModifier:
-                        # Sélection en plage (on ajoute sans effacer)
+                        # Shift+clic sur une instance stoppée → la lancer
+                        title = getattr(_card, "title_id", None) or (
+                            _it.data(Qt.UserRole) if _it is not None else None
+                        )
+                        is_stopped = False
+                        if title:
+                            with _state_lock:
+                                inst = _instances.get(title)
+                                is_stopped = bool(inst and inst.stopped)
+                        if is_stopped:
+                            self.list.clearSelection()
+                            sm.select(idx, QItemSelectionModel.ClearAndSelect)
+                            self.list.setCurrentItem(_it)
+                            self.update_card_selection_styles()
+                            self.update_selected_details()
+                            QTimer.singleShot(
+                                0, lambda t=title: self.on_card_relaunch(t)
+                            )
+                            ev.accept()
+                            return
+
+                        # Sinon : sélection en plage (on ajoute sans effacer)
                         cur = self.list.currentRow()
                         new = self.list.row(_it)
                         if cur < 0:
