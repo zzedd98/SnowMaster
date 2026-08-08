@@ -130,6 +130,7 @@ from PySide6.QtCore import (
     QItemSelectionModel,
     QCoreApplication,
     QMetaObject,
+    QPoint,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -166,7 +167,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QMenu,
 )
-from PySide6.QtGui import QIcon, QColor, QAction
+from PySide6.QtGui import QIcon, QColor, QAction, QGuiApplication
 from PySide6.QtWidgets import QStyledItemDelegate
 from PySide6.QtGui import QPainter, QPainterPath, QPen, QBrush
 from PySide6.QtWidgets import QStyle, QStyleOptionTab
@@ -438,6 +439,14 @@ DEFAULT_PREFS = {
         "refresh_interval_active_ms": 1000,
         "refresh_interval_inactive_ms": 2500,  # fenêtre inactive / minimisée
         "bus_coalesce_ms": 300,  # regroupement des heartbeats avant refresh UI
+        # Géométrie fenêtre principale (restaurée au démarrage)
+        "window": {
+            "x": None,
+            "y": None,
+            "w": 1440,
+            "h": 850,
+            "maximized": False,
+        },
     },
 }
 
@@ -7434,14 +7443,18 @@ class InstanceItemWidget(QWidget):
         self._compact = False
 
         self.dot = StatusDot(10)
+        # Clics / double-clics gérés par la carte (sélection, focus), pas par les enfants
+        self.dot.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         lay.addWidget(self.dot, 0, Qt.AlignVCenter)
 
         textcol = QVBoxLayout()
         textcol.setSpacing(1)
         self.lbl_title = QLabel(title)
         self.lbl_title.setObjectName("CardTitle")
+        self.lbl_title.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.lbl_extra = QLabel("")
         self.lbl_extra.setObjectName("ExtraLabel")
+        self.lbl_extra.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         textcol.addWidget(self.lbl_title)
         textcol.addWidget(self.lbl_extra)
         lay.addLayout(textcol, 1)
@@ -7511,9 +7524,17 @@ class InstanceItemWidget(QWidget):
 
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
+        self.setToolTip("Double-clic : mettre au premier plan")
         # Évite que la carte impose ~320px de largeur min à toute la fenêtre
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.requestFocus.emit(self.title_id)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def _show_context_menu(self, pos):
         """Menu clic droit : actions de la carte + historique heartbeats."""
@@ -8239,9 +8260,9 @@ class SnowMasterGUI(QWidget):
         self._auto_relaunch_scan_lock = threading.Lock()
         # self.setWindowTitle("❄️ SnowMaster")
         self.setWindowTitle(APP_DISPLAY_NAME)
-        self.resize(1440, 850)  # +62 pour afficher une instance de plus
         # Pas de taille minimale bloquante : la fenêtre peut se rétracter librement
         self.setMinimumSize(0, 0)
+        self._restore_window_geometry()
 
         # --- État interne pour le voyant global / alertes ---
         self._last_global_color = CLR_GREY  # dernière couleur vue du voyant global
@@ -8444,7 +8465,8 @@ class SnowMasterGUI(QWidget):
         group_layout = QVBoxLayout(group)
         group_layout.setSizeConstraint(QVBoxLayout.SetNoConstraint)
         # Marges internes : on supprime la marge droite pour maximiser l'espace horizontal des cartes
-        group_layout.setContentsMargins(8, 4, 0, 8)
+        # Marges internes : droite à 0, bas à 0
+        group_layout.setContentsMargins(8, 4, 0, 0)
         group_layout.setSpacing(0)
 
         tabs_row = QHBoxLayout()
@@ -10038,8 +10060,14 @@ class SnowMasterGUI(QWidget):
                         else:
                             sm.select(idx, QItemSelectionModel.Select)
                         self.list.setCurrentItem(_it, QItemSelectionModel.NoUpdate)
+                        # Ne PAS renvoyer le clic à la QListWidget : sinon Qt
+                        # re-traite la sélection et annule le toggle (Ctrl+clic « mort »).
+                        self.update_card_selection_styles()
+                        self.update_selected_details()
+                        ev.accept()
+                        return
 
-                    elif mods & Qt.ShiftModifier:
+                    if mods & Qt.ShiftModifier:
                         # Sélection en plage (on ajoute sans effacer)
                         cur = self.list.currentRow()
                         new = self.list.row(_it)
@@ -10054,11 +10082,15 @@ class SnowMasterGUI(QWidget):
                                     QItemSelectionModel.Select,
                                 )
                             self.list.setCurrentRow(new)
-                    else:
-                        # Clic simple : Clear + Select
-                        self.list.clearSelection()
-                        sm.select(idx, QItemSelectionModel.ClearAndSelect)
-                        self.list.setCurrentItem(_it)
+                        self.update_card_selection_styles()
+                        self.update_selected_details()
+                        ev.accept()
+                        return
+
+                    # Clic simple : Clear + Select
+                    self.list.clearSelection()
+                    sm.select(idx, QItemSelectionModel.ClearAndSelect)
+                    self.list.setCurrentItem(_it)
 
                     # 2) MAJ immédiate du style et du panneau de détails
                     self.update_card_selection_styles()
@@ -12389,8 +12421,73 @@ class SnowMasterGUI(QWidget):
         # Déclencher un traitement immédiat dans un thread background
         self._run_async(self._process_pending_resets)
 
+    def _restore_window_geometry(self):
+        """Restaure position/taille depuis settings.json (ui.window)."""
+        try:
+            geo = (_prefs.get("ui") or {}).get("window") or {}
+        except Exception:
+            geo = {}
+        try:
+            w = max(400, int(geo.get("w") or 1440))
+            h = max(300, int(geo.get("h") or 850))
+        except Exception:
+            w, h = 1440, 850
+        self.resize(w, h)
+
+        x = geo.get("x", None)
+        y = geo.get("y", None)
+        try:
+            if x is not None and y is not None:
+                pt = QPoint(int(x), int(y))
+                screen = QGuiApplication.screenAt(pt)
+                if screen is None:
+                    screen = QGuiApplication.primaryScreen()
+                    if screen is not None:
+                        avail = screen.availableGeometry()
+                        pt = QPoint(
+                            avail.x() + max(0, (avail.width() - w) // 2),
+                            avail.y() + max(0, (avail.height() - h) // 2),
+                        )
+                self.move(pt)
+        except Exception:
+            pass
+        self._restore_maximized = bool(geo.get("maximized", False))
+
+    def _apply_window_maximized_after_show(self):
+        """À appeler après show() si la fenêtre était maximisée à la fermeture."""
+        if getattr(self, "_restore_maximized", False):
+            try:
+                self.showMaximized()
+            except Exception:
+                pass
+
+    def _save_window_geometry(self):
+        """Persiste position/taille (géométrie normale si maximisé)."""
+        try:
+            maximized = bool(self.isMaximized())
+            g = self.normalGeometry() if maximized else self.geometry()
+            ui = _prefs.setdefault("ui", {})
+            ui["window"] = {
+                "x": int(g.x()),
+                "y": int(g.y()),
+                "w": int(g.width()),
+                "h": int(g.height()),
+                "maximized": maximized,
+            }
+            save_prefs(_prefs)
+        except Exception as e:
+            try:
+                print(f"[UI] save window geometry failed: {e}")
+            except Exception:
+                pass
+
     def closeEvent(self, event):
         global _discord_bot
+
+        try:
+            self._save_window_geometry()
+        except Exception:
+            pass
 
         try:
             flush_save_prefs()
@@ -15425,6 +15522,10 @@ def main():
         main_win.setAttribute(Qt.WA_StyledBackground, True)
         main_win.setWindowOpacity(0.0)
         main_win.show()
+        try:
+            main_win._apply_window_maximized_after_show()
+        except Exception:
+            pass
 
         anim = QPropertyAnimation(main_win, b"windowOpacity", main_win)
         anim.setDuration(650)
