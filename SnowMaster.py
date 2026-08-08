@@ -170,7 +170,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QIcon, QColor, QAction, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import QStyledItemDelegate
 from PySide6.QtGui import QPainter, QPainterPath, QPen, QBrush
-from PySide6.QtWidgets import QStyle, QStyleOptionTab
+from PySide6.QtWidgets import QStyle, QStyleOptionTab, QStyleOptionViewItem
 from PySide6.QtGui import QIcon, QMouseEvent
 
 
@@ -5137,6 +5137,18 @@ def apply_dark_blue_style(app: QApplication):
         QListWidget::item:focus { outline: none; }
         QListWidget::item:selected:!active { background: transparent; }
 
+        /* Liste instances : pas de cadre de focus Windows (carré blanc) — la carte gère la sélection */
+        QListWidget#instancesList::item,
+        QListWidget#instancesList::item:selected,
+        QListWidget#instancesList::item:selected:active,
+        QListWidget#instancesList::item:selected:!active,
+        QListWidget#instancesList::item:focus,
+        QListWidget#instancesList::item:hover {
+            background: transparent;
+            border: none;
+            outline: none;
+        }
+
         QListWidget#subsList::item { margin:2px 2px; }  /* Marges réduites pour maximiser l'espace horizontal */
 
         /* ---------- Scrollbar verticale : largeur augmentée + poignée plus large ---------- */
@@ -7961,6 +7973,15 @@ class InstancesFilterTabBar(QTabBar):
         self.style().drawControl(QStyle.CE_TabBarTabLabel, option, painter, self)
 
 
+class _NoFocusItemDelegate(QStyledItemDelegate):
+    """Empêche le cadre de focus / fond de sélection natif (bordure carrée Windows)."""
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        opt.state &= ~(QStyle.State_HasFocus | QStyle.State_Selected)
+        super().paint(painter, opt, index)
+
+
 class ItemPerWidgetList(QListWidget):
     """
     QListWidget des instances : molette = défilement horizontal fluide (px par cran).
@@ -7973,6 +7994,7 @@ class ItemPerWidgetList(QListWidget):
         self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setItemDelegate(_NoFocusItemDelegate(self))
 
         # DnD natif pour réordonner
         self.setDragEnabled(True)
