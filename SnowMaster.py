@@ -11005,69 +11005,22 @@ class SnowMasterGUI(QWidget):
                     return
 
                 start_ts = time.time()
-                watch_pid = int(p.pid)
                 with _state_lock:
                     try:
-                        inst.pid = watch_pid
+                        inst.pid = int(p.pid)
+                        inst.stopped = False
                     except Exception:
-                        inst.pid = inst.pid
+                        pass
                     _instances[title] = inst
                 try:
                     bus.instance_updated.emit(title)
                 except Exception:
                     pass
 
-                try:
-                    main_hwnd, main_pid = wait_for_large_window_for_process(
-                        p,
-                        start_ts,
-                        total_timeout=120.0,
-                        min_screen_ratio=0.5,
-                        poll_interval=0.25,
-                        log_progress=True,
-                        small_title=title,
-                        require_connexion_click_before_loading=(
-                            APP_VARIANT == "ankabot"
-                        ),
-                        connexion_image=(
-                            os.path.join(RESOURCES, "connexion.png")
-                            if APP_VARIANT == "ankabot"
-                            else None
-                        ),
-                        connexion_confidence=0.3,
-                    )
-                    try:
-                        _post_json(
-                            "/register",
-                            {
-                                "title": title,
-                                "pid": int(main_pid) if main_pid else 0,
-                                "hwnd": int(main_hwnd),
-                                "touch": True,
-                            },
-                        )
-                    except Exception:
-                        pass
-                    _set_empty_instance_window_title(main_hwnd, title, log_prefix=title)
-                    if main_pid:
-                        watch_pid = int(main_pid)
-                    with _state_lock:
-                        inst.awaiting_first_hb = False
-                        try:
-                            inst.pid = watch_pid
-                            inst.hwnd = int(main_hwnd) if main_hwnd else inst.hwnd
-                        except Exception:
-                            pass
-                        _instances[title] = inst
-                    try:
-                        bus.instance_updated.emit(title)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    _log_empty(f"[{title}] Relance wait_for_large_window: {e}")
-
-                # Attendre le process FENÊTRE (pas le launcher) — sinon stopped=True trop tôt
-                _wait_process_exit(watch_pid, fallback_proc=p)
+                watch_pid, seen = _attach_empty_instance_window(
+                    title, p, start_ts, inst
+                )
+                _watch_empty_instance_tree(title, p, watch_pid, seen_pids=seen)
                 with _state_lock:
                     inst.stopped = True
                     inst.awaiting_first_hb = False
@@ -11738,13 +11691,13 @@ class SnowMasterGUI(QWidget):
                 return
 
             start_ts = time.time()
-            watch_pid = int(p.pid)
             _log_empty(
                 f"[{title}] PID={p.pid} démarrage ok, attente grande fenêtre (voyant jaune)"
             )
             with _state_lock:
                 try:
-                    inst.pid = watch_pid
+                    inst.pid = int(p.pid)
+                    inst.stopped = False
                     _instances[title] = inst
                 except Exception:
                     pass
@@ -11753,65 +11706,8 @@ class SnowMasterGUI(QWidget):
             except Exception:
                 pass
 
-            # Même logique que run_snowbot_flow : attendre la grande fenêtre (>= 50% écran), puis register + renommer
-            try:
-                main_hwnd, main_pid = wait_for_large_window_for_process(
-                    p,
-                    start_ts,
-                    total_timeout=120.0,
-                    min_screen_ratio=0.5,
-                    poll_interval=0.25,
-                    log_progress=True,
-                    small_title=title,
-                    require_connexion_click_before_loading=(APP_VARIANT == "ankabot"),
-                    connexion_image=(
-                        os.path.join(RESOURCES, "connexion.png")
-                        if APP_VARIANT == "ankabot"
-                        else None
-                    ),
-                    connexion_confidence=0.3,
-                )
-                _log_empty(
-                    f"[{title}] Fenêtre détectée hwnd={main_hwnd} pid={main_pid}, register + renommage"
-                )
-                try:
-                    _post_json(
-                        "/register",
-                        {
-                            "title": title,
-                            "pid": int(main_pid) if main_pid else 0,
-                            "hwnd": int(main_hwnd),
-                            "touch": True,
-                        },
-                    )
-                    _log_empty(f"[{title}] /register OK")
-                except Exception as e_reg:
-                    _log_empty(f"[{title}] /register ÉCHEC: {e_reg}")
-                _set_empty_instance_window_title(main_hwnd, title, log_prefix=title)
-                if main_pid:
-                    watch_pid = int(main_pid)
-                with _state_lock:
-                    inst.awaiting_first_hb = False
-                    try:
-                        inst.pid = watch_pid
-                        inst.hwnd = int(main_hwnd) if main_hwnd else inst.hwnd
-                    except Exception:
-                        pass
-                    _instances[title] = inst
-                try:
-                    bus.instance_updated.emit(title)
-                except Exception:
-                    pass
-                _log_empty(f"[{title}] Voyant passé au bleu, attente fin process...")
-            except Exception as e_wait:
-                _log_empty(f"[{title}] wait_for_large_window exception: {e_wait}")
-                import traceback
-
-                _log_empty(traceback.format_exc())
-
-            # Attendre le process FENÊTRE (main_pid), pas le launcher Popen —
-            # sinon le launcher peut se terminer tout de suite → stopped alors que la fenêtre vit.
-            _wait_process_exit(watch_pid, fallback_proc=p)
+            watch_pid, seen = _attach_empty_instance_window(title, p, start_ts, inst)
+            _watch_empty_instance_tree(title, p, watch_pid, seen_pids=seen)
             with _state_lock:
                 inst.stopped = True
                 inst.awaiting_first_hb = False
@@ -11826,6 +11722,7 @@ class SnowMasterGUI(QWidget):
 
         t = threading.Thread(target=_run_and_monitor, daemon=True)
         t.start()
+
     def _run_async(self, func, *args, **kwargs):
         def _job():
             try:
@@ -11994,7 +11891,8 @@ class SnowMasterGUI(QWidget):
                 known_titles: set = set()
                 with _state_lock:
                     for t, inst in _instances.items():
-                        if not inst.stopped:
+                        # Inclure les vides stoppées : recovery si le process vit encore
+                        if (not inst.stopped) or getattr(inst, "manual_empty", False):
                             known_titles.add(t)
                 try:
                     all_processes = scan_snowbot_processes_by_cmdline(
@@ -12014,8 +11912,116 @@ class SnowMasterGUI(QWidget):
                         if proc_title not in processes_by_title:
                             processes_by_title[proc_title] = []
                         processes_by_title[proc_title].append(info)
+
+                # Réanimer les instances vides marquées stoppées alors que le process vit
+                for title, procs in list(processes_by_title.items()):
+                    with _state_lock:
+                        inst = _instances.get(title)
+                        if not inst or not getattr(inst, "manual_empty", False):
+                            continue
+                        if not inst.stopped and inst.pid and is_pid_alive(inst.pid):
+                            continue
+                    # Choisir le PID : préférer celui déjà stocké s'il est dans la liste
+                    keep = None
+                    with _state_lock:
+                        inst = _instances.get(title)
+                        keep = inst.pid if inst else None
+                    chosen = None
+                    for info in procs:
+                        try:
+                            pid = int(info.get("pid") or 0)
+                        except Exception:
+                            continue
+                        if not pid or not is_pid_alive(pid):
+                            continue
+                        if keep and pid == int(keep):
+                            chosen = info
+                            break
+                        if chosen is None:
+                            chosen = info
+                    if not chosen:
+                        continue
+                    try:
+                        pid = int(chosen.get("pid"))
+                        hwnd = chosen.get("hwnd")
+                    except Exception:
+                        continue
+                    with _state_lock:
+                        inst = _instances.get(title)
+                        if not inst:
+                            continue
+                        inst.stopped = False
+                        inst.manual_empty = True
+                        inst.awaiting_first_hb = False
+                        inst.pid = pid
+                        if hwnd:
+                            try:
+                                inst.hwnd = int(hwnd)
+                            except Exception:
+                                pass
+                        _instances[title] = inst
+                    scan_log(
+                        f"[SCAN_PIDS] '{title}': instance vide RÉANIMÉE (pid={pid})"
+                    )
+                    try:
+                        bus.instance_updated.emit(title)
+                    except Exception:
+                        pass
             else:
                 scan_log("[SCAN_PIDS] Scan léger : pas d'énumération globale des processus")
+                # Réanimer les vides stoppées encore vivantes (PID stocké ou --title)
+                with _state_lock:
+                    empty_stopped = [
+                        (t, inst.pid, inst.hwnd)
+                        for t, inst in _instances.items()
+                        if getattr(inst, "manual_empty", False) and inst.stopped
+                    ]
+                for title, pid, hwnd in empty_stopped:
+                    chosen_pid, chosen_hwnd = None, None
+                    if pid and is_pid_alive(pid):
+                        chosen_pid = int(pid)
+                        chosen_hwnd = hwnd if is_hwnd_valid(hwnd) else None
+                    else:
+                        try:
+                            matches = find_processes_by_title(title)
+                        except Exception:
+                            matches = []
+                        for info in matches or []:
+                            try:
+                                p2 = int(info.get("pid") or 0)
+                            except Exception:
+                                continue
+                            if p2 and is_pid_alive(p2):
+                                chosen_pid = p2
+                                chosen_hwnd = info.get("hwnd")
+                                break
+                    if not chosen_pid:
+                        continue
+                    if not chosen_hwnd:
+                        try:
+                            chosen_hwnd = get_main_hwnd(int(chosen_pid))
+                        except Exception:
+                            chosen_hwnd = None
+                    with _state_lock:
+                        cur = _instances.get(title)
+                        if not cur:
+                            continue
+                        cur.stopped = False
+                        cur.awaiting_first_hb = False
+                        cur.pid = chosen_pid
+                        if chosen_hwnd:
+                            try:
+                                cur.hwnd = int(chosen_hwnd)
+                            except Exception:
+                                pass
+                        _instances[title] = cur
+                    scan_log(
+                        f"[SCAN_PIDS] '{title}': vide stoppée réanimée (pid={chosen_pid})"
+                    )
+                    try:
+                        bus.instance_updated.emit(title)
+                    except Exception:
+                        pass
 
             # Afficher les doublons détectés
             duplicates_found = {
@@ -14194,6 +14200,92 @@ def get_recent_child_pids(root_pid, since_ts):
     return pids
 
 
+def update_process_tree_pids(root_pid, seen_pids: set) -> set:
+    """Accumule root + enfants dans seen_pids, même si le launcher est déjà mort.
+
+    Crucial pour les instances vides : le Popen initial peut se terminer alors que
+    la vraie fenêtre vit sur un PID enfant déjà vu.
+    """
+    if seen_pids is None:
+        seen_pids = set()
+    # Conserver les PID déjà vus encore vivants (+ leurs enfants)
+    alive = set()
+    for pid in list(seen_pids):
+        try:
+            pid_i = int(pid)
+        except Exception:
+            continue
+        if not is_pid_alive(pid_i):
+            continue
+        alive.add(pid_i)
+        try:
+            for ch in psutil.Process(pid_i).children(recursive=True):
+                try:
+                    alive.add(int(ch.pid))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    seen_pids.clear()
+    seen_pids.update(alive)
+    try:
+        root = psutil.Process(int(root_pid))
+        seen_pids.add(int(root_pid))
+        for child in root.children(recursive=True):
+            try:
+                seen_pids.add(int(child.pid))
+            except Exception:
+                pass
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, TypeError):
+        pass
+    return seen_pids
+
+
+def _hwnds_for_pid_prefer_visible(pid: int) -> List[int]:
+    hwnds = find_hwnds_for_pid_allow_empty_title(pid)
+    if hwnds:
+        return hwnds
+    try:
+        return find_hwnds_for_pid_minimal(pid)
+    except Exception:
+        return []
+
+
+def pick_best_window_for_pids(
+    pids, min_screen_ratio: float = 0.5, use_virtual: bool = False
+):
+    """Retourne (hwnd, pid) de la plus grande fenêtre visible parmi les pids, ou (None, None)."""
+    try:
+        scr_area, _ = screen_area(use_virtual=use_virtual)
+        threshold = scr_area * float(min_screen_ratio)
+    except Exception:
+        threshold = 0
+    best = None  # (area, hwnd, pid)
+    for pid in list(pids or []):
+        try:
+            pid_i = int(pid)
+        except Exception:
+            continue
+        if not is_pid_alive(pid_i):
+            continue
+        for h in _hwnds_for_pid_prefer_visible(pid_i):
+            try:
+                if not win32gui.IsWindowVisible(h):
+                    continue
+                area = get_window_area(h)
+                if area <= 0:
+                    continue
+                if threshold > 0 and area < threshold:
+                    continue
+                if best is None or area > best[0]:
+                    best = (area, h, pid_i)
+            except Exception:
+                pass
+    if not best:
+        return None, None
+    return best[1], best[2]
+
+
 def screen_area(use_virtual=False):
     if use_virtual:
         l = win32api.GetSystemMetrics(76)
@@ -14255,13 +14347,29 @@ def wait_for_windows_with_early_register(
     early_registered = False
     clicked_connexion_pids = set()
     first_click_ts = None
+    seen_pids = set()
+    try:
+        seen_pids.add(int(p.pid))
+    except Exception:
+        pass
     while True:
         now = time.time()
-        if now - start_ts > total_timeout:
+        elapsed = now - start_ts
+        if elapsed > total_timeout:
+            hwnd, pid = pick_best_window_for_pids(
+                seen_pids, min_screen_ratio=0.15, use_virtual=use_virtual_screen
+            )
+            if hwnd and pid:
+                return hwnd, pid
             raise TimeoutError(
                 f"Timeout fenêtre >= {int(min_screen_ratio*100)}% écran."
             )
-        candidate_pids = get_recent_child_pids(p.pid, start_ts)
+        update_process_tree_pids(p.pid, seen_pids)
+        try:
+            seen_pids.update(get_recent_child_pids(p.pid, start_ts))
+        except Exception:
+            pass
+        candidate_pids = set(seen_pids)
 
         # === EARLY CLICK sur la fenêtre de connexion (mode AnkaBot) ===
         # En mode require_connexion_click_before_loading, on clique d'abord "Connexion"
@@ -14297,66 +14405,69 @@ def wait_for_windows_with_early_register(
         # la terminer prématurément via "Terminer". Sera écrasé dès que la grande fenêtre
         # est détectée (second /register dans run_snowbot_flow).
         if not early_registered:
+            do_early = True
             if require_connexion_click_before_loading:
                 clicked_any = len(clicked_connexion_pids) > 0
                 click_grace_elapsed = (
                     first_click_ts and (time.time() - first_click_ts) > 8.0
                 )
-                if not clicked_any and not click_grace_elapsed:
-                    time.sleep(poll_interval)
-                    continue
-            for cpid in list(candidate_pids):
-                for h in find_hwnds_for_pid(cpid):
-                    try:
-                        # Renommer la petite fenêtre de lancement (avant la grande) en
-                        # "Lancement de <title>" si elle est visible et de taille inférieure
-                        # au seuil de la grande fenêtre.
+                start_grace = elapsed >= 12.0
+                # Ne plus bloquer toute la boucle : seulement l'early register
+                do_early = bool(clicked_any or click_grace_elapsed or start_grace)
+            if do_early:
+                for cpid in list(candidate_pids):
+                    for h in find_hwnds_for_pid(cpid):
                         try:
-                            if win32gui.IsWindowVisible(h):
-                                area = get_window_area(h)
-                                if area < threshold:
-                                    _set_launch_window_title(h, title_for_register)
-                        except Exception:
-                            # On ignore toute erreur de renommage pour ne rien casser.
-                            pass
+                            # Renommer la petite fenêtre de lancement (avant la grande) en
+                            # "Lancement de <title>" si elle est visible et de taille inférieure
+                            # au seuil de la grande fenêtre.
+                            try:
+                                if win32gui.IsWindowVisible(h):
+                                    area = get_window_area(h)
+                                    if area < threshold:
+                                        _set_launch_window_title(h, title_for_register)
+                            except Exception:
+                                # On ignore toute erreur de renommage pour ne rien casser.
+                                pass
 
-                        try:
-                            post_json_with_retry(
-                                "/register",
-                                {
-                                    "title": title_for_register,
-                                    "pid": int(cpid),
-                                    "hwnd": int(h),
-                                    "touch": True,
-                                },
-                                timeout=2.0,
-                                retries=2,
-                                delay=0.25,
-                            )
+                            try:
+                                post_json_with_retry(
+                                    "/register",
+                                    {
+                                        "title": title_for_register,
+                                        "pid": int(cpid),
+                                        "hwnd": int(h),
+                                        "touch": True,
+                                    },
+                                    timeout=2.0,
+                                    retries=2,
+                                    delay=0.25,
+                                )
+                            except Exception:
+                                _post_json(
+                                    "/register",
+                                    {
+                                        "title": title_for_register,
+                                        "pid": int(cpid),
+                                        "hwnd": int(h),
+                                        "touch": True,
+                                    },
+                                )
+                            early_registered = True
+                            break
                         except Exception:
-                            _post_json(
-                                "/register",
-                                {
-                                    "title": title_for_register,
-                                    "pid": int(cpid),
-                                    "hwnd": int(h),
-                                    "touch": True,
-                                },
-                            )
-                        early_registered = True
+                            pass
+                    if early_registered:
                         break
-                    except Exception:
-                        pass
-                if early_registered:
-                    break
 
         # time.sleep(1)
 
-        # Main window detection
+        # Main window detection (toujours, même sans clic Connexion)
+        active_threshold = threshold if elapsed < 45.0 else (scr_area * 0.25)
         for cpid in list(candidate_pids):
             for h in find_hwnds_for_pid(cpid):
                 area = get_window_area(h)
-                if area >= threshold:
+                if area >= active_threshold:
                     return h, cpid
 
         time.sleep(poll_interval)
@@ -14408,6 +14519,187 @@ def _wait_process_exit(pid, fallback_proc=None, poll_interval: float = 0.5):
             fallback_proc.wait()
         except Exception:
             pass
+
+
+def _watch_empty_instance_tree(title: str, launcher_proc, watch_pid, seen_pids=None):
+    """Surveille l'arbre process d'une instance vide jusqu'à extinction réelle.
+
+    Ne marque pas stoppé tant qu'un PID du tree (launcher ou enfants déjà vus) vit —
+    corrige le cas où le launcher meurt alors que la fenêtre principale reste ouverte.
+    """
+    seen = set()
+    if seen_pids:
+        for x in seen_pids:
+            try:
+                seen.add(int(x))
+            except Exception:
+                pass
+    try:
+        seen.add(int(launcher_proc.pid))
+    except Exception:
+        pass
+    cur = None
+    try:
+        cur = int(watch_pid) if watch_pid else None
+    except Exception:
+        cur = None
+    if cur:
+        seen.add(cur)
+
+    while True:
+        try:
+            update_process_tree_pids(getattr(launcher_proc, "pid", None), seen)
+        except Exception:
+            pass
+        if cur:
+            try:
+                update_process_tree_pids(cur, seen)
+            except Exception:
+                pass
+
+        live = [p for p in seen if is_pid_alive(p)]
+        if not live:
+            _log_empty(f"[{title}] tree éteint — fin surveillance")
+            return
+
+        if cur and cur in live:
+            time.sleep(0.5)
+            continue
+
+        hwnd, pid = pick_best_window_for_pids(live, min_screen_ratio=0.15)
+        if not pid:
+            pid = live[0]
+            hwnd = None
+        _log_empty(
+            f"[{title}] PID suivi mort → bascule watch_pid={pid} hwnd={hwnd} live={live}"
+        )
+        cur = int(pid)
+        seen.add(cur)
+        with _state_lock:
+            inst = _instances.get(title)
+            if inst and getattr(inst, "manual_empty", False):
+                inst.stopped = False
+                inst.pid = cur
+                if hwnd:
+                    try:
+                        inst.hwnd = int(hwnd)
+                    except Exception:
+                        pass
+                inst.awaiting_first_hb = False
+                _instances[title] = inst
+        try:
+            bus.instance_updated.emit(title)
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+
+def _attach_empty_instance_window(title: str, p, start_ts, inst):
+    """Attend / récupère la grande fenêtre, register, passe au bleu. Retourne (watch_pid, seen)."""
+    seen = set()
+    try:
+        seen.add(int(p.pid))
+    except Exception:
+        pass
+
+    main_hwnd, main_pid = None, None
+    try:
+        main_hwnd, main_pid = wait_for_large_window_for_process(
+            p,
+            start_ts,
+            total_timeout=120.0,
+            min_screen_ratio=0.5,
+            poll_interval=0.25,
+            log_progress=True,
+            small_title=title,
+            require_connexion_click_before_loading=(APP_VARIANT == "ankabot"),
+            connexion_image=(
+                os.path.join(RESOURCES, "connexion.png")
+                if APP_VARIANT == "ankabot"
+                else None
+            ),
+            connexion_confidence=0.3,
+        )
+    except Exception as e_wait:
+        _log_empty(f"[{title}] wait_for_large_window exception: {e_wait}")
+        try:
+            update_process_tree_pids(p.pid, seen)
+            main_hwnd, main_pid = pick_best_window_for_pids(seen, min_screen_ratio=0.15)
+            if main_hwnd:
+                _log_empty(
+                    f"[{title}] fallback fenêtre hwnd={main_hwnd} pid={main_pid}"
+                )
+        except Exception:
+            main_hwnd, main_pid = None, None
+
+    try:
+        update_process_tree_pids(p.pid, seen)
+    except Exception:
+        pass
+    if main_pid:
+        try:
+            seen.add(int(main_pid))
+        except Exception:
+            pass
+
+    watch_pid = int(main_pid) if main_pid else int(p.pid)
+
+    if main_hwnd and main_pid:
+        _log_empty(
+            f"[{title}] Fenêtre détectée hwnd={main_hwnd} pid={main_pid}, register + renommage"
+        )
+        try:
+            _post_json(
+                "/register",
+                {
+                    "title": title,
+                    "pid": int(main_pid),
+                    "hwnd": int(main_hwnd),
+                    "touch": True,
+                },
+            )
+            _log_empty(f"[{title}] /register OK")
+        except Exception as e_reg:
+            _log_empty(f"[{title}] /register ÉCHEC: {e_reg}")
+        _set_empty_instance_window_title(main_hwnd, title, log_prefix=title)
+        with _state_lock:
+            inst.awaiting_first_hb = False
+            inst.stopped = False
+            try:
+                inst.pid = watch_pid
+                inst.hwnd = int(main_hwnd)
+            except Exception:
+                pass
+            _instances[title] = inst
+        try:
+            bus.instance_updated.emit(title)
+        except Exception:
+            pass
+        _log_empty(f"[{title}] Voyant passé au bleu, attente fin process...")
+    else:
+        # Fenêtre pas encore trouvée : garder jaune + meilleur PID vivant du tree
+        best_hwnd, best_pid = pick_best_window_for_pids(seen, min_screen_ratio=0.0)
+        if best_pid:
+            watch_pid = int(best_pid)
+        with _state_lock:
+            inst.stopped = False
+            inst.awaiting_first_hb = True
+            try:
+                inst.pid = watch_pid
+                if best_hwnd:
+                    inst.hwnd = int(best_hwnd)
+            except Exception:
+                pass
+            _instances[title] = inst
+        try:
+            bus.instance_updated.emit(title)
+        except Exception:
+            pass
+        _log_empty(
+            f"[{title}] Pas de grande fenêtre — watch_pid={watch_pid} (reste jaune)"
+        )
+
+    return watch_pid, seen
 
 
 def _log_empty(msg: str):
@@ -14486,6 +14778,7 @@ def wait_for_large_window_for_process(
     """
     scr_area, _ = screen_area(use_virtual=False)
     threshold = scr_area * float(min_screen_ratio)
+    soft_threshold = scr_area * 0.25  # fallback si la fenêtre n'est pas maximisée
     if log_progress:
         _log_empty(
             f"wait_for_large_window pid={p.pid} scr_area={scr_area:.0f} threshold={threshold:.0f} ({min_screen_ratio*100:.0f}% écran) timeout={total_timeout}s"
@@ -14493,20 +14786,43 @@ def wait_for_large_window_for_process(
     poll_count = 0
     clicked_connexion_pids = set()
     first_click_ts = None
+    seen_pids = set()
+    try:
+        seen_pids.add(int(p.pid))
+    except Exception:
+        pass
+
     while True:
         now = time.time()
-        if now - start_ts > total_timeout:
+        elapsed = now - start_ts
+        if elapsed > total_timeout:
+            # Dernière chance : plus grande fenêtre visible du tree, même sous le seuil 50%
+            hwnd, pid = pick_best_window_for_pids(seen_pids, min_screen_ratio=0.15)
+            if hwnd and pid:
+                if log_progress:
+                    _log_empty(
+                        f"TIMEOUT soft-accept hwnd={hwnd} pid={pid} après {total_timeout}s"
+                    )
+                return hwnd, pid
             if log_progress:
                 _log_empty(f"TIMEOUT après {total_timeout}s (aucune grande fenêtre)")
             raise TimeoutError(
                 f"Timeout fenêtre >= {int(min_screen_ratio * 100)}% écran."
             )
-        candidate_pids = get_recent_child_pids(p.pid, start_ts)
+
+        update_process_tree_pids(getattr(p, "pid", None), seen_pids)
+        # Compat : aussi merger get_recent_child_pids tant que le launcher vit
+        try:
+            seen_pids.update(get_recent_child_pids(p.pid, start_ts))
+        except Exception:
+            pass
+        candidate_pids = set(seen_pids)
+
         if require_connexion_click_before_loading and connexion_image:
             for cpid in list(candidate_pids):
                 if cpid in clicked_connexion_pids:
                     continue
-                for h in find_hwnds_for_pid_allow_empty_title(cpid):
+                for h in _hwnds_for_pid_prefer_visible(cpid):
                     try:
                         if not win32gui.IsWindowVisible(h):
                             continue
@@ -14529,40 +14845,44 @@ def wait_for_large_window_for_process(
                     except Exception:
                         pass
 
+        # Rename petite fenêtre seulement après clic / grâce — mais NE PAS bloquer
+        # la détection de la grande fenêtre (sinon timeout alors que la fenêtre est là).
         can_manage_loading_window = True
         if require_connexion_click_before_loading:
             clicked_any = len(clicked_connexion_pids) > 0
-            grace_elapsed = first_click_ts and (time.time() - first_click_ts) > 8.0
-            can_manage_loading_window = bool(clicked_any or grace_elapsed)
-            if not can_manage_loading_window:
-                poll_count += 1
-                time.sleep(poll_interval)
-                continue
+            grace_after_click = bool(
+                first_click_ts and (time.time() - first_click_ts) > 8.0
+            )
+            grace_from_start = elapsed >= 12.0
+            can_manage_loading_window = bool(
+                clicked_any or grace_after_click or grace_from_start
+            )
+
+        # Seuil assoupli après 45s (fenêtre non maximisée / multi-écran)
+        active_threshold = threshold if elapsed < 45.0 else soft_threshold
+
         if log_progress and (poll_count == 0 or poll_count % 40 == 0):
             _log_empty(
-                f"poll #{poll_count} candidate_pids={candidate_pids} elapsed={now - start_ts:.1f}s"
+                f"poll #{poll_count} candidate_pids={sorted(candidate_pids)} "
+                f"elapsed={elapsed:.1f}s thr={active_threshold:.0f}"
             )
         for cpid in list(candidate_pids):
-            hwnds = find_hwnds_for_pid_allow_empty_title(cpid)
+            hwnds = _hwnds_for_pid_prefer_visible(cpid)
             if log_progress and poll_count > 0 and poll_count % 40 == 0 and hwnds:
                 _log_empty(f"  cpid={cpid} hwnds={len(hwnds)}")
             for h in hwnds:
                 if not win32gui.IsWindowVisible(h):
                     continue
                 area = get_window_area(h)
-                # Renommage des petites fenêtres de lancement pour les instances vides :
-                # toute fenêtre visible avec une aire positive, inférieure au seuil de
-                # la "grande" fenêtre, sera appelée "Lancement de <title>".
                 if (
                     small_title
                     and can_manage_loading_window
                     and area > 0
-                    and area < threshold
+                    and area < active_threshold
                 ):
                     try:
                         _set_launch_window_title(h, small_title)
                     except Exception:
-                        # On ne casse jamais la boucle de détection à cause du renommage.
                         pass
                 if log_progress and poll_count % 40 == 0 and area > 0:
                     try:
@@ -14570,7 +14890,7 @@ def wait_for_large_window_for_process(
                         _log_empty(f"  hwnd={h} area={area} title={tit[:50]!r}")
                     except Exception:
                         _log_empty(f"  hwnd={h} area={area}")
-                if area >= threshold:
+                if area >= active_threshold:
                     if log_progress:
                         try:
                             tit = win32gui.GetWindowText(h) or "(vide)"
@@ -15393,6 +15713,8 @@ def restore_running_instances_from_cmdline():
                         inst.restored_recently = False
                     else:
                         inst.restored_recently = True
+                    # Process vivant trouvé → ne plus laisser l'UI en gris stoppé
+                    inst.stopped = False
                     inst.last_heartbeat = 0.0
                     inst.awaiting_first_hb = False if is_empty_instance else True
 
