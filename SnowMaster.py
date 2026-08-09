@@ -434,7 +434,7 @@ DEFAULT_PREFS = {
         # Animations pulsées (ombre) sur les cartes d'instance ; si False : bordure QSS statique seulement
         "card_animations_enabled": True,
         "static_shadows_enabled": True,  # ombres fixes (panneau €, etc.)
-        "euro_counter_visible": True,  # afficher le bouton vert € en bas du dock config
+        "euro_counter_visible": True,  # afficher le bouton vert € (header)
         "config_panel_visible": True,  # panneau central Configs / Boutons
         "right_panel_visible": True,  # panneau droite Sous-contrôleurs / détails
         "compact_instances": False,  # cartes instances sans boutons (plus étroites)
@@ -471,7 +471,7 @@ def static_shadows_enabled() -> bool:
 
 
 def euro_counter_visible() -> bool:
-    """Préférence UI (settings.json → ui.euro_counter_visible) : bouton vert € du dock config."""
+    """Préférence UI (settings.json → ui.euro_counter_visible) : bouton vert € du header."""
     try:
         return bool(_prefs.get("ui", {}).get("euro_counter_visible", True))
     except Exception:
@@ -5193,30 +5193,27 @@ def apply_dark_blue_style(app: QApplication):
             background: transparent;
         }
 
-        /* ---------------------------------------------------------
-           Style minimal ajouté uniquement pour le compteur d'instances
-           (QLabel#InstancesBigCount). Rien d'autre n'est modifié.
-           --------------------------------------------------------- */
+        /* Compteur d'instances actives — taille header (non cliquable) */
         QLabel#InstancesBigCount {
-            font-size: 26px;
-            font-weight: 800;
-            color: #60a5fa; /* bleu doux cohérent avec le titre */
-            padding: 10px 14px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #93c5fd;
+            padding: 6px 10px;
             border-radius: 10px;
-            background: rgba(11,18,32,0.12); /* léger fond pour occuper l'espace */
-            border: 1px solid rgba(59,130,246,0.07);
+            background: rgba(15, 23, 42, 0.55);
+            border: 1px solid rgba(148, 163, 184, 0.28);
         }
                       
-        /* Compteur € total (vert) */
+        /* Compteur € total (vert) — taille alignée sur les boutons du header */
         QLabel#EuroBigCounter {
-            border-radius: 14px;
-            padding: 12px 18px;
+            border-radius: 10px;
+            padding: 6px 10px;
             background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                         stop:0 rgba(6,78,59,0.98), stop:1 rgba(5,150,105,0.98));
             border: 1px solid rgba(16,185,129,0.35);
             color: #e7fef5;
-            font-weight: 900;
-            font-size: 28px;
+            font-weight: 700;
+            font-size: 14px;
         }
         QLabel#EuroBigCounter:hover {
             border-color: rgba(16,185,129,0.55);
@@ -8361,21 +8358,51 @@ class SnowMasterGUI(QWidget):
         # Header
         header = QHBoxLayout()
         header.setSizeConstraint(QHBoxLayout.SetNoConstraint)
-        self.title_label = QLabel(f"❄️ {APP_DISPLAY_NAME}")
-        self.title_label.setObjectName("TitleLabel")
         self.global_dot = StatusDot(12, CLR_GREY)
 
+        # Compteur € (ex-bas du dock) → header, même taille que les boutons généraux
+        self.panel_euros = ClickablePanel("0.00 €")
+        self.panel_euros.setObjectName("EuroBigCounter")
+        self.panel_euros.setAlignment(Qt.AlignCenter)
+        self.panel_euros.setCursor(Qt.PointingHandCursor)
+        self.panel_euros.setToolTip("Voir le détail des € générés")
+        self.panel_euros.clicked.connect(self.open_revenue_window)
+        if static_shadows_enabled():
+            try:
+                shadow = QGraphicsDropShadowEffect(self.panel_euros)
+                shadow.setBlurRadius(16)
+                shadow.setXOffset(0)
+                shadow.setYOffset(4)
+                shadow.setColor(QColor(16, 185, 129, 80))
+                self.panel_euros.setGraphicsEffect(shadow)
+            except Exception:
+                pass
+        self.panel_euros.setVisible(euro_counter_visible())
+
+        # Compteur d'instances actives (ex-dock config) → header, non cliquable
+        self.lbl_instances_big = QLabel("0 instances")
+        self.lbl_instances_big.setObjectName("InstancesBigCount")
+        self.lbl_instances_big.setAlignment(Qt.AlignCenter)
+        self.lbl_instances_big.setToolTip("Nombre d'instances actives")
+
         self.btn_new = QPushButton("＋ Nouvelle instance")
+        self.btn_launch_empty = QPushButton("＋ Vide")
         self.btn_all_reload = QPushButton("Relancer tout")
         self.btn_all_kill = QPushButton("Terminer tout")
         self.btn_all_del = QPushButton("Supprimer tout")
         for b in (
             self.btn_new,
+            self.btn_launch_empty,
             self.btn_all_reload,
             self.btn_all_kill,
             self.btn_all_del,
         ):
             b.setCursor(Qt.PointingHandCursor)
+
+        self.btn_launch_empty.setToolTip(
+            "Lancer une instance vide (exécutable sans automatisation)"
+        )
+        self.btn_launch_empty.clicked.connect(self.on_launch_empty_instance)
 
         # Icônes configurables pour les actions globales (relancer / terminer / supprimer tout)
         play_icon_bulk = get_icon("play")
@@ -8465,11 +8492,13 @@ class SnowMasterGUI(QWidget):
 
         # Pas de largeur min sur le header (sauf le voyant, taille fixe)
         for w in (
-            self.title_label,
+            self.panel_euros,
+            self.lbl_instances_big,
             self.btn_toggle_config,
             self.btn_toggle_right,
             self.btn_toggle_compact,
             self.btn_new,
+            self.btn_launch_empty,
             self.btn_all_reload,
             self.btn_all_kill,
             self.btn_all_del,
@@ -8480,17 +8509,19 @@ class SnowMasterGUI(QWidget):
             except Exception:
                 pass
 
-        # Titre + voyant + boutons groupés à gauche (stretch à droite pour ne pas les coller au bord)
-        header.addWidget(self.title_label, 0, Qt.AlignVCenter)
+        # Voyant + boutons à gauche ; compteur instances + € collés après Terminer
         header.addWidget(self.global_dot, 0, Qt.AlignVCenter)
         header.addSpacing(10)
         header.addWidget(self.btn_toggle_config, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_toggle_right, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_toggle_compact, 0, Qt.AlignVCenter)
         ## header.addWidget(self.btn_new, 0, Qt.AlignVCenter)
+        header.addWidget(self.btn_launch_empty, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_all_reload, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_all_kill, 0, Qt.AlignVCenter)
         # header.addWidget(self.btn_all_del, 0, Qt.AlignVCenter)
+        header.addWidget(self.lbl_instances_big, 0, Qt.AlignVCenter)
+        header.addWidget(self.panel_euros, 0, Qt.AlignVCenter)
         header.addStretch(1)
 
         # Left column
@@ -8614,7 +8645,7 @@ class SnowMasterGUI(QWidget):
         self.chk_euro_counter = QCheckBox("Afficher bouton €")
         self.chk_euro_counter.setChecked(euro_counter_visible())
         self.chk_euro_counter.setToolTip(
-            "Coché : affiche le bouton vert des revenus (€) en bas du panneau config.\n"
+            "Coché : affiche le bouton vert des revenus (€) en haut à gauche.\n"
             "Décoché : le masque pour travailler sans distraction."
         )
         self.chk_euro_counter.stateChanged.connect(self.on_toggle_euro_counter)
@@ -8915,46 +8946,6 @@ class SnowMasterGUI(QWidget):
         self.btn_panic.clicked.connect(self.on_panic_selected_instances)
         cfg_v.addWidget(self.btn_panic)
 
-        # --- Nouveau: bouton pour lancer une "instance vide" (juste exe, sans automatisation) ---
-        self.btn_launch_empty = QPushButton("＋ Instance vide")
-        self.btn_launch_empty.setCursor(Qt.PointingHandCursor)
-        self.btn_launch_empty.setToolTip(
-            "Lance l'exécutable EXE sans automatisation. Donne un nom à l'instance."
-        )
-        self.btn_launch_empty.clicked.connect(self.on_launch_empty_instance)
-        cfg_v.addWidget(self.btn_launch_empty)
-
-        # Compteur d'instances (grand, centré)
-        self.lbl_instances_big = QLabel("0 instances")
-        self.lbl_instances_big.setObjectName("InstancesBigCount")
-        self.lbl_instances_big.setAlignment(Qt.AlignCenter)
-        # occupe un peu d'espace visuel dans le bas du dock
-        self.lbl_instances_big.setFixedHeight(92)
-        cfg_v.addWidget(self.lbl_instances_big)
-
-        # ---------- Compteur € cliquable (même look que InstancesBigCount) ----------
-        self.panel_euros = ClickablePanel("0\n€ générés")
-        self.panel_euros.setObjectName("EuroBigCounter")
-        self.panel_euros.setAlignment(Qt.AlignCenter)
-        self.panel_euros.setFixedHeight(92)
-        self.panel_euros.setCursor(Qt.PointingHandCursor)
-        self.panel_euros.clicked.connect(self.open_revenue_window)
-
-        if static_shadows_enabled():
-            try:
-                shadow = QGraphicsDropShadowEffect(self.panel_euros)
-                shadow.setBlurRadius(24)
-                shadow.setXOffset(0)
-                shadow.setYOffset(8)
-                shadow.setColor(QColor(16, 185, 129, 90))
-                self.panel_euros.setGraphicsEffect(shadow)
-            except Exception:
-                pass
-
-        # Bouton argent (fixe en bas) — visibilité pilotée par ui.euro_counter_visible
-        cfg_v.addWidget(self.panel_euros)
-        self.panel_euros.setVisible(euro_counter_visible())
-
         # ----- Données & remplissage -----
         # On utilise le store global _revenue_data (protégé par _revenue_lock)
         with _revenue_lock:
@@ -8984,14 +8975,13 @@ class SnowMasterGUI(QWidget):
         # expose local handle to the shared data (kept in sync via bus.revenue_updated)
         self.revenue_data = _revenue_data
 
-        # Calcul initial
+        # Calcul initial (bouton € déjà placé dans le header)
         self.update_revenue_counter()
 
         self.configDock.setMinimumWidth(0)
         self.configDock.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.configDock.setStyleSheet(
             "#ConfigDock QPushButton { padding:5px 8px; font-size:13px; } "
-            # "#ConfigDock QLabel:not(#EuroBigCounter) { font-size:13px; } "
             "#ConfigDock { font-size:13px; }"
         )
 
@@ -9020,6 +9010,7 @@ class SnowMasterGUI(QWidget):
         # form.addRow("Titre :", self.edit_title)
 
         self.lbl_script = QLabel("-")
+        self.lbl_exe = QLabel("-")
         self.lbl_last_reset = QLabel("-")  # <-- NOUVEAU
         self.lbl_status = QLabel("-")
         self.lbl_pid = QLabel("-")
@@ -9027,6 +9018,7 @@ class SnowMasterGUI(QWidget):
 
         # form.addRow("Titre :", self.lbl_title)
         form.addRow("Script :", self.lbl_script)
+        form.addRow("Exécutable :", self.lbl_exe)
         form.addRow("Last Update :", self.lbl_status)
         form.addRow(
             "Last Reset :", self.lbl_last_reset
@@ -9206,17 +9198,26 @@ class SnowMasterGUI(QWidget):
                     for inst_data in autos:
                         title = inst_data.get("title")
                         ctrl = inst_data.get("controller")
+                        exe_cfg = (inst_data.get("exe") or "").strip() or None
 
                         if not title or not ctrl:
                             continue
 
                         with _state_lock:
-                            # si déjà présent, on SKIP pour éviter doublons
-                            if title in _instances:
+                            existing = _instances.get(title)
+                            if existing is not None:
+                                # Instance déjà là (ex. restore process) : appliquer exe/controller du JSON
+                                if exe_cfg:
+                                    existing.exe_path = exe_cfg
+                                if ctrl and not existing.controller_path:
+                                    existing.controller_path = ctrl
                                 continue
 
                         inst = InstanceState(title)
                         inst.controller_path = ctrl
+                        # Exe spécifique à l'instance (sinon fallback EXE settings au lancement)
+                        if exe_cfg:
+                            inst.exe_path = exe_cfg
 
                         # Force état ARRETÉ propre
                         inst.pid = None
@@ -9830,7 +9831,7 @@ class SnowMasterGUI(QWidget):
         #     app_log_error(f"   Traceback: {traceback.format_exc()}")
 
     def update_instances_count(self):
-        """Met à jour le grand label 'Instances' avec total + actives."""
+        """Met à jour le label d'instances actives (header)."""
         try:
             with _state_lock:
                 instances_snapshot = list(_instances.values())
@@ -10358,6 +10359,9 @@ class SnowMasterGUI(QWidget):
             if hasattr(self, "edit_title"):
                 self.edit_title.setText("")
             self.lbl_script.setText("-")
+            if hasattr(self, "lbl_exe"):
+                self.lbl_exe.setText("-")
+                self.lbl_exe.setToolTip("")
             self.lbl_pid.setText("-")
             self.lbl_status.setText("-")
             self.lbl_subs.setText("-")
@@ -10385,6 +10389,8 @@ class SnowMasterGUI(QWidget):
         script_name = (
             os.path.basename(inst.controller_path) if inst.controller_path else "-"
         )
+        effective_exe = (getattr(inst, "exe_path", None) or "").strip() or (EXE or "")
+        exe_dir_txt = self._format_exe_dir_label(effective_exe)
         status_txt = self.fmt_last_update(
             self._effective_last_update_ts(inst), with_label=False
         )
@@ -10398,6 +10404,8 @@ class SnowMasterGUI(QWidget):
             title,
             inst.title,
             script_name,
+            exe_dir_txt,
+            effective_exe,
             pid_txt,
             status_txt,
             last_reset_txt,
@@ -10417,6 +10425,12 @@ class SnowMasterGUI(QWidget):
 
         if self.lbl_script.text() != script_name:
             self.lbl_script.setText(script_name)
+        if hasattr(self, "lbl_exe"):
+            if self.lbl_exe.text() != exe_dir_txt:
+                self.lbl_exe.setText(exe_dir_txt)
+            tip = effective_exe if effective_exe else ""
+            if self.lbl_exe.toolTip() != tip:
+                self.lbl_exe.setToolTip(tip)
         if self.lbl_pid.text() != pid_txt:
             self.lbl_pid.setText(pid_txt)
         if self.lbl_last_reset.text() != last_reset_txt:
@@ -12601,27 +12615,51 @@ class SnowMasterGUI(QWidget):
         )
         return True
 
-    def _load_controller_from_autoload(self, title: str) -> Optional[str]:
-        """Charge le contrôleur depuis autoload_instances_file si disponible."""
+    def _load_autoload_fields(self, title: str) -> Tuple[Optional[str], Optional[str]]:
+        """Charge (controller, exe) depuis instances.json pour un titre donné."""
         try:
             autoload_file = get_autoload_instances_file(_prefs)
             if not autoload_file or not os.path.exists(autoload_file):
-                return None
+                return None, None
 
             with open(autoload_file, "r", encoding="utf-8") as f:
                 autos = json.load(f)
 
             if isinstance(autos, list):
                 for inst_data in autos:
-                    if inst_data.get("title") == title:
-                        ctrl = inst_data.get("controller")
-                        if ctrl and os.path.exists(ctrl):
-                            return ctrl
+                    if inst_data.get("title") != title:
+                        continue
+                    ctrl = inst_data.get("controller") or None
+                    if ctrl and not os.path.exists(ctrl):
+                        ctrl = None
+                    exe = (inst_data.get("exe") or "").strip() or None
+                    return ctrl, exe
         except Exception as e:
             app_log_warn(
-                f"Erreur lors du chargement du contrôleur depuis autoload pour {title}: {e}"
+                f"Erreur lors du chargement autoload pour {title}: {e}"
             )
-        return None
+        return None, None
+
+    def _load_controller_from_autoload(self, title: str) -> Optional[str]:
+        """Charge le contrôleur depuis autoload_instances_file si disponible."""
+        ctrl, _exe = self._load_autoload_fields(title)
+        return ctrl
+
+    @staticmethod
+    def _format_exe_dir_label(exe_path: Optional[str]) -> str:
+        """Nom du dossier contenant l'exe (ex. ankabotpc2/ankabot.exe → ankabotpc2)."""
+        path = (exe_path or "").strip()
+        if not path:
+            path = (EXE or "").strip()
+        if not path:
+            return "-"
+        try:
+            folder = os.path.basename(
+                os.path.normpath(os.path.dirname(os.path.abspath(path)))
+            )
+            return folder or "-"
+        except Exception:
+            return "-"
 
     def _get_instance_launch_params(
         self, title: str
@@ -12633,16 +12671,29 @@ class SnowMasterGUI(QWidget):
             if not inst:
                 return None, None, None, None, 0.0
             controller = inst.controller_path
-            # Si le contrôleur est perdu, essayer de le charger depuis autoload_instances_file
-            if not controller:
-                controller = self._load_controller_from_autoload(title)
-                # Si trouvé, le sauvegarder dans l'instance
-                if controller:
-                    inst.controller_path = controller
-                    _instances[title] = inst
-            exe = inst.exe_path or EXE
+            exe = (inst.exe_path or "").strip() or None
             images = inst.images_dir or RESOURCES
             ratio = inst.ratio or 0.5
+
+        # Hors lock : I/O fichier autoload (controller / exe par instance)
+        if not controller or not exe:
+            auto_ctrl, auto_exe = self._load_autoload_fields(title)
+            with _state_lock:
+                inst = _instances.get(title)
+                if not inst:
+                    return None, None, None, None, 0.0
+                if not controller and auto_ctrl:
+                    controller = auto_ctrl
+                    inst.controller_path = auto_ctrl
+                if not exe and auto_exe:
+                    exe = auto_exe
+                    inst.exe_path = auto_exe
+                images = inst.images_dir or RESOURCES
+                ratio = inst.ratio or 0.5
+                _instances[title] = inst
+
+        # Fallback : exe global settings.json (client_exe / exe)
+        exe = exe or EXE
         return inst, controller, exe, images, ratio
 
     def _kill_instance_background(self, title: str):
