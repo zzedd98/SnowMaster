@@ -8374,6 +8374,8 @@ class SnowMasterGUI(QWidget):
         self._reddot_block_until: Dict[str, float] = {}  # title -> ts fin cooldown 30 min
         self._reddot_blocked_logged: set = set()  # évite de spammer les logs scan
         self._pending_resets: List[str] = []  # Queue de titres à reset
+        # title -> unix ts fin de fenêtre "busy" (relance / reset en cours)
+        self._instance_busy_until: Dict[str, float] = {}
         self._hb_history_dialogs: Dict[str, HeartbeatHistoryDialog] = {}
         self._init_reddot_log_state()
 
@@ -9487,6 +9489,13 @@ class SnowMasterGUI(QWidget):
                 inst = _instances.get(t)
             if inst:
                 self._ensure_item(t, inst)
+                # 1er HB / process OK → fin de la fenêtre busy relance
+                try:
+                    if not getattr(inst, "awaiting_first_hb", False) and not inst.stopped:
+                        if inst.pid or inst.hwnd or float(inst.last_heartbeat or 0) > 0:
+                            self._clear_instance_busy(t)
+                except Exception:
+                    pass
             if t == selected:
                 need_details = True
                 need_subs = True
@@ -10807,6 +10816,71 @@ class SnowMasterGUI(QWidget):
         )
         t.start()
 
+    def _mark_instance_busy(
+        self, title: str, *, reason: str = "launch", duration_s: Optional[float] = None
+    ):
+        """Marque une instance comme en cours de relance/reset (anti double-action scan)."""
+        if not title:
+            return
+        try:
+            dur = float(
+                duration_s
+                if duration_s is not None
+                else max(float(AWAITING_LAUNCH_TIMEOUT_S), float(AUTO_RELAUNCH_COOLDOWN_S) * 2)
+            )
+        except Exception:
+            dur = float(AWAITING_LAUNCH_TIMEOUT_S)
+        until = time.time() + max(5.0, dur)
+        prev = float(self._instance_busy_until.get(title, 0.0) or 0.0)
+        if until > prev:
+            self._instance_busy_until[title] = until
+        scan_log(
+            f"[BUSY] '{title}': busy jusqu'à +{dur:.0f}s (raison={reason})"
+        )
+
+    def _clear_instance_busy(self, title: str):
+        if not title:
+            return
+        if title in self._instance_busy_until:
+            self._instance_busy_until.pop(title, None)
+            scan_log(f"[BUSY] '{title}': busy cleared")
+
+    def _is_instance_busy(self, title: str, inst: Optional["InstanceState"] = None) -> bool:
+        """True si relance/reset en cours — awaiting_first_hb seul ne suffit pas."""
+        if not title:
+            return False
+        # Reset déjà en file d'attente
+        try:
+            if title in (getattr(self, "_pending_resets", None) or []):
+                return True
+        except Exception:
+            pass
+        # Fenêtre busy explicite (spawn / reset / auto-relaunch planifié)
+        until = float(self._instance_busy_until.get(title, 0.0) or 0.0)
+        if until > time.time():
+            return True
+        if until > 0:
+            self._instance_busy_until.pop(title, None)
+
+        # Cooldown anti-spam après une tentative auto
+        last = float(self._last_auto_relaunch_attempt.get(title, 0.0) or 0.0)
+        if last > 0 and (time.time() - last) < float(AUTO_RELAUNCH_COOLDOWN_S):
+            return True
+
+        # Lancement jaune récent (awaiting + last_reset)
+        if inst is None:
+            with _state_lock:
+                inst = _instances.get(title)
+        if inst is not None and getattr(inst, "awaiting_first_hb", False):
+            launch_ts = float(getattr(inst, "last_reset", 0.0) or 0.0) or float(
+                getattr(inst, "last_heartbeat", 0.0) or 0.0
+            )
+            if launch_ts > 0 and (time.time() - launch_ts) < float(
+                AWAITING_LAUNCH_TIMEOUT_S
+            ):
+                return True
+        return False
+
     def _mark_instance_launching_ui(self, title: str) -> bool:
         """Passe immédiatement en jaune et rafraîchit la carte (feedback avant le spawn)."""
         if not title:
@@ -10821,6 +10895,7 @@ class SnowMasterGUI(QWidget):
             inst.last_reset = time.time()
             inst.pid = None
             inst.hwnd = None
+        self._mark_instance_busy(title, reason="launch")
         try:
             # Pas de processEvents ici : évite la réentrance (timers/scan) avant le spawn.
             self._refresh_one_card(title)
@@ -12045,6 +12120,12 @@ class SnowMasterGUI(QWidget):
                 for title, inst in _instances.items():
                     if inst.stopped:
                         continue
+                    # Relance / reset en cours : ne pas traiter comme crash
+                    if self._is_instance_busy(title, inst):
+                        scan_log(
+                            f"[SCAN_PIDS] '{title}': busy (relance/reset) — ignore"
+                        )
+                        continue
                     # Détecter les instances avec PID et HWND invalides (0 ou None)
                     # Ces instances sont considérées comme terminées même si stopped=False
                     pid = inst.pid
@@ -12110,6 +12191,9 @@ class SnowMasterGUI(QWidget):
                             ),
                             "manual_empty": bool(
                                 getattr(inst, "manual_empty", False)
+                            ),
+                            "last_reset": float(
+                                getattr(inst, "last_reset", 0.0) or 0.0
                             ),
                         }
                     )
@@ -12226,6 +12310,16 @@ class SnowMasterGUI(QWidget):
                         is_hwnd_valid(inst_data["hwnd"]) if inst_data["hwnd"] else False
                     )
 
+                    # Lancement en cours : un PID launcher mort un instant ≠ crash à relancer
+                    if inst_data.get("awaiting_first_hb"):
+                        lr = float(inst_data.get("last_reset") or 0.0)
+                        if lr > 0 and (now - lr) < float(AWAITING_LAUNCH_TIMEOUT_S):
+                            scan_log(
+                                f"[SCAN_PIDS] '{title}': awaiting_first_hb "
+                                f"(âge={now - lr:.0f}s) — skip crash check"
+                            )
+                            continue
+
                     if not pid_ok and not hwnd_ok:
                         scan_log(
                             f"[SCAN_PIDS] '{title}': ⚠️ CRASH détecté (PID={inst_data['pid']} mort, HWND={inst_data['hwnd']} invalide)"
@@ -12279,9 +12373,10 @@ class SnowMasterGUI(QWidget):
                         f"[SCAN_PIDS] '{title}': Planification relance (raison: {reason})"
                     )
                     self._last_auto_relaunch_attempt[title] = now
-                    # Crash → stop propre avant relance. Jaune timeout → rester jaune.
+                    self._mark_instance_busy(title, reason=f"auto_{reason}")
+                    # Crash → stop propre avant relance (garde busy). Jaune timeout → rester jaune.
                     if reason != "jaune_timeout":
-                        self._mark_instance_stopped(title)
+                        self._mark_instance_stopped(title, clear_busy=False)
                     # Stocker temporairement le controller_path pour la relance
                     if controller_path:
                         with _state_lock:
@@ -12310,6 +12405,13 @@ class SnowMasterGUI(QWidget):
 
     def _auto_relaunch_still_needed(self, title: str, reason: str) -> bool:
         """True si, à l'instant T, une relance auto a encore du sens (évite de tuer un lancement réussi)."""
+        # Relance/reset déjà en cours → ne pas empiler une 2e action (sauf jaune timeout expiré)
+        if reason != "jaune_timeout" and self._is_instance_busy(title):
+            scan_log(
+                f"[SCAN_PIDS] '{title}': busy (relance/reset) — skip still_needed({reason})"
+            )
+            return False
+
         with _state_lock:
             inst = _instances.get(title)
             if not inst:
@@ -12320,6 +12422,7 @@ class SnowMasterGUI(QWidget):
             pid = inst.pid
             hwnd = inst.hwnd
             last_hb = float(inst.last_heartbeat or 0.0)
+            last_reset = float(getattr(inst, "last_reset", 0.0) or 0.0)
 
         pid_ok = is_pid_alive(pid) if pid else False
         hwnd_ok = is_hwnd_valid(hwnd) if hwnd else False
@@ -12331,12 +12434,32 @@ class SnowMasterGUI(QWidget):
                 return False
             if pid_ok or hwnd_ok:
                 return False
+            # Timeout réel : la fenêtre busy doit être expirée (ou last_reset trop vieux)
+            if last_reset > 0 and (time.time() - last_reset) < float(
+                AWAITING_LAUNCH_TIMEOUT_S
+            ):
+                return False
             return True
 
-        # crash / doublons : ne pas toucher une instance saine (ex. 1er HB entre-temps)
+        if reason == "crash":
+            # Process mort = relancer même si le dernier HB est encore « vert ».
+            # Mais pas pendant un lancement/reset en cours (PID launcher peut être mort un instant).
+            if awaiting and last_reset > 0 and (time.time() - last_reset) < float(
+                AWAITING_LAUNCH_TIMEOUT_S
+            ):
+                return False
+            if pid_ok or hwnd_ok:
+                return False
+            return True
+
+        # doublons (et autres) : ne pas toucher une instance saine
         if not stopped and (pid_ok or hwnd_ok):
             return False
-        # Les manuelles n'ont pas de vrais HB : ignorer hb_fresh
+        if awaiting and last_reset > 0 and (time.time() - last_reset) < float(
+            AWAITING_LAUNCH_TIMEOUT_S
+        ):
+            return False
+        # HB frais : utile seulement si on n'a pas déjà prouvé un crash PID/HWND
         if not stopped and hb_fresh and not awaiting and not manual_empty:
             return False
         return True
@@ -12354,6 +12477,7 @@ class SnowMasterGUI(QWidget):
 
         for title in resets_to_process:
             try:
+                self._mark_instance_busy(title, reason="reset")
                 _record_instance_reset_history(title)
                 # Kill le processus
                 self._kill_instance_sync(title)
@@ -12362,6 +12486,7 @@ class SnowMasterGUI(QWidget):
                 self.relaunch_requested.emit(title)
             except Exception as e:
                 app_log_error(f"[RESET] Erreur reset {title}: {e}")
+                self._clear_instance_busy(title)
 
     def _kill_duplicate_processes(
         self, title: str, proc_list: List[dict], keep_pid: Optional[int] = None
@@ -12509,7 +12634,7 @@ class SnowMasterGUI(QWidget):
         scan_log(f"[RESOLVE_CTRL] '{title}': ✗ ÉCHEC - Aucun controller valide trouvé")
         return None
 
-    def _mark_instance_stopped(self, title: str):
+    def _mark_instance_stopped(self, title: str, *, clear_busy: bool = True):
         """Marque une instance comme stoppée de manière thread-safe."""
         scan_log(f"[MARK_STOPPED] '{title}': Marquage comme stoppée...")
         with _state_lock:
@@ -12530,6 +12655,8 @@ class SnowMasterGUI(QWidget):
                 scan_log(
                     f"[MARK_STOPPED] '{title}': ⚠️ Instance non trouvée dans _instances"
                 )
+        if clear_busy:
+            self._clear_instance_busy(title)
 
         # Émettre le signal dans le thread UI
         QTimer.singleShot(0, lambda t=title: self._emit_instance_updated(t))
@@ -12800,6 +12927,7 @@ class SnowMasterGUI(QWidget):
                 self._pending_resets = []
             if title not in self._pending_resets:
                 self._pending_resets.append(title)
+        self._mark_instance_busy(title, reason="reset_queued")
         # Déclencher un traitement immédiat dans un thread background
         self._run_async(self._process_pending_resets)
 
