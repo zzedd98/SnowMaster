@@ -400,7 +400,7 @@ DEFAULT_PREFS = {
         "mode": "load_and_launch",  # comportement par défaut lors du chargement d'une config
         "overwrite_on_load": True,  # si True -> écrase les instances existantes lors du chargement d'une config
         "scan_pid_interval_ms": 30000,  # scan léger PID/HWND (ms)
-        "scan_pid_full_every": 4,  # 1 scan complet (doublons) tous les N scans légers
+        "scan_pid_full_every": 10,  # 1 scan complet (doublons) tous les N légers (~5 min si 30s)
     },
     # Configuration pour Discord : envoi de hook quand le voyant global passe au rouge
     "discord": {
@@ -10822,10 +10822,9 @@ class SnowMasterGUI(QWidget):
             inst.pid = None
             inst.hwnd = None
         try:
+            # Pas de processEvents ici : évite la réentrance (timers/scan) avant le spawn.
             self._refresh_one_card(title)
             self.update_global_dot()
-            # Peindre tout de suite, avant un éventuel scan process / spawn lent
-            QApplication.processEvents()
         except Exception:
             pass
         # Si aucun PID (même launcher) après le timeout → retenter sans attendre le scan périodique
@@ -10896,18 +10895,50 @@ class SnowMasterGUI(QWidget):
                     inst2.controller_path = controller_path
         self.relaunch_requested.emit(title)
 
+    def _schedule_post_launch_register(
+        self,
+        title: str,
+        controller: Optional[str],
+        exe: Optional[str],
+        images: Optional[str],
+        ratio: float,
+    ):
+        """Sync métadonnées après spawn, sans bloquer le clic.
+
+        Mise à jour mémoire uniquement (pas de /register pid=0) : évite d'écraser
+        le PID launcher et de forcer awaiting_first_hb via l'API.
+        """
+
+        def _job():
+            try:
+                with _state_lock:
+                    inst = _instances.get(title)
+                    if not inst:
+                        return
+                    if controller:
+                        inst.controller_path = str(controller)
+                    if exe:
+                        inst.exe_path = str(exe)
+                    if images:
+                        inst.images_dir = str(images)
+                    try:
+                        inst.ratio = float(ratio)
+                    except Exception:
+                        pass
+                    _instances[title] = inst
+            except Exception:
+                pass
+
+        self._run_async(_job)
+
     def on_card_relaunch_force(self, title: str, controller_path: str):
         """Relance forcée d'une instance sans vérifier si elle est déjà running.
         Utilisé par le scan auto-relaunch après détection de crash."""
-        # print(f"[DEBUG on_card_relaunch_force] {title}: DÉBUT avec controller={controller_path}")
         if not title:
-            # print(f"[DEBUG on_card_relaunch_force] {title}: title vide, return")
             return
 
         inst, controller, exe, images, ratio = self._get_instance_launch_params(title)
-        # print(f"[DEBUG on_card_relaunch_force] {title}: inst={inst}")
         if not inst:
-            # print(f"[DEBUG on_card_relaunch_force] {title}: inst None, return")
             return
 
         # Utiliser le controller passé en paramètre (celui détecté lors du crash)
@@ -10918,79 +10949,31 @@ class SnowMasterGUI(QWidget):
             print(f"[DEBUG on_card_relaunch_force] {title}: pas de controller, ABORT")
             return
 
-        # Feedback jaune immédiat (avant le nettoyage / spawn)
+        # Jaune → spawn immédiat. Métadonnées en arrière-plan.
         self._mark_instance_launching_ui(title)
-
-        # Killer les processus dupliqués si nécessaire
-        if self._enforce_unique_title_processes(title):
-            # print(f"[DEBUG on_card_relaunch_force] {title}: processus dupliqués tués")
-            inst, controller, exe, images, ratio = self._get_instance_launch_params(
-                title
-            )
-            if not inst:
-                # print(f"[DEBUG on_card_relaunch_force] {title}: inst None après enforce, return")
-                return
-            if controller_path:
-                controller = controller_path
-            self._mark_instance_launching_ui(title)
-
-        # print(f"[DEBUG on_card_relaunch_force] {title}: Envoi /register")
-        try:
-            _post_json(
-                "/register",
-                {
-                    "title": title,
-                    "pid": 0,
-                    "hwnd": 0,
-                    "controller": controller,
-                    "exe": exe,
-                    "images": images,
-                    "ratio": ratio,
-                    "touch": True,
-                },
-            )
-        except Exception:
-            pass
-
-        # print(f"[DEBUG on_card_relaunch_force] {title}: Appel _spawn_runner_thread")
         try:
             self._spawn_runner_thread(exe, controller, images, ratio, title)
-            # print(f"[DEBUG on_card_relaunch_force] {title}: _spawn_runner_thread terminé, FIN")
-        except Exception as e:
-            # print(f"[DEBUG on_card_relaunch_force] {title}: ERREUR dans _spawn_runner_thread: {e}")
+        except Exception:
             import traceback
 
             traceback.print_exc()
-
+            return
+        self._schedule_post_launch_register(title, controller, exe, images, ratio)
     def on_card_relaunch(self, title: str):
-        # print(f"[DEBUG on_card_relaunch] {title}: DÉBUT")
         if not title:
-            # print(f"[DEBUG on_card_relaunch] {title}: title vide, return")
             return
+        # Params déjà en mémoire au démarrage (autoload instances.json) ; fallback fichier si manque.
         inst, controller, exe, images, ratio = self._get_instance_launch_params(title)
-        # print(f"[DEBUG on_card_relaunch] {title}: inst={inst}, controller={controller}")
         if not inst:
-            # print(f"[DEBUG on_card_relaunch] {title}: inst None, return")
             return
 
-        is_running = self._is_instance_running(inst, fresh=True)
-        # print(f"[DEBUG on_card_relaunch] {title}: _is_instance_running={is_running}, inst.stopped={inst.stopped}, inst.pid={inst.pid}, inst.hwnd={inst.hwnd}")
-        if is_running:
-            # print(f"[DEBUG on_card_relaunch] {title}: instance considérée running, ABORT relance")
+        # Gris / stopped : pas de psutil frais. Sinon cache UI (scan périodique suffit).
+        need_fresh = (not inst.stopped) and bool(inst.pid or inst.hwnd)
+        if self._is_instance_running(inst, fresh=need_fresh):
             return
 
-        # Jaune immédiat — avant scan doublons / spawn (évite le doute au clic)
+        # Jaune → spawn immédiat. Pas de scan doublons synchrone avant Popen.
         self._mark_instance_launching_ui(title)
-
-        if self._enforce_unique_title_processes(title):
-            # print(f"[DEBUG on_card_relaunch] {title}: enforce_unique trouvé des doublons, re-fetch params")
-            inst, controller, exe, images, ratio = self._get_instance_launch_params(
-                title
-            )
-            if not inst:
-                # print(f"[DEBUG on_card_relaunch] {title}: inst None après enforce, return")
-                return
-            self._mark_instance_launching_ui(title)
 
         # --- Si c'est une "instance vide" lancée manuellement, on relance sans demander de controller ---
         if getattr(inst, "manual_empty", False):
@@ -11122,38 +11105,16 @@ class SnowMasterGUI(QWidget):
                 inst.controller_path = controller
                 _instances[title] = inst
 
-        print(f"[DEBUG on_card_relaunch] {title}: Envoi /register")
+        # Spawn d'abord ; register + orphelins ensuite (thread), sans bloquer le clic.
         try:
-            _post_json(
-                "/register",
-                {
-                    "title": title,
-                    "pid": 0,
-                    "hwnd": 0,
-                    "controller": controller,
-                    "exe": exe,
-                    "images": images,
-                    "ratio": ratio,
-                    "touch": True,
-                },
-            )
-        except Exception:
-            pass
-        print(f"[DEBUG on_card_relaunch] {title}: Appel _spawn_runner_thread")
-        try:
-            # Launch integrated runner thread
             self._spawn_runner_thread(exe, controller, images, ratio, title)
-            print(
-                f"[DEBUG on_card_relaunch] {title}: _spawn_runner_thread terminé, FIN de on_card_relaunch"
-            )
         except Exception as e:
-            print(
-                f"[DEBUG on_card_relaunch] {title}: ERREUR dans _spawn_runner_thread: {e}"
-            )
+            print(f"[DEBUG on_card_relaunch] {title}: ERREUR spawn: {e}")
             import traceback
 
             traceback.print_exc()
-
+            return
+        self._schedule_post_launch_register(title, controller, exe, images, ratio)
     def _ask(self, title: str, text: str) -> bool:
         res = QMessageBox.question(
             self, title, text, QMessageBox.Yes | QMessageBox.No, QMessageBox.No
@@ -11692,25 +11653,12 @@ class SnowMasterGUI(QWidget):
         images = RESOURCES
         ratio = 0.5
         try:
-            _post_json(
-                "/register",
-                {
-                    "title": title,
-                    "controller": path,
-                    "exe": exe,
-                    "images": images,
-                    "ratio": ratio,
-                    "touch": True,
-                },
-            )
-        except Exception:
-            pass
-        try:
             self._spawn_runner_thread(exe, path, images, ratio, title)
             self.update_instances_count()
         except Exception as e:
             print("Erreur lors du lancement de l'instance via runner:", e)
-
+            return
+        self._schedule_post_launch_register(title, path, exe, images, ratio)
     def on_launch_empty_instance(self):
         """
         Demande un nom, crée une InstanceState 'vide' (manual_empty=True), lance EXE en console
@@ -11760,10 +11708,6 @@ class SnowMasterGUI(QWidget):
             pass
         self._refresh_one_card(title)
         self.update_global_dot()
-        try:
-            QApplication.processEvents()
-        except Exception:
-            pass
 
         # thread qui lance et surveille le process (--title + --empty pour restauration voyant bleu)
         def _run_and_monitor():
@@ -11882,7 +11826,6 @@ class SnowMasterGUI(QWidget):
 
         t = threading.Thread(target=_run_and_monitor, daemon=True)
         t.start()
-
     def _run_async(self, func, *args, **kwargs):
         def _job():
             try:
@@ -12028,7 +11971,7 @@ class SnowMasterGUI(QWidget):
         """Scan périodique : léger (PID/HWND) + complet (doublons) tous les N ticks."""
         self._scan_pid_light_counter = getattr(self, "_scan_pid_light_counter", 0) + 1
         full_every = max(
-            1, int(_prefs.get("instances", {}).get("scan_pid_full_every", 4))
+            1, int(_prefs.get("instances", {}).get("scan_pid_full_every", 10))
         )
         do_full = self._scan_pid_light_counter % full_every == 0
         self._run_async(lambda full=do_full: self._scan_pids_worker(do_full=full))
@@ -12231,10 +12174,19 @@ class SnowMasterGUI(QWidget):
                         scan_log(
                             f"[SCAN_PIDS] '{title}': ⚠️ DOUBLONS détectés ({len(title_procs)} processus)"
                         )
-                        # Doublons détectés - les kill tous
-                        self._kill_duplicate_processes(title, title_procs)
+                        # Garder le PID stocké sur l'instance (dernier lancé / détails),
+                        # ne tuer que les orphelins — pas de relance si le PID gardé vit.
+                        keep_pid = inst_data.get("pid")
+                        kept = self._kill_duplicate_processes(
+                            title, title_procs, keep_pid=keep_pid
+                        )
+                        if kept:
+                            scan_log(
+                                f"[SCAN_PIDS] '{title}': doublons nettoyés, PID gardé={kept}"
+                            )
+                            continue
                         scan_log(
-                            f"[SCAN_PIDS] '{title}': Résolution du controller_path..."
+                            f"[SCAN_PIDS] '{title}': aucun PID gardé vivant → relance..."
                         )
                         if inst_data.get("manual_empty"):
                             actions_to_perform.append(
@@ -12405,13 +12357,44 @@ class SnowMasterGUI(QWidget):
             except Exception as e:
                 app_log_error(f"[RESET] Erreur reset {title}: {e}")
 
-    def _kill_duplicate_processes(self, title: str, proc_list: List[dict]):
-        """Kill tous les processus dupliqués pour un titre donné."""
+    def _kill_duplicate_processes(
+        self, title: str, proc_list: List[dict], keep_pid: Optional[int] = None
+    ) -> Optional[int]:
+        """Tue les process du même --title sauf le PID à conserver (celui des détails).
+
+        Returns:
+            Le PID gardé s'il est encore vivant après nettoyage, sinon None
+            (appelant pourra relancer).
+        """
+        keep_int: Optional[int] = None
+        try:
+            if keep_pid:
+                keep_int = int(keep_pid)
+        except Exception:
+            keep_int = None
+
+        # Si le PID stocké n'est pas vivant, ne pas le « garder » : on devra relancer.
+        if keep_int and not is_pid_alive(keep_int):
+            scan_log(
+                f"[KILL_DUPLICATES] '{title}': PID stocké={keep_int} mort — aucun keep"
+            )
+            keep_int = None
+
+        keep_set = set()
+        if keep_int:
+            keep_set.add(keep_int)
+            try:
+                for ch in psutil.Process(keep_int).children(recursive=True):
+                    keep_set.add(int(ch.pid))
+            except Exception:
+                pass
+
         scan_log(
-            f"[KILL_DUPLICATES] '{title}': Tentative de kill de {len(proc_list)} processus..."
+            f"[KILL_DUPLICATES] '{title}': {len(proc_list)} process, keep={keep_int}"
         )
         killed_pids = []
         failed_pids = []
+        kept_info = None
 
         for info in proc_list:
             pid = info.get("pid")
@@ -12419,20 +12402,31 @@ class SnowMasterGUI(QWidget):
                 scan_log(f"[KILL_DUPLICATES] '{title}': Process sans PID ignoré")
                 continue
             try:
-                scan_log(f"[KILL_DUPLICATES] '{title}': Kill PID {pid}...")
-                terminate_process_tree(int(pid), timeout=3.0)
-                killed_pids.append(pid)
-                scan_log(f"[KILL_DUPLICATES] '{title}': ✓ PID {pid} tué")
+                pid_int = int(pid)
+            except Exception:
+                continue
+            if pid_int in keep_set:
+                kept_info = info
+                scan_log(f"[KILL_DUPLICATES] '{title}': conserve PID {pid_int}")
+                continue
+            try:
+                scan_log(f"[KILL_DUPLICATES] '{title}': Kill PID {pid_int}...")
+                terminate_process_tree(pid_int, timeout=3.0)
+                killed_pids.append(pid_int)
+                scan_log(f"[KILL_DUPLICATES] '{title}': ✓ PID {pid_int} tué")
             except Exception as e:
-                scan_log(f"[KILL_DUPLICATES] '{title}': ✗ Échec kill PID {pid}: {e}")
-                failed_pids.append(pid)
+                scan_log(
+                    f"[KILL_DUPLICATES] '{title}': ✗ Échec kill PID {pid_int}: {e}"
+                )
+                failed_pids.append(pid_int)
 
         if killed_pids:
             scan_log(
-                f"[KILL_DUPLICATES] '{title}': ✓ {len(killed_pids)} processus tués: {killed_pids}"
+                f"[KILL_DUPLICATES] '{title}': ✓ {len(killed_pids)} orphelins tués: {killed_pids}"
             )
             app_log_warn(
-                f"[SCAN_PIDS] Doublons nettoyés pour '{title}' (PIDs={killed_pids})"
+                f"[SCAN_PIDS] Doublons nettoyés pour '{title}' "
+                f"(killed={killed_pids}, keep={keep_int})"
             )
 
         if failed_pids:
@@ -12440,9 +12434,30 @@ class SnowMasterGUI(QWidget):
                 f"[KILL_DUPLICATES] '{title}': ⚠️ {len(failed_pids)} échecs: {failed_pids}"
             )
 
-        # Mettre à jour l'état
-        scan_log(f"[KILL_DUPLICATES] '{title}': Marquage comme stoppée...")
+        if keep_int and is_pid_alive(keep_int):
+            # Réaligner hwnd éventuel sans toucher au statut running
+            try:
+                hwnd = None
+                if kept_info:
+                    hwnd = kept_info.get("hwnd")
+                with _state_lock:
+                    inst = _instances.get(title)
+                    if inst and not inst.stopped:
+                        inst.pid = keep_int
+                        if hwnd:
+                            try:
+                                inst.hwnd = int(hwnd)
+                            except Exception:
+                                pass
+                        _instances[title] = inst
+            except Exception:
+                pass
+            return keep_int
+
+        # Rien à garder : marque stoppée pour permettre une relance propre
+        scan_log(f"[KILL_DUPLICATES] '{title}': aucun PID gardé — marquage stoppée")
         self._mark_instance_stopped(title)
+        return None
 
     def _resolve_controller_path(
         self, title: str, current_path: Optional[str]
@@ -12578,7 +12593,11 @@ class SnowMasterGUI(QWidget):
             app_log_error(f"[RESET] Relaunch failed for {title}: {e}")
 
     def _enforce_unique_title_processes(self, title: str) -> bool:
-        """Supprime les processus AnkaBot dupliqués partageant le même --title."""
+        """Legacy : tue tous les process du même --title puis marque stoppé.
+
+        Non utilisé au lancement (trop lourd / dangereux post-spawn).
+        Les doublons sont gérés par le scan PID périodique (garde le PID stocké).
+        """
         if not title:
             return False
         try:
@@ -12685,6 +12704,11 @@ class SnowMasterGUI(QWidget):
     ) -> Tuple[
         Optional["InstanceState"], Optional[str], Optional[str], Optional[str], float
     ]:
+        """Retourne (inst, controller, exe, images, ratio).
+
+        Au démarrage, autoload remplit déjà controller/exe en mémoire.
+        Relecture de instances.json uniquement si un champ manque.
+        """
         with _state_lock:
             inst = _instances.get(title)
             if not inst:
