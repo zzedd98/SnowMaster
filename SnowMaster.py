@@ -3487,11 +3487,41 @@ else:
     APP_ALERT_TAG = "SNOWMASTER"
 
 
-def format_instance_window_title(title: str) -> str:
-    """Titre fenêtre du client orchestré ({title} - SnowBot|AnkaBot), selon appVariant."""
+def format_exe_dir_label(exe_path: Optional[str] = None) -> str:
+    """Nom du dossier contenant l'exe (ex. ankabotpc2/ankabot.exe → ankabotpc2)."""
+    path = (exe_path or "").strip() or (EXE or "").strip()
+    if not path:
+        return "-"
+    try:
+        folder = os.path.basename(
+            os.path.normpath(os.path.dirname(os.path.abspath(path)))
+        )
+        return folder or "-"
+    except Exception:
+        return "-"
+
+
+def format_instance_window_title(title: str, exe_path: Optional[str] = None) -> str:
+    """Titre fenêtre du client : '{title} - {dossierExe}' (fallback APP_EXE_NAME)."""
     t = (title or "").strip()
-    client = APP_EXE_NAME or "SnowBot"
-    return f"{t} - {client}" if t else client
+    folder = format_exe_dir_label(exe_path)
+    if not folder or folder == "-":
+        folder = APP_EXE_NAME or "SnowBot"
+    return f"{t} - {folder}" if t else folder
+
+
+def _resolve_instance_exe_path(title: str) -> Optional[str]:
+    """Exe effectif d'une instance (exe_path instance, sinon EXE settings)."""
+    try:
+        with _state_lock:
+            inst = _instances.get(title) if title else None
+            if inst:
+                p = (getattr(inst, "exe_path", None) or "").strip()
+                if p:
+                    return p
+    except Exception:
+        pass
+    return (EXE or "").strip() or None
 
 
 # Identifiant de build : généré automatiquement en CI dans version.txt (PyInstaller --add-data).
@@ -5212,8 +5242,8 @@ def apply_dark_blue_style(app: QApplication):
                         stop:0 rgba(6,78,59,0.98), stop:1 rgba(5,150,105,0.98));
             border: 1px solid rgba(16,185,129,0.35);
             color: #e7fef5;
-            font-weight: 700;
-            font-size: 14px;
+            font-weight: 800;
+            font-size: 17px;
         }
         QLabel#EuroBigCounter:hover {
             border-color: rgba(16,185,129,0.55);
@@ -12648,18 +12678,7 @@ class SnowMasterGUI(QWidget):
     @staticmethod
     def _format_exe_dir_label(exe_path: Optional[str]) -> str:
         """Nom du dossier contenant l'exe (ex. ankabotpc2/ankabot.exe → ankabotpc2)."""
-        path = (exe_path or "").strip()
-        if not path:
-            path = (EXE or "").strip()
-        if not path:
-            return "-"
-        try:
-            folder = os.path.basename(
-                os.path.normpath(os.path.dirname(os.path.abspath(path)))
-            )
-            return folder or "-"
-        except Exception:
-            return "-"
+        return format_exe_dir_label(exe_path)
 
     def _get_instance_launch_params(
         self, title: str
@@ -14378,13 +14397,13 @@ def _log_empty(msg: str):
 
 def _set_empty_instance_window_title(main_hwnd, title, log_prefix=None):
     """
-    Renomme la fenêtre de l'instance vide en "{title} - <client>" (APP_EXE_NAME) :
+    Renomme la fenêtre de l'instance vide en "{title} - {dossierExe}" :
     - vérifie que le hwnd est valide,
     - attend un court délai après /register (l'app peut réécrire le titre),
     - plusieurs tentatives espacées pour contrer un éventuel ré-écriture par l'app.
     """
     prefix = f"[{log_prefix}]" if log_prefix else ""
-    desired = format_instance_window_title(title)
+    desired = format_instance_window_title(title, _resolve_instance_exe_path(title))
     if not win32gui.IsWindow(main_hwnd):
         _log_empty(f"{prefix} SetWindowText ignoré: hwnd={main_hwnd} invalide")
         return
@@ -14664,9 +14683,12 @@ def run_snowbot_flow(
             bring_to_front(main_hwnd)
         time.sleep(0.35)
 
-        # Renommer la fenêtre avec le titre de l'instance (SnowBot / AnkaBot selon appVariant)
+        # Renommer la fenêtre : "{title} - {dossierExe}" (même libellé que Détails)
         try:
-            win32gui.SetWindowText(main_hwnd, format_instance_window_title(title))
+            win32gui.SetWindowText(
+                main_hwnd,
+                format_instance_window_title(title, _resolve_instance_exe_path(title)),
+            )
         except Exception:
             pass  # Ignorer les erreurs de renommage
 
