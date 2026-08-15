@@ -255,6 +255,190 @@ scan_pids_logger.setLevel(logging.DEBUG)
 if not scan_pids_logger.handlers:
     scan_pids_logger.addHandler(logging.NullHandler())
 
+# ----- Console debug UI (capture uniquement si cochée) -----
+_UI_LOG_MAX = 4000
+_ui_log_buffer: Deque[str] = deque(maxlen=_UI_LOG_MAX)
+_ui_log_lock = threading.Lock()
+_ui_log_bridge = None  # LogBridge
+_ui_log_capture_enabled = False
+_orig_stdout = None
+_orig_stderr = None
+
+# Contexte logs lancement (thread-local) → "[PID - Titre] message"
+_flow_log_tls = threading.local()
+
+
+class LogBridge(QObject):
+    """Pont thread-safe : émet les lignes de log vers la console UI."""
+
+    line = Signal(str)
+
+
+class UiLogHandler(logging.Handler):
+    """Handler logging → buffer UI (seulement si capture activée)."""
+
+    def emit(self, record):
+        if not _ui_log_capture_enabled:
+            return
+        try:
+            msg = self.format(record)
+        except Exception:
+            msg = str(getattr(record, "msg", record))
+        _ui_log_append(msg)
+
+
+class _StdoutTee:
+    """Duplique stdout/stderr vers la console UI si capture activée."""
+
+    def __init__(self, stream, prefix: str = ""):
+        self._stream = stream
+        self._prefix = prefix
+        self._buf = ""
+
+    def write(self, data):
+        try:
+            if self._stream is not None:
+                self._stream.write(data)
+                try:
+                    self._stream.flush()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if not _ui_log_capture_enabled:
+            return len(data) if data is not None else 0
+        try:
+            text = str(data)
+        except Exception:
+            return 0
+        if not text:
+            return 0
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.rstrip("\r")
+            if line:
+                _ui_log_append(f"{self._prefix}{line}" if self._prefix else line)
+        return len(text)
+
+    def flush(self):
+        try:
+            if self._stream is not None:
+                self._stream.flush()
+        except Exception:
+            pass
+        if not _ui_log_capture_enabled:
+            self._buf = ""
+            return
+        if self._buf.strip():
+            _ui_log_append(
+                f"{self._prefix}{self._buf.rstrip()}"
+                if self._prefix
+                else self._buf.rstrip()
+            )
+            self._buf = ""
+
+    def isatty(self):
+        try:
+            return bool(self._stream and self._stream.isatty())
+        except Exception:
+            return False
+
+    @property
+    def encoding(self):
+        return getattr(self._stream, "encoding", "utf-8")
+
+
+def _ui_log_append(line: str):
+    """Écrit dans le buffer console UI uniquement si la capture est activée."""
+    if not _ui_log_capture_enabled:
+        return
+    try:
+        ts = datetime.now().strftime("%H:%M:%S")
+    except Exception:
+        ts = "--:--:--"
+    text = str(line).rstrip("\n\r")
+    if not text:
+        return
+    if len(text) >= 8 and text[2] == ":" and text[5] == ":":
+        formatted = text
+    else:
+        formatted = f"[{ts}] {text}"
+    with _ui_log_lock:
+        _ui_log_buffer.append(formatted)
+    bridge = _ui_log_bridge
+    if bridge is not None:
+        try:
+            bridge.line.emit(formatted)
+        except Exception:
+            pass
+
+
+def _install_ui_log_capture():
+    """Installe tee stdout/stderr + handler logging (idempotent)."""
+    global _ui_log_bridge, _orig_stdout, _orig_stderr
+    if _ui_log_bridge is None:
+        _ui_log_bridge = LogBridge()
+    fmt = logging.Formatter("%(levelname)s %(name)s: %(message)s")
+    handler = UiLogHandler()
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(fmt)
+    for lg in (logger,):
+        if not any(isinstance(h, UiLogHandler) for h in lg.handlers):
+            lg.addHandler(handler)
+    if _orig_stdout is None:
+        _orig_stdout = sys.stdout
+        _orig_stderr = sys.stderr
+        sys.stdout = _StdoutTee(_orig_stdout)
+        sys.stderr = _StdoutTee(_orig_stderr)
+
+
+def enable_ui_log_capture():
+    """Active l'écriture vers la console UI (+ installe le tee si besoin)."""
+    global _ui_log_capture_enabled
+    _install_ui_log_capture()
+    _ui_log_capture_enabled = True
+
+
+def disable_ui_log_capture():
+    """Coupe l'écriture vers la console UI (plus rien n'est bufferisé)."""
+    global _ui_log_capture_enabled
+    _ui_log_capture_enabled = False
+
+
+def debug_console_visible_pref() -> bool:
+    try:
+        return bool(_prefs.get("ui", {}).get("debug_console_visible", False))
+    except Exception:
+        return False
+
+
+def set_flow_log_context(title: Optional[str] = None, pid=None) -> None:
+    """Définit le préfixe des logs de lancement pour le thread courant."""
+    if title is not None:
+        _flow_log_tls.title = str(title)
+    if pid is not None:
+        try:
+            _flow_log_tls.pid = int(pid)
+        except Exception:
+            _flow_log_tls.pid = pid
+
+
+def clear_flow_log_context() -> None:
+    _flow_log_tls.title = None
+    _flow_log_tls.pid = None
+
+
+def flow_log(msg: str) -> None:
+    """Log clair de lancement : [PID - Titre] message."""
+    title = getattr(_flow_log_tls, "title", None) or "?"
+    pid = getattr(_flow_log_tls, "pid", None)
+    prefix = f"[{pid} - {title}]" if pid is not None else f"[? - {title}]"
+    try:
+        print(f"{prefix} {msg}")
+    except Exception:
+        pass
+
 
 def scan_log(msg):
     """Log du scan des PIDs (console uniquement, plus de fichier dédié)."""
@@ -445,6 +629,7 @@ DEFAULT_PREFS = {
         "right_panel_visible": True,  # panneau droite Sous-contrôleurs / détails
         "compact_instances": False,  # cartes instances sans boutons (plus étroites)
         "always_on_top": False,  # garder SnowMaster au-dessus des autres fenêtres
+        "debug_console_visible": False,  # fenêtre console + capture logs (seulement si coché)
         "refresh_interval_active_ms": 1000,
         "refresh_interval_inactive_ms": 2500,  # fenêtre inactive / minimisée
         "bus_coalesce_ms": 300,  # regroupement des heartbeats avant refresh UI
@@ -1180,15 +1365,14 @@ def click_connexion_button(
         )
         if btn:
             if _bm_click(btn):
-                print(f"[EARLY CLICK] BM_CLICK sur hwnd bouton={btn}")
+                flow_log("Clic sur Connexion")
                 return True
             else:
-                print("[WARN] BM_CLICK sans effet, tentative WM_COMMAND(BN_CLICKED)")
                 if _send_bn_clicked_to_parent(btn):
-                    print(f"[EARLY CLICK] WM_COMMAND vers parent du bouton child={btn}")
+                    flow_log("Clic sur Connexion")
                     return True
-    except Exception as e:
-        print(f"[WARN] path bouton failed: {e}")
+    except Exception:
+        pass
 
     return False
 
@@ -1255,8 +1439,8 @@ def _bm_click(hwnd_button: int) -> bool:
             pass
         win32gui.SendMessage(hwnd_button, win32con.BM_CLICK, 0, 0)
         return True
-    except Exception as e:
-        print(f"[WARN] _bm_click failed: {e}")
+    except Exception:
+        return False
         return False
 
 
@@ -1308,19 +1492,13 @@ def click_ankabot_open_gestionnaire_toolbar_bg(main_hwnd: int) -> bool:
     )
     btn = _find_best_winforms_button_by_hint_substrings(main_hwnd, hints)
     if not btn:
-        print("[ANKA-GEST] aucun bouton WinForms candidat (hints gestionnaire/comptes)")
         return False
-    try:
-        print("[ANKA-GEST] candidat hwnd=0x%08X text=%r" % (btn, _safe_get_text(btn)))
-    except Exception:
-        pass
     if _bm_click(btn):
-        print("[ANKA-GEST] BM_CLICK OK")
+        flow_log("Ouverture gestionnaire de comptes V1")
         return True
     if _send_bn_clicked_to_parent(btn):
-        print("[ANKA-GEST] WM_COMMAND fallback OK")
+        flow_log("Ouverture gestionnaire de comptes V2")
         return True
-    print("[ANKA-GEST] échec BM_CLICK et WM_COMMAND")
     return False
 
 
@@ -1374,10 +1552,8 @@ def background_command_click_by_relative(
             if child and win32gui.IsWindow(child):
                 if send_command_to_top_by_child(child):
                     return True
-        print("[BG-CMD] aucun child sous le point")
         return False
     except Exception as e:
-        print(f"[BG-CMD] error: {e}")
         return False
 
 
@@ -1430,18 +1606,13 @@ def send_command_to_top_by_child(child_hwnd: int) -> bool:
                     ctrl_id = 0
         top = _get_toplevel(child_hwnd)
         if ctrl_id == 0 or not top:
-            print(f"[WM_COMMAND] pas d’ID exploitable (child=0x{child_hwnd:08X})")
             return False
         # wParam = (HIWORD=notification=0, LOWORD=ID)
         wparam = (0 << 16) | (ctrl_id & 0xFFFF)
         # lParam = HWND du child (classique pour owner-draw)
         win32gui.SendMessage(top, win32con.WM_COMMAND, wparam, child_hwnd)
-        print(
-            f"[WM_COMMAND] id={ctrl_id} → top=0x{top:08X} (lParam=0x{child_hwnd:08X})"
-        )
         return True
     except Exception as e:
-        print(f"[WM_COMMAND] error: {e}")
         return False
 
 
@@ -1544,10 +1715,12 @@ def click_child_by_text(
                     # 1) si vrai bouton WinForms/Win32
                     if cls.startswith("WindowsForms10.BUTTON") or cls == "Button":
                         if _bm_click(h):
+                            flow_log(f"Clic sur « {txt.strip() or 'bouton'} »")
                             return True
                     # 2) fallback WM_COMMAND
                     # if _send_command_to_top_by_child(h):
                     if send_command_to_top_by_child(h):
+                        flow_log(f"Clic sur « {txt.strip() or 'bouton'} »")
                         return True
             except Exception:
                 pass
@@ -1572,12 +1745,16 @@ def close_gestionnaire_dialog(dlg_hwnd: int) -> bool:
             # on laisse 200–400ms au form pour se fermer si c'est bien un 'OK'
             time.sleep(0.35)
             if not win32gui.IsWindow(dlg_hwnd):
+                flow_log("Fermeture gestionnaire de comptes")
                 return True
             # parfois le form reste ouvert (ex: validation non bloquante) -> on continue
     # fallback soft
     win32gui.SendMessage(dlg_hwnd, win32con.WM_CLOSE, 0, 0)
     time.sleep(0.2)
-    return not win32gui.IsWindow(dlg_hwnd)
+    closed = not win32gui.IsWindow(dlg_hwnd)
+    if closed:
+        flow_log("Fermeture gestionnaire de comptes")
+    return closed
 
 
 #################################################### jusque la tout est utilisé
@@ -1691,10 +1868,8 @@ def find_open_dialog_for_instance(main_hwnd: int, timeout: float = 5.0) -> int |
         win32gui.EnumWindows(enum_cb, None)
         if found:
             dlg = found[-1]  # la plus haute dans le z-order
-            print(f"[OPEN] cible=0x{dlg:08X} cls='{_class(dlg)}' title='{_text(dlg)}'")
             return dlg
         time.sleep(0.05)
-    print("[OPEN] dialog introuvable (ciblage PID/owner)")
     return None
 
 
@@ -1702,12 +1877,10 @@ def find_open_dialog_for_instance(main_hwnd: int, timeout: float = 5.0) -> int |
 def find_filename_edit(dlg: int) -> int | None:
     h = win32gui.GetDlgItem(dlg, EDT_FILENAME)
     if h and win32gui.IsWindow(h):
-        print(f"[OPEN] edit par ID (0x{EDT_FILENAME:04X}) = 0x{h:08X}")
         return h
     # fallback: 1er Edit en bas de la boîte
     edits = [c for c in _enum_children(dlg) if _class(c) == "Edit"]
     if not edits:
-        print("[OPEN] aucun Edit trouvé")
         return None
 
     # on prend l’Edit avec la coordonnée 'top' la plus grande (le plus bas)
@@ -1719,7 +1892,6 @@ def find_filename_edit(dlg: int) -> int | None:
 
     edits.sort(key=_top)
     h = edits[-1]
-    print(f"[OPEN] edit fallback = 0x{h:08X}")
     return h
 
 
@@ -1727,10 +1899,10 @@ def find_filename_edit(dlg: int) -> int | None:
 def press_open_ok(dlg: int) -> bool:
     try:
         win32gui.SendMessage(dlg, win32con.WM_COMMAND, IDOK, 0)
-        print("[OPEN] WM_COMMAND(IDOK) envoyé")
+        flow_log("Clic sur le bouton OK")
         return True
-    except Exception as e:
-        print(f"[OPEN] IDOK échec: {e}")
+    except Exception:
+        pass
         # fallback: bouton “Ouvrir”
         for c in _enum_children(dlg):
             if _class(c).startswith("Button") and _text(c).strip().lower() in (
@@ -1740,7 +1912,7 @@ def press_open_ok(dlg: int) -> bool:
                 "&open",
             ):
                 win32gui.SendMessage(c, win32con.BM_CLICK, 0, 0)
-                print(f"[OPEN] BM_CLICK sur bouton 0x{c:08X}")
+                flow_log("Clic sur le bouton OK")
                 return True
     return False
 
@@ -1749,32 +1921,32 @@ def press_open_ok(dlg: int) -> bool:
 def open_file_via_dialog_bg(main_hwnd: int, fullpath: str) -> bool:
     # normaliser → chemins Windows sans guillemets ni slashs
     want = os.path.normpath(fullpath.strip().strip('"')).replace("/", "\\")
-    print(f"[OPEN-ASYNC] want='{want}'")
+    flow_log(f"Ouverture du script: {os.path.basename(want)}")
 
     dlg = find_open_dialog_for_instance(main_hwnd, timeout=4.0)
     if not dlg:
+        flow_log("Dialogue Ouvrir introuvable")
         return False
 
     ed = find_filename_edit(dlg)
     if not ed:
+        flow_log("Champ fichier introuvable")
         return False
 
     # WM_SETTEXT direct (pas de guillemets)
     try:
         win32gui.SendMessage(ed, win32con.WM_SETTEXT, 0, want)
-        print("[OPEN] WM_SETTEXT OK (Nom du fichier)")
-    except Exception as e:
-        print(f"[OPEN] SETTEXT échec: {e}")
+    except Exception:
+        flow_log("Échec saisie du chemin script")
         return False
 
     if not press_open_ok(dlg):
-        print("[OPEN] validation KO")
+        flow_log("Échec validation dialogue Ouvrir")
         return False
 
     # laisser le temps de traiter
     time.sleep(0.25)
-    still = win32gui.IsWindow(dlg) and win32gui.IsWindowVisible(dlg)
-    print("[OPEN] terminé, dialog encore visible ?", still)
+    flow_log("Script chargé")
     return True
 
 
@@ -1855,7 +2027,6 @@ def click_script_loader_icon_async(
         if hgt <= max_h and w <= max_w and ymin <= t <= ymax:
             icons.append((h, rc))
     if not icons:
-        print("[ICON-ASYNC] aucune icône trouvée")
         return False
 
     # tri gauche→droite
@@ -1872,12 +2043,8 @@ def click_script_loader_icon_async(
     wparam = ((BN_CLICKED & 0xFFFF) << 16) | (cid & 0xFFFF)
     try:
         PostMessageW(parent, win32con.WM_COMMAND, wparam, h_btn)
-        print(
-            f"[ICON-ASYNC] Post WM_COMMAND(BN_CLICKED) parent=0x{parent:08X} child=0x{h_btn:08X} id={cid} rect={rc_btn}"
-        )
         return True
-    except Exception as e:
-        print(f"[ICON-ASYNC] post failed: {e}")
+    except Exception:
         return False
 
 
@@ -1953,7 +2120,6 @@ def _try_bm_click(child: int) -> bool:
         win32gui.SendMessage(child, win32con.BM_CLICK, 0, 0)
         return True
     except Exception as e:
-        print(f"[BG] BM_CLICK failed: {e}")
         return False
 
 
@@ -1970,7 +2136,6 @@ def _try_wm_command_bn_clicked(target_parent: int, child: int) -> bool:
         win32gui.SendMessage(target_parent, win32con.WM_COMMAND, wparam, child)
         return True
     except Exception as e:
-        print(f"[BG] WM_COMMAND(BN_CLICKED) failed: {e}")
         return False
 
 
@@ -1986,7 +2151,6 @@ def _try_wm_command_neutral(target_parent: int, child: int) -> bool:
         win32gui.SendMessage(target_parent, win32con.WM_COMMAND, wparam, child)
         return True
     except Exception as e:
-        print(f"[BG] WM_COMMAND(neutral) failed: {e}")
         return False
 
 
@@ -2027,9 +2191,6 @@ def background_click_robust_by_relative(
                 cid = win32gui.GetDlgCtrlID(child) or 0
             except:
                 cid = 0
-            print(
-                f"[BG] hit child=0x{child:08X} class='{cls}' text='{txt}' id={cid} cwp={fl}"
-            )
 
             top = win32gui.GetAncestor(child, win32con.GA_ROOT) or parent_hwnd
             par = win32gui.GetParent(child) or 0
@@ -2037,33 +2198,24 @@ def background_click_robust_by_relative(
             # 1) vrai bouton ?
             if cls.startswith("WindowsForms10.BUTTON") or cls == "Button":
                 if _try_bm_click(child):
-                    print("[BG] BM_CLICK sent")
                     return True
                 if _try_wm_command_bn_clicked(top, child):
-                    print("[BG] WM_COMMAND(BN_CLICKED) to top OK")
                     return True
                 if par and _try_wm_command_bn_clicked(par, child):
-                    print("[BG] WM_COMMAND(BN_CLICKED) to parent OK")
                     return True
 
             # 2) pas un bouton → owner-draw/menu/panel : on force BN_CLICKED via ID
             if _try_wm_command_bn_clicked(top, child):
-                print("[BG] WM_COMMAND(BN_CLICKED) to top OK")
                 return True
             if _try_wm_command_neutral(top, child):
-                print("[BG] WM_COMMAND(neutral) to top OK")
                 return True
             if par and _try_wm_command_bn_clicked(par, child):
-                print("[BG] WM_COMMAND(BN_CLICKED) to parent OK")
                 return True
             if par and _try_wm_command_neutral(par, child):
-                print("[BG] WM_COMMAND(neutral) to parent OK")
                 return True
 
-        print("[BG] aucun child sous le point / hit-test épuisé")
         return False
     except Exception as e:
-        print(f"[BG] error: {e}")
         return False
 
 
@@ -2153,15 +2305,11 @@ def click_child_by_id(parent_hwnd: int, ctrl_id: int) -> bool:
     """Re-trouve le bouton par ID puis tente BM_CLICK, sinon WM_COMMAND(BN_CLICKED)."""
     h = _find_child_by_id(parent_hwnd, ctrl_id)
     if not h:
-        print(f"[BTN] id {ctrl_id} introuvable")
         return False
     if _bm_click(h):
-        print(f"[BTN] BM_CLICK id={ctrl_id} hwnd=0x{h:08X}")
         return True
     if _send_bn_clicked_to_parent(h):
-        print(f"[BTN] WM_COMMAND(BN_CLICKED) id={ctrl_id} hwnd=0x{h:08X}")
         return True
-    print(f"[BTN] échec clic id={ctrl_id} hwnd=0x{h:08X}")
     return False
 
 
@@ -2421,15 +2569,14 @@ def activate_controller_by_index_background_strong(
     # 1) resolve tv vivant
     tv = _find_first_treeview(main_hwnd)
     if not tv or not win32gui.IsWindow(tv):
-        print("[TV] introuvable")
+        flow_log("Liste des contrôleurs introuvable")
         return False
 
     # 2) sélection caret
     hitem = _tv_select_by_index_safe(tv, index)
     if not hitem:
-        print(f"[TV] select index={index} impossible")
+        flow_log(f"Sélection contrôleur index {index} impossible")
         return False
-    # print(f"[TV] caret on index={index} hItem=0x{int(hitem):08X}")
 
     # 3) re-resolve une seconde fois pour contrer recréation async
     tv2 = _find_first_treeview(main_hwnd)
@@ -2459,6 +2606,7 @@ def activate_controller_by_index_background_strong(
     # 7) bonus : notifie aussi le parent
     _notify_parent_nm_dblclk_safe(tv)
 
+    flow_log("Activation du contrôleur")
     return True
 
 
@@ -6948,6 +7096,87 @@ class CollapsibleGroupBox(QWidget):
         self._content_layout.addStretch(stretch)
 
 
+class DebugConsoleDialog(QDialog):
+    """Fenêtre de logs application en temps réel (uniquement si capture activée)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Console — {APP_DISPLAY_NAME}")
+        self.setMinimumSize(720, 420)
+        self.resize(900, 520)
+        self.setWindowFlag(Qt.Window, True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        toolbar = QHBoxLayout()
+        self.btn_clear = QPushButton("Effacer")
+        self.btn_clear.setCursor(Qt.PointingHandCursor)
+        self.btn_clear.clicked.connect(self._clear)
+        self.chk_autoscroll = QCheckBox("Auto-scroll")
+        self.chk_autoscroll.setChecked(True)
+        toolbar.addWidget(self.btn_clear)
+        toolbar.addWidget(self.chk_autoscroll)
+        toolbar.addStretch(1)
+        layout.addLayout(toolbar)
+
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setMaximumBlockCount(_UI_LOG_MAX)
+        self.text.setStyleSheet(
+            "QPlainTextEdit {"
+            " background:#0b1220; color:#e2e8f0;"
+            " border:1px solid rgba(148,163,184,0.28); border-radius:8px;"
+            " font-family: Consolas, 'Courier New', monospace; font-size:12px;"
+            "}"
+        )
+        layout.addWidget(self.text, 1)
+
+        with _ui_log_lock:
+            snapshot = list(_ui_log_buffer)
+        if snapshot:
+            self.text.setPlainText("\n".join(snapshot))
+            self._scroll_to_end()
+
+        if _ui_log_bridge is not None:
+            _ui_log_bridge.line.connect(self._on_line)
+
+    def _on_line(self, line: str):
+        self.text.appendPlainText(line)
+        if self.chk_autoscroll.isChecked():
+            self._scroll_to_end()
+
+    def _scroll_to_end(self):
+        try:
+            cursor = self.text.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.text.setTextCursor(cursor)
+            self.text.ensureCursorVisible()
+        except Exception:
+            pass
+
+    def _clear(self):
+        with _ui_log_lock:
+            _ui_log_buffer.clear()
+        self.text.clear()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+        disable_ui_log_capture()
+        parent = self.parent()
+        try:
+            if parent is not None and hasattr(parent, "chk_debug_console"):
+                parent.chk_debug_console.blockSignals(True)
+                parent.chk_debug_console.setChecked(False)
+                parent.chk_debug_console.blockSignals(False)
+                _prefs.setdefault("ui", {})["debug_console_visible"] = False
+                save_prefs(_prefs)
+        except Exception:
+            pass
+
+
 class HeartbeatHistoryDialog(QDialog):
     """Historique heartbeats d'une instance — refresh manuel, filtres via setHidden (pas de rebuild texte)."""
 
@@ -8604,7 +8833,7 @@ class SnowMasterGUI(QWidget):
         )
         self.chk_hb_history.stateChanged.connect(self.on_toggle_hb_history)
 
-        self.chk_euro_counter = QCheckBox("Afficher bouton €")
+        self.chk_euro_counter = QCheckBox("Alertes Discord")
         self.chk_euro_counter.setChecked(euro_counter_visible())
         self.chk_euro_counter.setToolTip(
             "Coché : affiche le bouton vert des revenus (€) dans le header.\n"
@@ -8624,6 +8853,14 @@ class SnowMasterGUI(QWidget):
         )
         self.chk_always_on_top.stateChanged.connect(self.on_toggle_always_on_top)
 
+        self.chk_debug_console = QCheckBox("Afficher la console")
+        self.chk_debug_console.setChecked(debug_console_visible_pref())
+        self.chk_debug_console.setToolTip(
+            "Coché : capture les logs et ouvre la console temps réel.\n"
+            "Décoché : aucune écriture dans la console (rien n'est bufferisé)."
+        )
+        self.chk_debug_console.stateChanged.connect(self.on_toggle_debug_console)
+        self._debug_console_dialog: Optional[DebugConsoleDialog] = None
 
         # Lecture initiale des prefs pour les instances
         instances_prefs = _prefs.get("instances", {})
@@ -8755,6 +8992,7 @@ class SnowMasterGUI(QWidget):
         inst_group_collapsible.addWidget(self.chk_hb_history)
         inst_group_collapsible.addWidget(self.chk_euro_counter)
         inst_group_collapsible.addWidget(self.chk_always_on_top)
+        inst_group_collapsible.addWidget(self.chk_debug_console)
         # inst_group_collapsible.addWidget(self.btn_save_cfg)
         # inst_group_collapsible.addWidget(self.btn_load_cfg)
         # Checkbox: overwrite existing instances when loading a config
@@ -9243,6 +9481,10 @@ class SnowMasterGUI(QWidget):
                 self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
             except Exception:
                 pass
+
+        # Console debug : uniquement si la case est cochée (sinon aucune capture)
+        if self.chk_debug_console.isChecked():
+            QTimer.singleShot(300, self._show_debug_console)
 
     def eventFilter(self, obj, event):
         if obj is self.list and event.type() == QEvent.Resize:
@@ -12670,6 +12912,35 @@ class SnowMasterGUI(QWidget):
             pass
         app_log_info(f"Bouton € {'affiché' if val else 'masqué'}")
 
+    def on_toggle_debug_console(self, _state):
+        val = bool(self.chk_debug_console.isChecked())
+        _prefs.setdefault("ui", {})["debug_console_visible"] = val
+        save_prefs(_prefs)
+        if val:
+            self._show_debug_console()
+        else:
+            self._hide_debug_console()
+
+    def _ensure_debug_console(self) -> DebugConsoleDialog:
+        enable_ui_log_capture()
+        dlg = getattr(self, "_debug_console_dialog", None)
+        if dlg is None:
+            dlg = DebugConsoleDialog(self)
+            self._debug_console_dialog = dlg
+        return dlg
+
+    def _show_debug_console(self):
+        dlg = self._ensure_debug_console()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _hide_debug_console(self):
+        disable_ui_log_capture()
+        dlg = getattr(self, "_debug_console_dialog", None)
+        if dlg is not None:
+            dlg.hide()
+
     def on_toggle_config_panel(self, checked: bool):
         """Affiche / masque le panneau central Configs & Boutons."""
         try:
@@ -13955,6 +14226,7 @@ def wait_for_windows_with_early_register(
     early_connexion_confidence=0.3,  # <— AJOUT
     require_connexion_click_before_loading=False,
 ):
+    set_flow_log_context(title_for_register)
     cmd = [exe_path] + (args or [])
     start_ts = time.time()
     exe_dir = os.path.dirname(os.path.abspath(exe_path)) if exe_path else None
@@ -13966,7 +14238,8 @@ def wait_for_windows_with_early_register(
         text=True,
         cwd=exe_dir,
     )
-    # print(f"PID lancé: {p.pid} @ {datetime.fromtimestamp(start_ts).isoformat()}")
+    set_flow_log_context(title_for_register, p.pid)
+    flow_log("Processus lancé")
     app_log_info(
         "Launched PID=%s @ %s", p.pid, datetime.fromtimestamp(start_ts).isoformat()
     )
@@ -14008,6 +14281,7 @@ def wait_for_windows_with_early_register(
                         )
                         if ok:
                             clicked_connexion_pids.add(cpid)
+                            set_flow_log_context(pid=cpid)
                             if first_click_ts is None:
                                 first_click_ts = time.time()
                             time.sleep(0.2)
@@ -14066,6 +14340,8 @@ def wait_for_windows_with_early_register(
                                 },
                             )
                         early_registered = True
+                        set_flow_log_context(pid=cpid)
+                        flow_log("Fenêtre de lancement détectée")
                         break
                     except Exception:
                         pass
@@ -14079,6 +14355,8 @@ def wait_for_windows_with_early_register(
             for h in find_hwnds_for_pid(cpid):
                 area = get_window_area(h)
                 if area >= threshold:
+                    set_flow_log_context(pid=cpid)
+                    flow_log("Fenêtre principale détectée")
                     return h, cpid
 
         time.sleep(poll_interval)
@@ -14295,91 +14573,89 @@ def run_snowbot_flow(
 ):
     if image_dir is None:
         image_dir = RESOURCES
-    try:
-        main_hwnd, main_pid = wait_for_windows_with_early_register(
-            exe_path=exe_path,
-            title_for_register=title,
-            args=args,
-            poll_interval=0.25,
-            total_timeout=120.0,
-            min_screen_ratio=min_screen_ratio,
-            use_virtual_screen=False,
-            early_connexion_image=(
-                os.path.join(image_dir, "connexion.png")
-                if APP_VARIANT == "ankabot"
-                else None
-            ),
-            early_connexion_confidence=0.3,
-            require_connexion_click_before_loading=(APP_VARIANT == "ankabot"),
-        )
-    except Exception as e:
-        # print("Erreur lancement/extraction fenêtre:", e)
-        try:
-            post_json_with_retry(
-                "/log",
-                {"title": title, "message": f"Erreur lancement: {e}", "level": "ERROR"},
-                retries=2,
-                delay=0.2,
-            )
-        except Exception:
-            pass
-        return
-
-    # print(
-    #     f"Fenêtre principale: HWND={main_hwnd}, Title='{win32gui.GetWindowText(main_hwnd)}', PID={main_pid}"
-    # )
-
-    try:
-        try:
-            post_json_with_retry(
-                "/register",
-                {
-                    "title": title,
-                    "pid": int(main_pid) if main_pid else 0,
-                    "hwnd": int(main_hwnd),
-                    "touch": True,
-                },
-                retries=2,
-                delay=0.2,
-            )
-        except Exception:
-            _post_json(
-                "/register",
-                {
-                    "title": title,
-                    "pid": int(main_pid) if main_pid else 0,
-                    "hwnd": int(main_hwnd),
-                    "touch": True,
-                },
-            )
-    except Exception as e:
-        # print("WARN register (main):", e)
-        pass
-
-    # 1er passage à gauche : dès que la fenêtre principale existe (avant le lock workflow).
-    # Évite de laisser une fenêtre "random" au milieu pendant l'attente du lock.
-    if APP_VARIANT == "ankabot":
-        try:
-            ok_left_prelock = force_window_on_left_screen_no_activate(main_hwnd)
-            print(
-                f"[LEFT] prelock hwnd=0x{int(main_hwnd):08X} ok={ok_left_prelock}"
-            )
-        except Exception:
-            pass
-
+    set_flow_log_context(title)
     acquired = False
     try:
+        try:
+            main_hwnd, main_pid = wait_for_windows_with_early_register(
+                exe_path=exe_path,
+                title_for_register=title,
+                args=args,
+                poll_interval=0.25,
+                total_timeout=120.0,
+                min_screen_ratio=min_screen_ratio,
+                use_virtual_screen=False,
+                early_connexion_image=(
+                    os.path.join(image_dir, "connexion.png")
+                    if APP_VARIANT == "ankabot"
+                    else None
+                ),
+                early_connexion_confidence=0.3,
+                require_connexion_click_before_loading=(APP_VARIANT == "ankabot"),
+            )
+        except Exception as e:
+            flow_log(f"Erreur lancement: {e}")
+            try:
+                post_json_with_retry(
+                    "/log",
+                    {
+                        "title": title,
+                        "message": f"Erreur lancement: {e}",
+                        "level": "ERROR",
+                    },
+                    retries=2,
+                    delay=0.2,
+                )
+            except Exception:
+                pass
+            return
+
+        set_flow_log_context(title, main_pid)
+
+        try:
+            try:
+                post_json_with_retry(
+                    "/register",
+                    {
+                        "title": title,
+                        "pid": int(main_pid) if main_pid else 0,
+                        "hwnd": int(main_hwnd),
+                        "touch": True,
+                    },
+                    retries=2,
+                    delay=0.2,
+                )
+            except Exception:
+                _post_json(
+                    "/register",
+                    {
+                        "title": title,
+                        "pid": int(main_pid) if main_pid else 0,
+                        "hwnd": int(main_hwnd),
+                        "touch": True,
+                    },
+                )
+        except Exception:
+            pass
+
+        # 1er passage à gauche : dès que la fenêtre principale existe (avant le lock workflow).
+        # Évite de laisser une fenêtre "random" au milieu pendant l'attente du lock.
+        if APP_VARIANT == "ankabot":
+            try:
+                force_window_on_left_screen_no_activate(main_hwnd)
+            except Exception:
+                pass
+
+        flow_log("Attente du verrou souris")
         acquire_mouse_lock(owner=title, ttl=180.0)
         acquired = True
+        flow_log("Verrou souris acquis")
 
         def _force_left(where: str):
             if APP_VARIANT != "ankabot":
                 return
             try:
-                ok_left = force_window_on_left_screen_no_activate(main_hwnd)
-                print(
-                    f"[LEFT] {where} hwnd=0x{int(main_hwnd):08X} ok={ok_left}"
-                )
+                force_window_on_left_screen_no_activate(main_hwnd)
             except Exception:
                 pass
 
@@ -14409,10 +14685,11 @@ def run_snowbot_flow(
                 ok = background_click_robust_by_relative(
                     main_hwnd, rx=0.072, ry=0.946, dx=+14, dy=0
                 )
+                if ok:
+                    flow_log("Ouverture gestionnaire de comptes")
             if ok:
                 break
             time.sleep(0.25)
-        # print("BG robust click:", ok)
 
         # Laisse un petit délai, puis re-scanne la boîte :
         if ok:
@@ -14421,7 +14698,7 @@ def run_snowbot_flow(
                 main_hwnd, title_substr="Gestionnaire de comptes", timeout=5.0
             )
             if dlg:
-                # print(f"Dialog trouvé: 0x{dlg:08X} '{win32gui.GetWindowText(dlg)}'")
+                flow_log("Gestionnaire de comptes ouvert")
                 targets = [
                     "Charger un compte contrôleur",
                     "Charger un compte controleur",
@@ -14429,41 +14706,36 @@ def run_snowbot_flow(
                     "Charger un compte",
                     "charger un compte contrôleur",
                 ]
-                ok2 = click_child_by_text(dlg, targets, timeout=2.0)
-                # print("Clique 'Charger un compte contrôleur':", ok2)
-
-                # time.sleep(1)
-
-                ok_close = close_gestionnaire_dialog(dlg)
-                # print("Fermeture gestionnaire:", ok_close)
+                click_child_by_text(dlg, targets, timeout=2.0)
+                close_gestionnaire_dialog(dlg)
             else:
-                pass
-                # print("Boîte 'Gestionnaire de comptes' introuvable.")
+                flow_log("Gestionnaire de comptes introuvable")
 
             time.sleep(0.5)
             # On vise la 1ère ligne visible du panneau gauche (souvent "Contrôleur 1")
-            ok_sel = activate_controller_by_index_background_strong(main_hwnd, index=0)
-            # print("Activate contrôleur (strong):", ok_sel)
+            activate_controller_by_index_background_strong(main_hwnd, index=0)
 
             time.sleep(0.5)
 
             # 1) Clic async sur l’icône “Charger un script” (ta fonction existante)
             ok_icon = click_script_loader_icon_async(main_hwnd, index_from_left=2)
-            # print("Click icône 'Charger un script' (async):", ok_icon)
+            if ok_icon:
+                flow_log("Clic sur Charger un script")
 
             time.sleep(0.5)
 
-            ok = open_file_via_dialog_bg(main_hwnd, controller_path)
-            # print("Open via dialog:", ok)
+            open_file_via_dialog_bg(main_hwnd, controller_path)
 
             time.sleep(0.5)
 
             ok_icon = click_script_loader_icon_async(main_hwnd, index_from_left=3)
-            # print("Click icône 'LANCER un script' (async):", ok_icon)
+            if ok_icon:
+                flow_log("Clic sur Lancer le script")
 
     finally:
         if acquired:
             release_mouse_lock(owner=title)
+        clear_flow_log_context()
 
 
 def run_snowbot_flow_panic(title: str):
