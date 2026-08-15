@@ -388,11 +388,156 @@ def debug_console_visible_pref() -> bool:
 
 
 def pre_launch_scan_enabled() -> bool:
-    """Préférence : scan léger anti-doublon avant un lancement manuel."""
+    """Préférence : check anti-doublon avant un lancement manuel (cache scan périodique)."""
     try:
         return bool(_prefs.get("instances", {}).get("pre_launch_scan", True))
     except Exception:
         return True
+
+
+# Cache du dernier scan PID complet (périodique) — lu par le check pré-lancement
+_process_scan_cache: Dict[str, List[dict]] = {}
+_process_scan_cache_ts: float = 0.0
+_process_scan_cache_lock = threading.Lock()
+
+
+def store_process_scan_cache(processes_by_title: Dict[str, List[dict]]) -> None:
+    """Enregistre le résultat d'un scan périodique complet (par --title)."""
+    global _process_scan_cache, _process_scan_cache_ts
+    snapshot: Dict[str, List[dict]] = {}
+    for k, v in (processes_by_title or {}).items():
+        title = str(k or "").strip()
+        if not title:
+            continue
+        snapshot[title] = [dict(info) for info in (v or []) if isinstance(info, dict)]
+    with _process_scan_cache_lock:
+        _process_scan_cache = snapshot
+        _process_scan_cache_ts = time.time()
+
+
+def process_scan_cache_age_s() -> Optional[float]:
+    with _process_scan_cache_lock:
+        ts = float(_process_scan_cache_ts or 0.0)
+    if ts <= 0:
+        return None
+    return max(0.0, time.time() - ts)
+
+
+def get_cached_processes_for_title(title: str) -> Optional[List[dict]]:
+    """None = aucun scan périodique encore ; sinon liste (éventuellement vide) pour ce titre."""
+    title = (title or "").strip()
+    if not title:
+        return None
+    with _process_scan_cache_lock:
+        if float(_process_scan_cache_ts or 0.0) <= 0:
+            return None
+        return [dict(info) for info in _process_scan_cache.get(title, [])]
+
+
+def remove_pids_from_process_scan_cache(title: str, pids) -> None:
+    """Retire des PID du cache après un kill pré-lancement (évite des relectures mortes)."""
+    title = (title or "").strip()
+    if not title or not pids:
+        return
+    try:
+        drop = {int(p) for p in pids if p}
+    except Exception:
+        return
+    if not drop:
+        return
+    with _process_scan_cache_lock:
+        if float(_process_scan_cache_ts or 0.0) <= 0:
+            return
+        cur = list(_process_scan_cache.get(title, []))
+        kept = []
+        for info in cur:
+            try:
+                pid = int((info or {}).get("pid") or 0)
+            except Exception:
+                continue
+            if pid and pid not in drop:
+                kept.append(info)
+        _process_scan_cache[title] = kept
+
+
+def upsert_process_scan_cache_title(title: str, matches: List[dict]) -> None:
+    """Met à jour le cache pour un titre (après un scan live de secours)."""
+    global _process_scan_cache, _process_scan_cache_ts
+    title = (title or "").strip()
+    if not title:
+        return
+    clean = [dict(info) for info in (matches or []) if isinstance(info, dict)]
+    with _process_scan_cache_lock:
+        if float(_process_scan_cache_ts or 0.0) <= 0:
+            _process_scan_cache = {title: clean}
+            _process_scan_cache_ts = time.time()
+        else:
+            _process_scan_cache[title] = clean
+
+
+def refresh_process_scan_cache_light(
+    instance_rows: List[dict],
+) -> None:
+    """Rafraîchit le cache sans énumération globale (scan périodique léger).
+
+    - retire les PID morts du cache existant
+    - synchronise les PID/HWND encore vivants des fiches actives
+    Ne découvre pas les orphelins --title (réservé au scan complet).
+    """
+    global _process_scan_cache, _process_scan_cache_ts
+    rows = list(instance_rows or [])
+    with _process_scan_cache_lock:
+        # 1) Purger les morts si un cache existe
+        if float(_process_scan_cache_ts or 0.0) > 0:
+            for title, procs in list(_process_scan_cache.items()):
+                kept: List[dict] = []
+                for info in procs or []:
+                    try:
+                        pid = int((info or {}).get("pid") or 0)
+                    except Exception:
+                        continue
+                    if pid and is_pid_alive(pid):
+                        kept.append(dict(info))
+                _process_scan_cache[title] = kept
+
+        # 2) Synchroniser les fiches actives (pid stocké vivant)
+        for row in rows:
+            try:
+                title = str((row or {}).get("title") or "").strip()
+                pid = int((row or {}).get("pid") or 0)
+            except Exception:
+                continue
+            if not title or not pid or not is_pid_alive(pid):
+                continue
+            hwnd = (row or {}).get("hwnd")
+            try:
+                hwnd_i = int(hwnd) if hwnd else None
+            except Exception:
+                hwnd_i = None
+            cur = list(_process_scan_cache.get(title, []))
+            found = False
+            for info in cur:
+                try:
+                    if int((info or {}).get("pid") or 0) == pid:
+                        if hwnd_i:
+                            info["hwnd"] = hwnd_i
+                        info["title"] = title
+                        found = True
+                        break
+                except Exception:
+                    continue
+            if not found:
+                cur.append(
+                    {
+                        "pid": pid,
+                        "hwnd": hwnd_i,
+                        "title": title,
+                    }
+                )
+            _process_scan_cache[title] = cur
+
+        if _process_scan_cache:
+            _process_scan_cache_ts = time.time()
 
 
 def aggressive_duplicate_kill_enabled() -> bool:
@@ -562,7 +707,7 @@ DEFAULT_PREFS = {
         "overwrite_on_load": True,  # si True -> écrase les instances existantes lors du chargement d'une config
         "scan_pid_interval_ms": 30000,  # scan léger PID/HWND (ms)
         "scan_pid_full_every": 10,  # 1 scan complet (doublons) tous les N légers (~5 min si 30s)
-        "pre_launch_scan": True,  # avant lancement manuel : tuer d'éventuels PID --title restants
+        "pre_launch_scan": True,  # check pré-lancement manuel via cache du scan périodique
         "aggressive_duplicate_kill": False,  # True = kill TOUS les doublons + relance
     },
     # Configuration pour Discord : envoi de hook quand le voyant global passe au rouge
@@ -9228,11 +9373,13 @@ class SnowMasterGUI(QWidget):
         self.chk_debug_console.stateChanged.connect(self.on_toggle_debug_console)
         self._debug_console_dialog: Optional[DebugConsoleDialog] = None
 
-        self.chk_pre_launch_scan = QCheckBox("Scan pré lancement")
+        self.chk_pre_launch_scan = QCheckBox("Check pré lancement")
         self.chk_pre_launch_scan.setChecked(pre_launch_scan_enabled())
         self.chk_pre_launch_scan.setToolTip(
             "Coché : avant un lancement manuel (Relancer / Relancer tout / nouvelle instance),\n"
-            "scanne les process --title et ferme les anciens PID encore ouverts.\n"
+            "vérifie les process --title via le dernier scan périodique (sans rescan),\n"
+            "et ferme les anciens PID encore ouverts.\n"
+            "Si aucun scan périodique n'a encore tourné : scan ciblé une seule fois.\n"
             "N'affecte pas les resets ni les relances automatiques."
         )
         self.chk_pre_launch_scan.stateChanged.connect(self.on_toggle_pre_launch_scan)
@@ -11662,7 +11809,7 @@ class SnowMasterGUI(QWidget):
         self._schedule_post_launch_register(title, controller, exe, images, ratio)
 
     def _pre_launch_scan_kill(self, title: str) -> List[int]:
-        """Scan léger (cmdline, un titre) avant lancement manuel.
+        """Check pré-lancement manuel : lit le cache du scan périodique (rescan seulement si vide).
 
         - Mode normal : ne tue que les PID launcher ; laisse une instance déjà lancée.
         - Mode agressif : tue tous les PID --title.
@@ -11672,13 +11819,32 @@ class SnowMasterGUI(QWidget):
         """
         if not title or not pre_launch_scan_enabled():
             return []
-        try:
-            matches = scan_processes_by_title_forced(title)
-        except Exception as e:
-            app_log_warn(f"[PRE_LAUNCH] scan échoué pour '{title}': {e}")
-            return []
+
+        source = "cache"
+        matches = get_cached_processes_for_title(title)
+        if matches is None:
+            source = "live"
+            try:
+                matches = scan_processes_by_title_forced(title) or []
+            except Exception as e:
+                app_log_warn(f"[PRE_LAUNCH] scan live échoué pour '{title}': {e}")
+                return []
+            # Amorcer / enrichir le cache pour les prochains lancements
+            try:
+                upsert_process_scan_cache_title(title, matches)
+            except Exception:
+                pass
+            print(f"[PRE_LAUNCH] '{title}': pas de cache périodique → scan live")
+        else:
+            age = process_scan_cache_age_s()
+            age_s = f"{age:.0f}s" if age is not None else "?"
+            print(
+                f"[PRE_LAUNCH] '{title}': lecture cache scan périodique "
+                f"(âge≈{age_s}, {len(matches)} entrée(s))"
+            )
+
         if not matches:
-            print(f"[PRE_LAUNCH] '{title}': aucun process --title trouvé")
+            print(f"[PRE_LAUNCH] '{title}': aucun process --title ({source})")
             return []
 
         aggressive = aggressive_duplicate_kill_enabled()
@@ -11686,7 +11852,7 @@ class SnowMasterGUI(QWidget):
         kept_launched: List[int] = []
         print(
             f"[PRE_LAUNCH] '{title}': {len(matches)} process "
-            f"(mode={'agressif' if aggressive else 'launchers seulement'})"
+            f"(mode={'agressif' if aggressive else 'launchers seulement'}, src={source})"
         )
         for info in matches:
             try:
@@ -11709,6 +11875,7 @@ class SnowMasterGUI(QWidget):
                 app_log_warn(f"[PRE_LAUNCH] kill PID {pid_int} échoué: {e}")
 
         if killed:
+            remove_pids_from_process_scan_cache(title, killed)
             with _state_lock:
                 inst = _instances.get(title)
                 if inst:
@@ -11721,7 +11888,11 @@ class SnowMasterGUI(QWidget):
                         inst.last_heartbeat = 0.0
                     _instances[title] = inst
             app_log_info(
-                "[PRE_LAUNCH] '%s': tués=%s gardés=%s", title, killed, kept_launched
+                "[PRE_LAUNCH] '%s': tués=%s gardés=%s (src=%s)",
+                title,
+                killed,
+                kept_launched,
+                source,
             )
         return killed
 
@@ -12474,7 +12645,7 @@ class SnowMasterGUI(QWidget):
         if not ok or not title.strip():
             return
         title = title.strip()
-        # Scan pré-lancement manuel (nouvelle instance)
+        # Check pré-lancement manuel (nouvelle instance)
         self._pre_launch_scan_kill(title)
         exe = EXE
         images = RESOURCES
@@ -12770,9 +12941,9 @@ class SnowMasterGUI(QWidget):
             if do_full:
                 known_titles: set = set()
                 with _state_lock:
-                    for t, inst in _instances.items():
-                        # Inclure les vides stoppées : recovery si le process vit encore
-                        if (not inst.stopped) or getattr(inst, "manual_empty", False):
+                    # Toutes les fiches (y compris stoppées) → cache utile au check pré-lancement
+                    for t in _instances.keys():
+                        if t:
                             known_titles.add(t)
                 try:
                     all_processes = scan_snowbot_processes_by_cmdline(
@@ -12792,6 +12963,16 @@ class SnowMasterGUI(QWidget):
                         if proc_title not in processes_by_title:
                             processes_by_title[proc_title] = []
                         processes_by_title[proc_title].append(info)
+
+                # Sauvegarde pour le check pré-lancement (évite un rescan cmdline)
+                try:
+                    store_process_scan_cache(processes_by_title)
+                    scan_log(
+                        f"[SCAN_PIDS] cache pré-lancement mis à jour "
+                        f"({len(processes_by_title)} titre(s))"
+                    )
+                except Exception as e:
+                    scan_log(f"[SCAN_PIDS] échec maj cache pré-lancement: {e}")
 
                 # Réanimer les instances vides marquées stoppées alors que le process vit
                 for title, procs in list(processes_by_title.items()):
@@ -12904,6 +13085,26 @@ class SnowMasterGUI(QWidget):
                         bus.instance_updated.emit(title)
                     except Exception:
                         pass
+
+                # Cache pré-lancement : purge PID morts + sync fiches actives (sans cmdline)
+                try:
+                    with _state_lock:
+                        light_rows = [
+                            {
+                                "title": t,
+                                "pid": inst.pid,
+                                "hwnd": inst.hwnd,
+                            }
+                            for t, inst in _instances.items()
+                            if t and not inst.stopped and inst.pid
+                        ]
+                    refresh_process_scan_cache_light(light_rows)
+                    scan_log(
+                        f"[SCAN_PIDS] cache pré-lancement rafraîchi (léger, "
+                        f"{len(light_rows)} fiche(s) actives)"
+                    )
+                except Exception as e:
+                    scan_log(f"[SCAN_PIDS] échec rafraîchissement cache léger: {e}")
 
             # Afficher les doublons détectés
             duplicates_found = {
@@ -14203,7 +14404,7 @@ class SnowMasterGUI(QWidget):
         val = bool(self.chk_pre_launch_scan.isChecked())
         _prefs.setdefault("instances", {})["pre_launch_scan"] = val
         save_prefs(_prefs)
-        app_log_info(f"Scan pré lancement {'activé' if val else 'désactivé'}")
+        app_log_info(f"Check pré lancement {'activé' if val else 'désactivé'}")
 
     def on_toggle_aggressive_dup_kill(self, _state):
         val = bool(self.chk_aggressive_dup_kill.isChecked())
