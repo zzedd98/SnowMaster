@@ -3165,7 +3165,8 @@ class InstanceState:
         # self.sub_map: Dict[str, float] = {}
         self.sub_map: Dict[str, Dict[str, float]] = {}
         self.last_heartbeat: float = 0.0
-        self.last_reset: float = 0.0  # <-- NOUVEAU : date/heure du dernier lancement
+        self.last_reset: float = 0.0  # horodatage d'une vraie requête /reset (UI « Last Reset »)
+        self.awaiting_since: float = 0.0  # début du lancement jaune (timeout / anti-double)
 
         self.logs: Deque[str] = deque(maxlen=MAX_LOGS_PER_INSTANCE)
         self.stopped: bool = False
@@ -3313,11 +3314,32 @@ def _record_heartbeat_history(inst: InstanceState, data: dict, now_ts: float) ->
         )
 
 
+def _instance_awaiting_since(inst: "InstanceState") -> float:
+    """Chrono du lancement jaune (pas le Last Reset UI)."""
+    try:
+        ts = float(getattr(inst, "awaiting_since", 0.0) or 0.0)
+    except Exception:
+        ts = 0.0
+    if ts > 0:
+        return ts
+    # Compat anciennes sessions : repli last_reset uniquement si encore en awaiting
+    try:
+        if getattr(inst, "awaiting_first_hb", False):
+            return float(getattr(inst, "last_reset", 0.0) or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+
 def _record_instance_reset_history(title: str, now_ts: Optional[float] = None) -> None:
-    """Ajoute un marqueur « Reset de l'instance » (onglet All uniquement)."""
+    """Ajoute un marqueur « Reset de l'instance » (onglet All uniquement) + met à jour last_reset."""
+    now_ts = float(now_ts or time.time())
+    with _state_lock:
+        inst = _instances.get(title)
+        if inst:
+            inst.last_reset = now_ts
     if not hb_history_storage_enabled():
         return
-    now_ts = float(now_ts or time.time())
     try:
         hhmmss = datetime.fromtimestamp(now_ts).strftime("%H:%M:%S")
     except Exception:
@@ -3949,9 +3971,6 @@ def api_register():
     with _state_lock:
         inst = _instances.get(title) or InstanceState(title)
         inst.title = title
-        # Mémoriser avant de forcer awaiting : l'early /register ne doit PAS
-        # repousser last_reset (sinon le timeout jaune 30s ne part jamais).
-        was_awaiting = bool(getattr(inst, "awaiting_first_hb", False))
         inst.awaiting_first_hb = True
         inst.stopped = False
         if "pid" in data:
@@ -3985,9 +4004,7 @@ def api_register():
             inst.sub_map = _parse_subcontrollers(data["subcontrollers"], time.time())
         if data.get("touch", True):
             now_ts = time.time()
-            # last_reset = chrono du lancement UI uniquement (pas early register)
-            if not was_awaiting:
-                inst.last_reset = now_ts
+            # Ne PAS toucher last_reset ici (réservé aux requêtes /reset).
             # Ne pas inventer un heartbeat « vivant » si aucun process n'est encore là
             # (sinon l'UI affiche une MAJ + _is_instance_running croit l'instance active).
             pid_ok = bool(inst.pid) and int(inst.pid) != 0
@@ -4047,6 +4064,7 @@ def api_heartbeat():
         # **Heartbeat effectif : mettre à jour last_heartbeat et lever flags de restauration**
         inst.last_heartbeat = now_ts
         inst.awaiting_first_hb = False
+        inst.awaiting_since = 0.0
         # si c'était marqué restauré, on le retire pour repasser au vert
         if getattr(inst, "restored_recently", False):
             inst.restored_recently = False
@@ -10922,12 +10940,12 @@ class SnowMasterGUI(QWidget):
         if last > 0 and (time.time() - last) < float(AUTO_RELAUNCH_COOLDOWN_S):
             return True
 
-        # Lancement jaune récent (awaiting + last_reset)
+        # Lancement jaune récent (awaiting + awaiting_since)
         if inst is None:
             with _state_lock:
                 inst = _instances.get(title)
         if inst is not None and getattr(inst, "awaiting_first_hb", False):
-            launch_ts = float(getattr(inst, "last_reset", 0.0) or 0.0) or float(
+            launch_ts = _instance_awaiting_since(inst) or float(
                 getattr(inst, "last_heartbeat", 0.0) or 0.0
             )
             if launch_ts > 0 and (time.time() - launch_ts) < float(
@@ -10947,7 +10965,7 @@ class SnowMasterGUI(QWidget):
             inst.awaiting_first_hb = True
             inst.stopped = False
             inst.last_heartbeat = 0.0
-            inst.last_reset = time.time()
+            inst.awaiting_since = time.time()  # chrono jaune — pas last_reset (UI Reset)
             inst.pid = None
             inst.hwnd = None
         self._mark_instance_busy(title, reason="launch")
@@ -10958,7 +10976,7 @@ class SnowMasterGUI(QWidget):
         except Exception:
             pass
         # Re-check périodique tant que jaune (one-shot unique = risque de rater le timeout
-        # si last_reset / PID évoluent entre-temps).
+        # si awaiting_since / PID évoluent entre-temps).
         self._schedule_yellow_watch(title)
         return True
 
@@ -10991,7 +11009,7 @@ class SnowMasterGUI(QWidget):
             hwnd = inst.hwnd
             manual_empty = bool(getattr(inst, "manual_empty", False))
             controller = inst.controller_path
-            launch_ts = float(getattr(inst, "last_reset", 0.0) or 0.0) or float(
+            launch_ts = _instance_awaiting_since(inst) or float(
                 inst.last_heartbeat or 0.0
             )
 
@@ -11119,7 +11137,7 @@ class SnowMasterGUI(QWidget):
         # Déjà en lancement récent AVEC process → ne pas re-spawn (évite les doubles).
         # Jaune sans process, ou jaune trop vieux (timeout) → on (re)lance.
         if getattr(inst, "awaiting_first_hb", False):
-            launch_ts = float(getattr(inst, "last_reset", 0.0) or 0.0)
+            launch_ts = _instance_awaiting_since(inst)
             age = (time.time() - launch_ts) if launch_ts > 0 else 1e9
             if age < float(AWAITING_LAUNCH_TIMEOUT_S):
                 pid_ok = is_pid_alive(inst.pid) if inst.pid else False
@@ -11899,7 +11917,7 @@ class SnowMasterGUI(QWidget):
         inst.manual_empty = True
         now_ts = time.time()
         inst.last_heartbeat = now_ts
-        inst.last_reset = now_ts
+        inst.awaiting_since = now_ts  # chrono jaune — pas last_reset
         inst.awaiting_first_hb = True
         inst.stopped = False
 
@@ -12312,9 +12330,9 @@ class SnowMasterGUI(QWidget):
                     if (not pid or pid == 0) and (not hwnd or hwnd == 0):
                         # En cours de lancement : laisser le temps au process d'apparaître
                         if getattr(inst, "awaiting_first_hb", False):
-                            launch_ts = float(
-                                getattr(inst, "last_reset", 0.0) or 0.0
-                            ) or float(getattr(inst, "last_heartbeat", 0.0) or 0.0)
+                            launch_ts = _instance_awaiting_since(inst) or float(
+                                getattr(inst, "last_heartbeat", 0.0) or 0.0
+                            )
                             age = (time.time() - launch_ts) if launch_ts > 0 else 1e9
                             if age < float(AWAITING_LAUNCH_TIMEOUT_S):
                                 scan_log(
@@ -12348,6 +12366,7 @@ class SnowMasterGUI(QWidget):
                             inst.pid = None
                             inst.hwnd = None
                             inst.awaiting_first_hb = False
+                            inst.awaiting_since = 0.0
                             inst.last_heartbeat = 0.0
                             try:
                                 inst.sub_map.clear()
@@ -12369,9 +12388,7 @@ class SnowMasterGUI(QWidget):
                                 getattr(inst, "awaiting_first_hb", False)
                             ),
                             "manual_empty": bool(getattr(inst, "manual_empty", False)),
-                            "last_reset": float(
-                                getattr(inst, "last_reset", 0.0) or 0.0
-                            ),
+                            "awaiting_since": float(_instance_awaiting_since(inst) or 0.0),
                         }
                     )
 
@@ -12487,7 +12504,7 @@ class SnowMasterGUI(QWidget):
 
                     # Lancement en cours : un PID launcher mort un instant ≠ crash à relancer
                     if inst_data.get("awaiting_first_hb"):
-                        lr = float(inst_data.get("last_reset") or 0.0)
+                        lr = float(inst_data.get("awaiting_since") or 0.0)
                         if lr > 0 and (now - lr) < float(AWAITING_LAUNCH_TIMEOUT_S):
                             scan_log(
                                 f"[SCAN_PIDS] '{title}': awaiting_first_hb "
@@ -12597,7 +12614,7 @@ class SnowMasterGUI(QWidget):
             pid = inst.pid
             hwnd = inst.hwnd
             last_hb = float(inst.last_heartbeat or 0.0)
-            last_reset = float(getattr(inst, "last_reset", 0.0) or 0.0)
+            launch_ts = float(_instance_awaiting_since(inst) or 0.0)
 
         pid_ok = is_pid_alive(pid) if pid else False
         hwnd_ok = is_hwnd_valid(hwnd) if hwnd else False
@@ -12608,7 +12625,7 @@ class SnowMasterGUI(QWidget):
             # Un PID launcher vivant sans 1er HB = lancement raté (ne pas bloquer).
             if stopped or not awaiting:
                 return False
-            if last_reset > 0 and (time.time() - last_reset) < float(
+            if launch_ts > 0 and (time.time() - launch_ts) < float(
                 AWAITING_LAUNCH_TIMEOUT_S
             ):
                 return False
@@ -12619,8 +12636,8 @@ class SnowMasterGUI(QWidget):
             # Mais pas pendant un lancement/reset en cours (PID launcher peut être mort un instant).
             if (
                 awaiting
-                and last_reset > 0
-                and (time.time() - last_reset) < float(AWAITING_LAUNCH_TIMEOUT_S)
+                and launch_ts > 0
+                and (time.time() - launch_ts) < float(AWAITING_LAUNCH_TIMEOUT_S)
             ):
                 return False
             if pid_ok or hwnd_ok:
@@ -12632,8 +12649,8 @@ class SnowMasterGUI(QWidget):
             return False
         if (
             awaiting
-            and last_reset > 0
-            and (time.time() - last_reset) < float(AWAITING_LAUNCH_TIMEOUT_S)
+            and launch_ts > 0
+            and (time.time() - launch_ts) < float(AWAITING_LAUNCH_TIMEOUT_S)
         ):
             return False
         # HB frais : utile seulement si on n'a pas déjà prouvé un crash PID/HWND
