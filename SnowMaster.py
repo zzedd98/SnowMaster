@@ -3340,6 +3340,37 @@ class InstanceState:
         self._hb_dedup_key: Optional[tuple] = None
         self._hb_dedup_ts: float = 0.0
 
+    def reset_as_never_launched(self) -> None:
+        """Remet l'instance comme jamais lancée (carte grise).
+
+        Conserve uniquement la fiche config : title, controller/exe/images/ratio, manual_empty.
+        Tout le reste (process, jaune, HB, historiques, flags) est effacé.
+        """
+        self.pid = None
+        self.hwnd = None
+        try:
+            self.sub_map.clear()
+        except Exception:
+            self.sub_map = {}
+        self.last_heartbeat = 0.0
+        self.last_reset = 0.0
+        self.awaiting_since = 0.0
+        self.launcher_seen_at = 0.0
+        try:
+            self.logs.clear()
+        except Exception:
+            self.logs = deque(maxlen=MAX_LOGS_PER_INSTANCE)
+        self.stopped = True
+        self.awaiting_first_hb = False
+        self.restored_recently = False
+        self.reddot_resettable = True
+        try:
+            self.hb_history.clear()
+        except Exception:
+            self.hb_history = deque(maxlen=MAX_HEARTBEAT_HISTORY)
+        self._hb_dedup_key = None
+        self._hb_dedup_ts = 0.0
+
 
 class HeartbeatSubLine:
     """Une ligne d'historique = un sous-contrôleur dans un heartbeat, ou un marqueur reset."""
@@ -11204,18 +11235,40 @@ class SnowMasterGUI(QWidget):
     def on_card_kill(self, title: str):
         if not title:
             return
+        killed = set()
         with _state_lock:
             inst = _instances.get(title)
-        if inst and inst.pid:
+            pid = inst.pid if inst else None
+        if pid:
             try:
-                terminate_process_tree(int(inst.pid), timeout=3.0)
+                terminate_process_tree(int(pid), timeout=3.0)
+                killed.add(int(pid))
             except Exception:
                 try:
-                    psutil.Process(int(inst.pid)).terminate()
+                    psutil.Process(int(pid)).terminate()
+                    killed.add(int(pid))
                 except Exception:
                     pass
-        # Utiliser _mark_instance_stopped pour garantir que tous les champs sont réinitialisés
-        self._mark_instance_stopped(title)
+        # Orphelins / doublons encore vivants avec le même --title
+        try:
+            matches = scan_processes_by_title_forced(title) or []
+        except Exception:
+            matches = []
+        for info in matches:
+            try:
+                p2 = int((info or {}).get("pid") or 0)
+            except Exception:
+                continue
+            if not p2 or p2 in killed or not is_pid_alive(p2):
+                continue
+            try:
+                terminate_process_tree(p2, timeout=3.0)
+                killed.add(p2)
+            except Exception:
+                pass
+
+        # Reset runtime complet + busy + mouse lock
+        self._mark_instance_stopped(title, clear_busy=True, release_lock=True)
 
         try:
             _post_json("/goodbye", {"title": title})
@@ -13571,29 +13624,57 @@ class SnowMasterGUI(QWidget):
         scan_log(f"[RESOLVE_CTRL] '{title}': ✗ ÉCHEC - Aucun controller valide trouvé")
         return None
 
-    def _mark_instance_stopped(self, title: str, *, clear_busy: bool = True):
-        """Marque une instance comme stoppée de manière thread-safe."""
-        scan_log(f"[MARK_STOPPED] '{title}': Marquage comme stoppée...")
+    def _mark_instance_stopped(
+        self,
+        title: str,
+        *,
+        clear_busy: bool = True,
+        release_lock: bool = True,
+    ):
+        """Arrêt complet : état = jamais lancée (gris), config fiche conservée."""
+        scan_log(f"[MARK_STOPPED] '{title}': arrêt complet (état jamais lancée)...")
         with _state_lock:
             inst = _instances.get(title)
             if inst:
-                inst.pid = None
-                inst.hwnd = None
-                inst.stopped = True
-                inst.awaiting_first_hb = False
-                inst.last_heartbeat = 0.0
-                try:
-                    inst.sub_map.clear()
-                except Exception:
-                    inst.sub_map = {}
+                inst.reset_as_never_launched()
                 _instances[title] = inst
-                scan_log(f"[MARK_STOPPED] '{title}': ✓ Instance marquée comme stoppée")
+                scan_log(
+                    f"[MARK_STOPPED] '{title}': ✓ stoppée / jamais lancée "
+                    f"(config conservée)"
+                )
             else:
                 scan_log(
                     f"[MARK_STOPPED] '{title}': ⚠️ Instance non trouvée dans _instances"
                 )
+
         if clear_busy:
             self._clear_instance_busy(title)
+            try:
+                self._last_auto_relaunch_attempt.pop(title, None)
+            except Exception:
+                pass
+            # Annuler un reset encore en file pour ce titre
+            try:
+                pending = getattr(self, "_pending_resets", None)
+                if pending and title in pending:
+                    self._pending_resets = [t for t in pending if t != title]
+            except Exception:
+                pass
+            try:
+                with _pending_api_resets_lock:
+                    if title in _pending_api_resets:
+                        _pending_api_resets[:] = [
+                            t for t in _pending_api_resets if t != title
+                        ]
+            except Exception:
+                pass
+
+        if release_lock:
+            try:
+                release_mouse_lock(owner=title)
+                scan_log(f"[MARK_STOPPED] '{title}': mouse lock libéré (si propriétaire)")
+            except Exception:
+                pass
 
         # Émettre le signal dans le thread UI
         QTimer.singleShot(0, lambda t=title: self._emit_instance_updated(t))
@@ -15199,6 +15280,7 @@ def acquire_mouse_lock(owner, ttl=120.0, poll=0.5, max_wait: float = 180.0):
     une file de lancements si un owner ne libère pas le lock).
     """
     t0 = time.time()
+    last_log = 0.0
     while True:
         try:
             resp = post_json_with_retry(
@@ -15209,12 +15291,32 @@ def acquire_mouse_lock(owner, ttl=120.0, poll=0.5, max_wait: float = 180.0):
                 delay=0.3,
             )
             if resp.get("ok"):
+                waited = time.time() - t0
+                if waited >= 1.0:
+                    print(
+                        f"[MOUSE_LOCK] '{owner}': acquis après {waited:.0f}s"
+                    )
                 return True
+            # Occupé par un autre lancement (gestionnaire / open file, etc.)
+            now = time.time()
+            if now - last_log >= 5.0:
+                last_log = now
+                other = resp.get("owner") or "?"
+                rem = resp.get("remaining")
+                rem_s = f"{float(rem):.0f}s" if rem is not None else "?"
+                waited = now - t0
+                print(
+                    f"[MOUSE_LOCK] '{owner}': en attente "
+                    f"(owner='{other}', reste≈{rem_s}, déjà {waited:.0f}s)"
+                )
         except Exception:
             pass
         if max_wait is not None and (time.time() - t0) >= float(max_wait):
             app_log_warn(
                 f"[MOUSE_LOCK] '{owner}': timeout acquire après {max_wait:.0f}s — continue sans lock"
+            )
+            print(
+                f"[MOUSE_LOCK] '{owner}': timeout {max_wait:.0f}s — continue sans lock"
             )
             return False
         time.sleep(poll)
@@ -16191,10 +16293,15 @@ def run_snowbot_flow(
         except Exception:
             pass
 
+    print(f"[FLOW] '{title}': fenêtre OK → attente mouse lock (gestionnaire/script)")
     acquired = False
     try:
-        acquire_mouse_lock(owner=title, ttl=180.0)
-        acquired = True
+        acquired = bool(acquire_mouse_lock(owner=title, ttl=180.0))
+        print(
+            f"[FLOW] '{title}': "
+            f"{'mouse lock OK' if acquired else 'sans mouse lock'} "
+            f"→ ouverture gestionnaire / script"
+        )
 
         def _force_left(where: str):
             if APP_VARIANT != "ankabot":
