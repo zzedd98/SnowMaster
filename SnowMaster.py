@@ -12453,12 +12453,28 @@ class SnowMasterGUI(QWidget):
 
                     title_procs = processes_by_title.get(title, []) if do_full else []
                     if do_full and len(title_procs) > 1:
+                        # Ne jamais nettoyer les doublons pendant un lancement/reset :
+                        # launcher + enfant partagent souvent le même --title ; un keep
+                        # stale/mort tuerait le process fraîchement lancé.
+                        if self._is_instance_busy(title) or inst_data.get(
+                            "awaiting_first_hb"
+                        ):
+                            scan_log(
+                                f"[SCAN_PIDS] '{title}': doublons ignorés "
+                                f"(lancement/busy en cours, {len(title_procs)} procs)"
+                            )
+                            continue
                         scan_log(
                             f"[SCAN_PIDS] '{title}': ⚠️ DOUBLONS détectés ({len(title_procs)} processus)"
                         )
                         # Garder le PID stocké sur l'instance (dernier lancé / détails),
                         # ne tuer que les orphelins — pas de relance si le PID gardé vit.
+                        # Re-lire le PID actuel (pas le snapshot figé) pour éviter un keep mort.
                         keep_pid = inst_data.get("pid")
+                        with _state_lock:
+                            cur = _instances.get(title)
+                            if cur and cur.pid:
+                                keep_pid = cur.pid
                         kept = self._kill_duplicate_processes(
                             title, title_procs, keep_pid=keep_pid
                         )
@@ -12705,17 +12721,77 @@ class SnowMasterGUI(QWidget):
             )
             keep_int = None
 
+        # Sans keep fiable : ne PAS massacrer tous les process du titre (un launcher
+        # fraîchement spawn serait tué). Choisir le plus récent encore vivant.
+        if not keep_int and proc_list:
+            newest_pid = None
+            newest_ct = -1.0
+            for info in proc_list:
+                try:
+                    pid_i = int(info.get("pid") or 0)
+                except Exception:
+                    continue
+                if not pid_i or not is_pid_alive(pid_i):
+                    continue
+                try:
+                    ct = float(psutil.Process(pid_i).create_time())
+                except Exception:
+                    ct = 0.0
+                if ct >= newest_ct:
+                    newest_ct = ct
+                    newest_pid = pid_i
+            if newest_pid:
+                keep_int = newest_pid
+                scan_log(
+                    f"[KILL_DUPLICATES] '{title}': keep de secours = PID le plus récent {keep_int}"
+                )
+
         keep_set = set()
         if keep_int:
             keep_set.add(keep_int)
+            # Enfants du keep
             try:
                 for ch in psutil.Process(keep_int).children(recursive=True):
                     keep_set.add(int(ch.pid))
             except Exception:
                 pass
+            # Ancêtres du keep (sinon tuer le launcher parent tue aussi le keep enfant)
+            try:
+                cur = psutil.Process(keep_int)
+                for _ in range(8):
+                    parent = cur.parent()
+                    if parent is None:
+                        break
+                    ppid = int(parent.pid)
+                    if ppid <= 0 or ppid in keep_set:
+                        break
+                    keep_set.add(ppid)
+                    # + frères utiles : enfants du parent déjà listés dans proc_list
+                    cur = parent
+            except Exception:
+                pass
+            # Tout pid de proc_list qui est parent/enfant d'un membre keep_set
+            try:
+                for info in proc_list:
+                    try:
+                        pid_i = int(info.get("pid") or 0)
+                    except Exception:
+                        continue
+                    if not pid_i or pid_i in keep_set:
+                        continue
+                    try:
+                        p = psutil.Process(pid_i)
+                        child_pids = {int(c.pid) for c in p.children(recursive=True)}
+                    except Exception:
+                        continue
+                    if keep_set & child_pids or pid_i in keep_set:
+                        keep_set.add(pid_i)
+                        keep_set |= child_pids
+            except Exception:
+                pass
 
         scan_log(
-            f"[KILL_DUPLICATES] '{title}': {len(proc_list)} process, keep={keep_int}"
+            f"[KILL_DUPLICATES] '{title}': {len(proc_list)} process, keep={keep_int}, keep_set={sorted(keep_set)}"
         )
         killed_pids = []
         failed_pids = []
@@ -12734,6 +12810,23 @@ class SnowMasterGUI(QWidget):
                 kept_info = info
                 scan_log(f"[KILL_DUPLICATES] '{title}': conserve PID {pid_int}")
                 continue
+            # Ne jamais terminate_process_tree un ancêtre du keep (déjà dans keep_set),
+            # ni un process dont le tree couvre le keep.
+            try:
+                if keep_int and is_pid_alive(pid_int):
+                    descendants = {
+                        int(c.pid)
+                        for c in psutil.Process(pid_int).children(recursive=True)
+                    }
+                    if keep_int in descendants or (keep_set & descendants):
+                        keep_set.add(pid_int)
+                        scan_log(
+                            f"[KILL_DUPLICATES] '{title}': conserve PID {pid_int} "
+                            f"(ancêtre/tree du keep)"
+                        )
+                        continue
+            except Exception:
+                pass
             try:
                 scan_log(f"[KILL_DUPLICATES] '{title}': Kill PID {pid_int}...")
                 terminate_process_tree(pid_int, timeout=3.0)
