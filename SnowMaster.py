@@ -9287,12 +9287,17 @@ class SnowMasterGUI(QWidget):
                         if not title or not ctrl:
                             continue
 
+                        rec = self._normalize_instance_record(inst_data)
+
                         with _state_lock:
-                            # si déjà présent, on SKIP pour éviter doublons
+                            # Déjà présente (souvent via restore process) :
+                            # on complète controller/exe manquants, on ne recrée pas.
                             if title in _instances:
+                                inst = _instances[title]
+                                apply_disk_record_to_instance(inst, rec)
+                                _instances[title] = inst
                                 continue
 
-                        rec = self._normalize_instance_record(inst_data)
                         inst = InstanceState(title)
                         inst.controller_path = rec.get("controller") or ctrl
                         if rec.get("exe"):
@@ -12603,7 +12608,7 @@ class SnowMasterGUI(QWidget):
     ) -> Tuple[
         Optional["InstanceState"], Optional[str], Optional[str], Optional[str], float
     ]:
-        """Retourne (inst, controller, exe, images, ratio). Si infos manquantes → charge depuis le disque."""
+        """Lit uniquement le dict mémoire `_instances` (pas de relecture fichier)."""
         with _state_lock:
             inst = _instances.get(title)
             if not inst:
@@ -12615,38 +12620,10 @@ class SnowMasterGUI(QWidget):
                 ratio = float(getattr(inst, "ratio", 0.5) or 0.5)
             except Exception:
                 ratio = 0.5
-            need_fill = (not controller and not getattr(inst, "manual_empty", False)) or (
-                not exe
-            )
-
-        if need_fill:
-            rec = load_instance_record_from_disk(title)
-            with _state_lock:
-                inst = _instances.get(title)
-                if not inst:
-                    return None, None, None, None, 0.0
-                apply_disk_record_to_instance(inst, rec)
-                controller = (getattr(inst, "controller_path", None) or "").strip() or None
-                exe = (getattr(inst, "exe_path", None) or "").strip() or None
-                images = (getattr(inst, "images_dir", None) or "").strip() or None
-                try:
-                    ratio = float(getattr(inst, "ratio", 0.5) or 0.5)
-                except Exception:
-                    ratio = 0.5
-                if not exe:
-                    exe = (EXE or "").strip() or None
-                    if exe:
-                        inst.exe_path = exe
-                if not images:
-                    images = RESOURCES
-                    inst.images_dir = images
-                _instances[title] = inst
-        else:
             if not exe:
                 exe = (EXE or "").strip() or None
             if not images:
                 images = RESOURCES
-
         return inst, controller, exe, images, ratio
 
     def _kill_instance_background(self, title: str):
