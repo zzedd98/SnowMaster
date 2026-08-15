@@ -387,6 +387,14 @@ def debug_console_visible_pref() -> bool:
         return False
 
 
+def pre_launch_scan_enabled() -> bool:
+    """Préférence : scan léger anti-doublon avant un lancement manuel."""
+    try:
+        return bool(_prefs.get("instances", {}).get("pre_launch_scan", True))
+    except Exception:
+        return True
+
+
 def scan_log(msg):
     """Log du scan des PIDs (console uniquement, plus de fichier dédié)."""
     try:
@@ -541,6 +549,7 @@ DEFAULT_PREFS = {
         "overwrite_on_load": True,  # si True -> écrase les instances existantes lors du chargement d'une config
         "scan_pid_interval_ms": 30000,  # scan léger PID/HWND (ms)
         "scan_pid_full_every": 10,  # 1 scan complet (doublons) tous les N légers (~5 min si 30s)
+        "pre_launch_scan": True,  # avant lancement manuel : tuer d'éventuels PID --title restants
     },
     # Configuration pour Discord : envoi de hook quand le voyant global passe au rouge
     "discord": {
@@ -9066,6 +9075,15 @@ class SnowMasterGUI(QWidget):
         self.chk_debug_console.stateChanged.connect(self.on_toggle_debug_console)
         self._debug_console_dialog: Optional[DebugConsoleDialog] = None
 
+        self.chk_pre_launch_scan = QCheckBox("Scan pré lancement")
+        self.chk_pre_launch_scan.setChecked(pre_launch_scan_enabled())
+        self.chk_pre_launch_scan.setToolTip(
+            "Coché : avant un lancement manuel (Relancer / Relancer tout / nouvelle instance),\n"
+            "scanne les process --title et ferme les anciens PID encore ouverts.\n"
+            "N'affecte pas les resets ni les relances automatiques."
+        )
+        self.chk_pre_launch_scan.stateChanged.connect(self.on_toggle_pre_launch_scan)
+
         # Lecture initiale des prefs pour les instances
         instances_prefs = _prefs.get("instances", {})
         default_delay = int(instances_prefs.get("launch_delay", 1))
@@ -9196,6 +9214,7 @@ class SnowMasterGUI(QWidget):
         inst_group_collapsible.addWidget(self.chk_euro_counter)
         inst_group_collapsible.addWidget(self.chk_always_on_top)
         inst_group_collapsible.addWidget(self.chk_debug_console)
+        inst_group_collapsible.addWidget(self.chk_pre_launch_scan)
         # inst_group_collapsible.addWidget(self.btn_save_cfg)
         # inst_group_collapsible.addWidget(self.btn_load_cfg)
         # Checkbox: overwrite existing instances when loading a config
@@ -11443,13 +11462,70 @@ class SnowMasterGUI(QWidget):
             return
         self._schedule_post_launch_register(title, controller, exe, images, ratio)
 
-    def on_card_relaunch(self, title: str):
+    def _pre_launch_scan_kill(self, title: str) -> List[int]:
+        """Scan léger (cmdline, un titre) avant lancement manuel : tue les PID --title restants.
+
+        Returns:
+            Liste des PIDs tués.
+        """
+        if not title or not pre_launch_scan_enabled():
+            return []
+        try:
+            matches = scan_processes_by_title_forced(title)
+        except Exception as e:
+            app_log_warn(f"[PRE_LAUNCH] scan échoué pour '{title}': {e}")
+            return []
+        if not matches:
+            print(f"[PRE_LAUNCH] '{title}': aucun process --title trouvé")
+            return []
+
+        killed: List[int] = []
+        print(
+            f"[PRE_LAUNCH] '{title}': {len(matches)} process trouvé(s) — fermeture avant lancement"
+        )
+        for info in matches:
+            try:
+                pid_int = int(info.get("pid") or 0)
+            except Exception:
+                continue
+            if not pid_int or not is_pid_alive(pid_int):
+                continue
+            try:
+                terminate_process_tree(pid_int, timeout=3.0)
+                killed.append(pid_int)
+                print(f"[PRE_LAUNCH] '{title}': PID {pid_int} tué")
+            except Exception as e:
+                app_log_warn(f"[PRE_LAUNCH] kill PID {pid_int} échoué: {e}")
+
+        if killed:
+            with _state_lock:
+                inst = _instances.get(title)
+                if inst:
+                    inst.pid = None
+                    inst.hwnd = None
+                    inst.last_heartbeat = 0.0
+                    # Pas stopped=True : on enchaîne sur un spawn manuel
+                    _instances[title] = inst
+            app_log_info(
+                "[PRE_LAUNCH] '%s': anciens PID fermés %s", title, killed
+            )
+        return killed
+
+    def on_card_relaunch(self, title: str, *, manual: bool = True):
         if not title:
             return
         # Params déjà en mémoire au démarrage (autoload instances.json) ; fallback fichier si manque.
         inst, controller, exe, images, ratio = self._get_instance_launch_params(title)
         if not inst:
             return
+
+        # Lancement manuel uniquement : scan léger anti-doublon (pas reset / auto).
+        killed_pre = []
+        if manual:
+            killed_pre = self._pre_launch_scan_kill(title)
+            # Recharger l'état après éventuel kill
+            with _state_lock:
+                inst = _instances.get(title) or inst
 
         # Déjà en lancement récent AVEC process → ne pas re-spawn (évite les doubles).
         # Jaune sans process, ou jaune trop vieux (timeout) → on (re)lance.
@@ -11469,7 +11545,8 @@ class SnowMasterGUI(QWidget):
                     pass
         else:
             need_fresh = (not inst.stopped) and bool(inst.pid or inst.hwnd)
-            if self._is_instance_running(inst, fresh=need_fresh):
+            # Si on vient de tuer des orphelins au pré-scan, ne pas no-op sur HB frais
+            if not killed_pre and self._is_instance_running(inst, fresh=need_fresh):
                 return
 
         # Jaune → spawn immédiat. Pas de scan doublons synchrone avant Popen.
@@ -12188,6 +12265,8 @@ class SnowMasterGUI(QWidget):
         if not ok or not title.strip():
             return
         title = title.strip()
+        # Scan pré-lancement manuel (nouvelle instance)
+        self._pre_launch_scan_kill(title)
         exe = EXE
         images = RESOURCES
         ratio = 0.5
@@ -12215,6 +12294,8 @@ class SnowMasterGUI(QWidget):
         if not ok or not title or not title.strip():
             return
         title = title.strip()
+        # Fermer d'éventuels orphelins --title avant le spawn manuel
+        self._pre_launch_scan_kill(title)
 
         # si titre déjà utilisé -> avertir (vérifier SANS tenir le lock pendant le popup,
         # sinon deadlock/crash : la modal lance la boucle d'événements et un autre slot peut prendre _state_lock)
@@ -13044,14 +13125,14 @@ class SnowMasterGUI(QWidget):
             app_log_error(f"[RESET] Relance '{title}': instance introuvable")
             return
         if getattr(inst, "manual_empty", False):
-            self.on_card_relaunch(title)
+            self.on_card_relaunch(title, manual=False)
             return
         if not controller:
             controller = self._resolve_controller_path(title, None)
         if not controller:
             # Dernier recours : chemin normal (peut ouvrir un dialog fichier)
             print(f"[RESET] Relance '{title}': pas de controller → on_card_relaunch")
-            self.on_card_relaunch(title)
+            self.on_card_relaunch(title, manual=False)
             return
         print(f"[RESET] Relance forcée '{title}'")
         self.on_card_relaunch_force(title, controller)
@@ -13267,7 +13348,7 @@ class SnowMasterGUI(QWidget):
     def _trigger_relaunch_from_reset(self, title: str):
         """Déclenche une relance après un reset."""
         try:
-            self.on_card_relaunch(title)
+            self.on_card_relaunch(title, manual=False)
         except Exception as e:
             app_log_error(f"[RESET] Relaunch failed for {title}: {e}")
 
@@ -13459,7 +13540,7 @@ class SnowMasterGUI(QWidget):
         # de manière asynchrone (non-bloquante car dans la queue d'événements Qt)
         # Cela permet d'exécuter on_card_relaunch dans le thread principal (nécessaire pour QFileDialog)
         # mais sans bloquer car c'est planifié dans la queue d'événements
-        QTimer.singleShot(0, lambda t=title: self.on_card_relaunch(t))
+        QTimer.singleShot(0, lambda t=title: self.on_card_relaunch(t, manual=False))
 
     def on_bus_reset_instance(self, title: str):
         """Reset demandé via signal Qt (complément de la file API Flask)."""
@@ -13619,6 +13700,12 @@ class SnowMasterGUI(QWidget):
         else:
             self._hide_debug_console()
         app_log_info(f"Console debug {'affichée' if val else 'masquée'}")
+
+    def on_toggle_pre_launch_scan(self, _state):
+        val = bool(self.chk_pre_launch_scan.isChecked())
+        _prefs.setdefault("instances", {})["pre_launch_scan"] = val
+        save_prefs(_prefs)
+        app_log_info(f"Scan pré lancement {'activé' if val else 'désactivé'}")
 
     def _ensure_debug_console(self) -> DebugConsoleDialog:
         _install_ui_log_capture()
@@ -16223,6 +16310,16 @@ def find_processes_by_title(title: str) -> List[dict]:
                 "controller": inst.controller_path,
             }
         ]
+    return scan_processes_by_title_forced(title)
+
+
+def scan_processes_by_title_forced(title: str) -> List[dict]:
+    """Scan cmdline ciblé sur un --title (ignore le raccourci PID stocké)."""
+    if not title:
+        return []
+    title_norm = title.strip().lower()
+    if not title_norm:
+        return []
     try:
         processes = scan_snowbot_processes_by_cmdline(
             verbose=False, known_titles={title}
