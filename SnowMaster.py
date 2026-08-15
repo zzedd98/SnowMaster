@@ -426,7 +426,7 @@ REDDOT_SECOND_RESET_COOLDOWN_S = 30 * 60  # pas de 2e reset auto avant 30 min
 REDDOT_LOG_BASENAME = "reddot.log"
 REDDOT_LOG_LINE_RE = re.compile(r"^(.+):(\d{2}/\d{2}/\d{4}) (\d{2})h(\d{2})$")
 # Attente max de la grande fenêtre au lancement / reset
-MAIN_WINDOW_LAUNCH_TIMEOUT_S = 120.0  # 2 minutes
+MAIN_WINDOW_LAUNCH_TIMEOUT_S = 180.0  # 3 minutes
 
 # ======== SERVER DISPLAY ORDER ========
 SERVER_KAMAS_DISPLAY_ORDER = [
@@ -2738,6 +2738,81 @@ def get_autoload_instances_file(prefs: dict) -> str:
     if (prefs or {}).get("bot_root"):
         return INSTANCES_FILE
     return (prefs or {}).get("autoload_instances_file") or INSTANCES_FILE
+
+
+def normalize_instance_record(data: dict) -> dict:
+    """Normalise les clés controller/exe/images/ratio depuis un dict config."""
+    controller = (
+        data.get("controller")
+        or data.get("controller_path")
+        or data.get("script")
+        or ""
+    )
+    exe = data.get("exe") or data.get("exe_path") or data.get("client_exe") or ""
+    images = data.get("images") or data.get("images_dir") or ""
+    try:
+        ratio = float(data.get("ratio") if data.get("ratio") is not None else 0.5)
+    except Exception:
+        ratio = 0.5
+    return {
+        "title": str(data.get("title") or "").strip(),
+        "controller": str(controller).strip() if controller else "",
+        "exe": str(exe).strip() if exe else "",
+        "images": str(images).strip() if images else "",
+        "ratio": ratio,
+    }
+
+
+def load_instance_record_from_disk(title: str) -> Optional[dict]:
+    """Lit la fiche d'une instance dans instances.json (autoload)."""
+    if not title:
+        return None
+    try:
+        autoload_file = get_autoload_instances_file(_prefs)
+        if not autoload_file or not os.path.exists(autoload_file):
+            return None
+        with open(autoload_file, "r", encoding="utf-8") as f:
+            autos = json.load(f)
+        if not isinstance(autos, list):
+            return None
+        for inst_data in autos:
+            if not isinstance(inst_data, dict):
+                continue
+            if str(inst_data.get("title") or "").strip() != title:
+                continue
+            return normalize_instance_record(inst_data)
+    except Exception:
+        pass
+    return None
+
+
+def apply_disk_record_to_instance(inst: "InstanceState", rec: Optional[dict]) -> bool:
+    """Complète controller/exe manquants depuis une fiche disque. Retourne True si modifié."""
+    if not inst or not rec:
+        return False
+    changed = False
+    disk_ctrl = (rec.get("controller") or "").strip()
+    disk_exe = (rec.get("exe") or "").strip()
+    disk_images = (rec.get("images") or "").strip()
+    cur_ctrl = (getattr(inst, "controller_path", None) or "").strip()
+    cur_exe = (getattr(inst, "exe_path", None) or "").strip()
+    if disk_ctrl and (not cur_ctrl or not os.path.exists(cur_ctrl)):
+        if os.path.exists(disk_ctrl):
+            inst.controller_path = disk_ctrl
+            changed = True
+    if disk_exe and (not cur_exe or not os.path.exists(cur_exe)):
+        if os.path.exists(disk_exe):
+            inst.exe_path = disk_exe
+            changed = True
+        else:
+            resolved = resolve_path_from_bot_root(_prefs, disk_exe, disk_exe)
+            if resolved and os.path.exists(resolved):
+                inst.exe_path = resolved
+                changed = True
+    if disk_images and not (getattr(inst, "images_dir", None) or "").strip():
+        inst.images_dir = disk_images
+        changed = True
+    return changed
 
 
 def parse_time_hhmm(s: str) -> Optional[Tuple[int, int]]:
@@ -9217,8 +9292,28 @@ class SnowMasterGUI(QWidget):
                             if title in _instances:
                                 continue
 
+                        rec = self._normalize_instance_record(inst_data)
                         inst = InstanceState(title)
-                        inst.controller_path = ctrl
+                        inst.controller_path = rec.get("controller") or ctrl
+                        if rec.get("exe"):
+                            exe_cand = rec["exe"]
+                            if os.path.exists(exe_cand):
+                                inst.exe_path = exe_cand
+                            else:
+                                resolved = resolve_path_from_bot_root(
+                                    _prefs, exe_cand, exe_cand
+                                )
+                                inst.exe_path = (
+                                    resolved
+                                    if resolved and os.path.exists(resolved)
+                                    else exe_cand
+                                )
+                        if rec.get("images"):
+                            inst.images_dir = rec["images"]
+                        try:
+                            inst.ratio = float(rec.get("ratio") or 0.5)
+                        except Exception:
+                            inst.ratio = 0.5
 
                         # Force état ARRETÉ propre
                         inst.pid = None
@@ -10779,18 +10874,32 @@ class SnowMasterGUI(QWidget):
             controller = controller_path
 
         if not controller:
-            print(f"[DEBUG on_card_relaunch_force] {title}: pas de controller, ABORT")
+            write_app_log(
+                f"[RELAUNCH_FORCE] '{title}': ABORT — controller introuvable"
+            )
             return
 
         # Killer les processus dupliqués si nécessaire
         if self._enforce_unique_title_processes(title):
             # print(f"[DEBUG on_card_relaunch_force] {title}: processus dupliqués tués")
-            inst, controller, exe, images, ratio = self._get_instance_launch_params(
+            inst, _controller2, exe, images, ratio = self._get_instance_launch_params(
                 title
             )
             if not inst:
                 # print(f"[DEBUG on_card_relaunch_force] {title}: inst None après enforce, return")
                 return
+            # Ne pas écraser le controller forcé par un éventuel trou mémoire
+            if controller_path:
+                controller = controller_path
+            elif _controller2:
+                controller = _controller2
+
+        if not exe:
+            exe = (EXE or "").strip() or None
+
+        write_app_log(
+            f"[RELAUNCH_FORCE] '{title}': exe={exe} controller={controller}"
+        )
 
         # PAS de check _is_instance_running - on force la relance
         # print(f"[DEBUG on_card_relaunch_force] {title}: Marquage awaiting_first_hb=True, stopped=False")
@@ -10977,9 +11086,7 @@ class SnowMasterGUI(QWidget):
             return
 
         # --- Comportement existant pour les instances "normales" ---
-        # print(f"[DEBUG on_card_relaunch] {title}: controller={controller}")
         if not controller:
-            # print(f"[DEBUG on_card_relaunch] {title}: pas de controller, demande à l'utilisateur")
             # Dernier recours : demander à l'utilisateur
             controller, _ = QFileDialog.getOpenFileName(
                 self,
@@ -10988,11 +11095,15 @@ class SnowMasterGUI(QWidget):
                 "Exécutables / Scripts (*.exe *.bat *.cmd *.py *.lua);;Tous (*.*)",
             )
             if not controller:
-                # print(f"[DEBUG on_card_relaunch] {title}: utilisateur a annulé, return")
                 return
             with _state_lock:
                 inst.controller_path = controller
                 _instances[title] = inst
+
+        if not exe:
+            exe = (EXE or "").strip() or None
+
+        write_app_log(f"[RELAUNCH] '{title}': exe={exe} controller={controller}")
 
         # print(f"[DEBUG on_card_relaunch] {title}: Marquage awaiting_first_hb=True, stopped=False")
         # Marquer l'instance comme "en attente du premier heartbeat" (voyant jaune)
@@ -11004,6 +11115,10 @@ class SnowMasterGUI(QWidget):
                 inst2.last_heartbeat = 0.0  # Réinitialiser pour forcer le voyant jaune
                 inst2.pid = None
                 inst2.hwnd = None
+                if controller:
+                    inst2.controller_path = controller
+                if exe:
+                    inst2.exe_path = exe
                 _instances[title] = inst2
         try:
             bus.instance_updated.emit(title)
@@ -11308,7 +11423,8 @@ class SnowMasterGUI(QWidget):
         for item in cfg:
             try:
                 title = str(item.get("title") or "").strip()
-                controller = item.get("controller") or ""
+                rec = self._normalize_instance_record(item)
+                controller = rec.get("controller") or ""
                 if not title or not controller:
                     continue
             except Exception:
@@ -11328,9 +11444,29 @@ class SnowMasterGUI(QWidget):
                 # toujours mettre à jour le controller (utile si on veut remplacer)
                 inst.title = title
                 inst.controller_path = controller
-                inst.exe_path = inst.exe_path or EXE
-                inst.images_dir = inst.images_dir or RESOURCES
-                inst.ratio = inst.ratio or 0.5
+                exe_from_cfg = rec.get("exe") or ""
+                if exe_from_cfg:
+                    if os.path.exists(exe_from_cfg):
+                        inst.exe_path = exe_from_cfg
+                    else:
+                        resolved = resolve_path_from_bot_root(
+                            _prefs, exe_from_cfg, exe_from_cfg
+                        )
+                        inst.exe_path = (
+                            resolved
+                            if resolved and os.path.exists(resolved)
+                            else exe_from_cfg
+                        )
+                else:
+                    inst.exe_path = inst.exe_path or EXE
+                if rec.get("images"):
+                    inst.images_dir = rec["images"]
+                else:
+                    inst.images_dir = inst.images_dir or RESOURCES
+                try:
+                    inst.ratio = float(rec.get("ratio") or inst.ratio or 0.5)
+                except Exception:
+                    inst.ratio = inst.ratio or 0.5
 
                 # Si l'instance existait déjà (restaurée ou manuelle), on NE la marque PAS comme stopped,
                 # pour éviter que l'autopilote la relance inutilement.
@@ -11468,9 +11604,10 @@ class SnowMasterGUI(QWidget):
                             )
                     continue
 
-                # Format dict : { "title": "...", "controller": "..." }
+                # Format dict : { "title": "...", "controller": "...", "exe": "..." }
                 title = str(item.get("title") or "").strip()
-                controller = item.get("controller") or ""
+                rec = self._normalize_instance_record(item)
+                controller = rec.get("controller") or ""
                 if not title:
                     continue
 
@@ -11490,9 +11627,29 @@ class SnowMasterGUI(QWidget):
                     inst.title = title
                     if controller:
                         inst.controller_path = controller
-                    inst.exe_path = inst.exe_path or EXE
-                    inst.images_dir = inst.images_dir or RESOURCES
-                    inst.ratio = inst.ratio or 0.5
+                    exe_from_cfg = rec.get("exe") or ""
+                    if exe_from_cfg:
+                        if os.path.exists(exe_from_cfg):
+                            inst.exe_path = exe_from_cfg
+                        else:
+                            resolved = resolve_path_from_bot_root(
+                                _prefs, exe_from_cfg, exe_from_cfg
+                            )
+                            inst.exe_path = (
+                                resolved
+                                if resolved and os.path.exists(resolved)
+                                else exe_from_cfg
+                            )
+                    else:
+                        inst.exe_path = inst.exe_path or EXE
+                    if rec.get("images"):
+                        inst.images_dir = rec["images"]
+                    else:
+                        inst.images_dir = inst.images_dir or RESOURCES
+                    try:
+                        inst.ratio = float(rec.get("ratio") or inst.ratio or 0.5)
+                    except Exception:
+                        inst.ratio = inst.ratio or 0.5
 
                     if not existed:
                         inst.stopped = True
@@ -12432,46 +12589,64 @@ class SnowMasterGUI(QWidget):
 
     def _load_controller_from_autoload(self, title: str) -> Optional[str]:
         """Charge le contrôleur depuis autoload_instances_file si disponible."""
-        try:
-            autoload_file = get_autoload_instances_file(_prefs)
-            if not autoload_file or not os.path.exists(autoload_file):
-                return None
-
-            with open(autoload_file, "r", encoding="utf-8") as f:
-                autos = json.load(f)
-
-            if isinstance(autos, list):
-                for inst_data in autos:
-                    if inst_data.get("title") == title:
-                        ctrl = inst_data.get("controller")
-                        if ctrl and os.path.exists(ctrl):
-                            return ctrl
-        except Exception as e:
-            app_log_warn(
-                f"Erreur lors du chargement du contrôleur depuis autoload pour {title}: {e}"
-            )
+        rec = load_instance_record_from_disk(title)
+        ctrl = (rec or {}).get("controller")
+        if ctrl and os.path.exists(ctrl):
+            return ctrl
         return None
+
+    def _normalize_instance_record(self, data: dict) -> dict:
+        return normalize_instance_record(data)
 
     def _get_instance_launch_params(
         self, title: str
     ) -> Tuple[
         Optional["InstanceState"], Optional[str], Optional[str], Optional[str], float
     ]:
+        """Retourne (inst, controller, exe, images, ratio). Si infos manquantes → charge depuis le disque."""
         with _state_lock:
             inst = _instances.get(title)
             if not inst:
                 return None, None, None, None, 0.0
-            controller = inst.controller_path
-            # Si le contrôleur est perdu, essayer de le charger depuis autoload_instances_file
-            if not controller:
-                controller = self._load_controller_from_autoload(title)
-                # Si trouvé, le sauvegarder dans l'instance
-                if controller:
-                    inst.controller_path = controller
-                    _instances[title] = inst
-            exe = inst.exe_path or EXE
-            images = inst.images_dir or RESOURCES
-            ratio = inst.ratio or 0.5
+            controller = (getattr(inst, "controller_path", None) or "").strip() or None
+            exe = (getattr(inst, "exe_path", None) or "").strip() or None
+            images = (getattr(inst, "images_dir", None) or "").strip() or None
+            try:
+                ratio = float(getattr(inst, "ratio", 0.5) or 0.5)
+            except Exception:
+                ratio = 0.5
+            need_fill = (not controller and not getattr(inst, "manual_empty", False)) or (
+                not exe
+            )
+
+        if need_fill:
+            rec = load_instance_record_from_disk(title)
+            with _state_lock:
+                inst = _instances.get(title)
+                if not inst:
+                    return None, None, None, None, 0.0
+                apply_disk_record_to_instance(inst, rec)
+                controller = (getattr(inst, "controller_path", None) or "").strip() or None
+                exe = (getattr(inst, "exe_path", None) or "").strip() or None
+                images = (getattr(inst, "images_dir", None) or "").strip() or None
+                try:
+                    ratio = float(getattr(inst, "ratio", 0.5) or 0.5)
+                except Exception:
+                    ratio = 0.5
+                if not exe:
+                    exe = (EXE or "").strip() or None
+                    if exe:
+                        inst.exe_path = exe
+                if not images:
+                    images = RESOURCES
+                    inst.images_dir = images
+                _instances[title] = inst
+        else:
+            if not exe:
+                exe = (EXE or "").strip() or None
+            if not images:
+                images = RESOURCES
+
         return inst, controller, exe, images, ratio
 
     def _kill_instance_background(self, title: str):
@@ -15187,6 +15362,16 @@ def restore_running_instances_from_cmdline():
                             inst.hwnd = int(info.get("hwnd"))
                         except:
                             pass
+                    if controller and not (getattr(inst, "controller_path", None) or "").strip():
+                        inst.controller_path = controller
+                    if info.get("exe") and not (getattr(inst, "exe_path", None) or "").strip():
+                        inst.exe_path = info.get("exe")
+                    try:
+                        apply_disk_record_to_instance(
+                            inst, load_instance_record_from_disk(title)
+                        )
+                    except Exception:
+                        pass
 
                     if is_empty_instance:
                         inst.manual_empty = True
@@ -15217,6 +15402,13 @@ def restore_running_instances_from_cmdline():
 
                 inst.controller_path = controller or None
                 inst.exe_path = info.get("exe") or None
+                # Compléter controller/exe depuis instances.json si absents de la cmdline
+                try:
+                    apply_disk_record_to_instance(
+                        inst, load_instance_record_from_disk(title)
+                    )
+                except Exception:
+                    pass
                 inst.images_dir = None
                 inst.last_heartbeat = 0.0
                 inst.stopped = False
