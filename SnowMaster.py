@@ -425,6 +425,8 @@ AUTO_REDDOT_RELAUNCH_DELAY_DEFAULT = 300  # secondes en reddot avant reset
 REDDOT_SECOND_RESET_COOLDOWN_S = 30 * 60  # pas de 2e reset auto avant 30 min
 REDDOT_LOG_BASENAME = "reddot.log"
 REDDOT_LOG_LINE_RE = re.compile(r"^(.+):(\d{2}/\d{2}/\d{4}) (\d{2})h(\d{2})$")
+# Attente max de la grande fenêtre au lancement / reset
+MAIN_WINDOW_LAUNCH_TIMEOUT_S = 120.0  # 2 minutes
 
 # ======== SERVER DISPLAY ORDER ========
 SERVER_KAMAS_DISPLAY_ORDER = [
@@ -10918,7 +10920,7 @@ class SnowMasterGUI(QWidget):
                     main_hwnd, main_pid = wait_for_large_window_for_process(
                         p,
                         start_ts,
-                        total_timeout=120.0,
+                        total_timeout=MAIN_WINDOW_LAUNCH_TIMEOUT_S,
                         min_screen_ratio=0.5,
                         poll_interval=0.25,
                         log_progress=True,
@@ -11000,6 +11002,8 @@ class SnowMasterGUI(QWidget):
                 inst2.awaiting_first_hb = True
                 inst2.stopped = False
                 inst2.last_heartbeat = 0.0  # Réinitialiser pour forcer le voyant jaune
+                inst2.pid = None
+                inst2.hwnd = None
                 _instances[title] = inst2
         try:
             bus.instance_updated.emit(title)
@@ -11014,8 +11018,8 @@ class SnowMasterGUI(QWidget):
                 "/register",
                 {
                     "title": title,
-                    "pid": inst.pid or 0,
-                    "hwnd": inst.hwnd or 0,
+                    "pid": 0,
+                    "hwnd": 0,
                     "controller": controller,
                     "exe": exe,
                     "images": images,
@@ -11695,7 +11699,7 @@ class SnowMasterGUI(QWidget):
                 main_hwnd, main_pid = wait_for_large_window_for_process(
                     p,
                     start_ts,
-                    total_timeout=120.0,
+                    total_timeout=MAIN_WINDOW_LAUNCH_TIMEOUT_S,
                     min_screen_ratio=0.5,
                     poll_interval=0.25,
                     log_progress=True,
@@ -11963,10 +11967,24 @@ class SnowMasterGUI(QWidget):
                     if inst.stopped:
                         continue
                     # Détecter les instances avec PID et HWND invalides (0 ou None)
-                    # Ces instances sont considérées comme terminées même si stopped=False
+                    # SAUF si un lancement/reset est en cours (awaiting_first_hb) :
+                    # on_card_relaunch enregistre d'abord pid=0/hwnd=0 volontairement.
                     pid = inst.pid
                     hwnd = inst.hwnd
                     if (not pid or pid == 0) and (not hwnd or hwnd == 0):
+                        if getattr(inst, "awaiting_first_hb", False):
+                            age = 0.0
+                            try:
+                                lr = float(getattr(inst, "last_reset", 0.0) or 0.0)
+                                if lr > 0:
+                                    age = time.time() - lr
+                            except Exception:
+                                age = 0.0
+                            scan_log(
+                                f"[SCAN_PIDS] '{title}': lancement/reset en cours "
+                                f"(awaiting_first_hb, {age:.0f}s) — PID/HWND 0 ignorés"
+                            )
+                            continue
                         scan_log(
                             f"[SCAN_PIDS] '{title}': Instance avec PID={pid}, HWND={hwnd} invalides détectée (stopped={inst.stopped})"
                         )
@@ -12306,11 +12324,34 @@ class SnowMasterGUI(QWidget):
             if inst:
                 pid = inst.pid
 
+        killed = set()
         if pid:
             try:
                 terminate_process_tree(int(pid), timeout=3.0)
+                killed.add(int(pid))
             except Exception as e:
                 app_log_warn(f"[RESET] Terminate failed for {title}: {e}")
+
+        # Pendant un lancement raté, l'état peut rester pid=0 alors qu'un process
+        # --title existe encore : on le retrouve via la cmdline.
+        try:
+            for info in find_processes_by_title(title) or []:
+                p = info.get("pid")
+                if not p:
+                    continue
+                try:
+                    p = int(p)
+                except Exception:
+                    continue
+                if p in killed:
+                    continue
+                try:
+                    terminate_process_tree(p, timeout=3.0)
+                    killed.add(p)
+                except Exception as e:
+                    app_log_warn(f"[RESET] Terminate title-PID {p} failed for {title}: {e}")
+        except Exception as e:
+            app_log_warn(f"[RESET] find_processes_by_title failed for {title}: {e}")
 
         self._mark_instance_stopped(title)
 
@@ -13977,7 +14018,7 @@ def wait_for_windows_with_early_register(
     title_for_register,
     args=None,
     poll_interval=0.25,
-    total_timeout=120.0,
+    total_timeout=MAIN_WINDOW_LAUNCH_TIMEOUT_S,
     min_screen_ratio=0.5,
     use_virtual_screen=False,
     early_connexion_image=None,  # <— AJOUT
@@ -14001,6 +14042,34 @@ def wait_for_windows_with_early_register(
     app_log_info(
         "Launched PID=%s @ %s", p.pid, datetime.fromtimestamp(start_ts).isoformat()
     )
+    # Enregistrer tout de suite le PID launcher pour que le scan périodique
+    # ne croie pas que l'instance est morte (pid=0) pendant l'attente fenêtre.
+    try:
+        post_json_with_retry(
+            "/register",
+            {
+                "title": title_for_register,
+                "pid": int(p.pid),
+                "hwnd": 0,
+                "touch": True,
+            },
+            timeout=2.0,
+            retries=2,
+            delay=0.2,
+        )
+    except Exception:
+        try:
+            _post_json(
+                "/register",
+                {
+                    "title": title_for_register,
+                    "pid": int(p.pid),
+                    "hwnd": 0,
+                    "touch": True,
+                },
+            )
+        except Exception:
+            pass
 
     scr_area, _ = screen_area(use_virtual_screen)
     threshold = scr_area * float(min_screen_ratio)
@@ -14011,6 +14080,13 @@ def wait_for_windows_with_early_register(
     while True:
         now = time.time()
         if now - start_ts > total_timeout:
+            flow_log(
+                f"Timeout {int(total_timeout)}s — arrêt du processus de lancement"
+            )
+            try:
+                terminate_process_tree(int(p.pid), timeout=3.0)
+            except Exception:
+                pass
             raise TimeoutError(
                 f"Timeout fenêtre >= {int(min_screen_ratio*100)}% écran."
             )
@@ -14203,7 +14279,7 @@ def _set_empty_instance_window_title(main_hwnd, title, log_prefix=None):
 def wait_for_large_window_for_process(
     p,
     start_ts,
-    total_timeout=120.0,
+    total_timeout=MAIN_WINDOW_LAUNCH_TIMEOUT_S,
     min_screen_ratio=0.5,
     poll_interval=0.25,
     log_progress=True,
@@ -14340,7 +14416,7 @@ def run_snowbot_flow(
                 title_for_register=title,
                 args=args,
                 poll_interval=0.25,
-                total_timeout=120.0,
+                total_timeout=MAIN_WINDOW_LAUNCH_TIMEOUT_S,
                 min_screen_ratio=min_screen_ratio,
                 use_virtual_screen=False,
                 early_connexion_image=(
@@ -14364,6 +14440,16 @@ def run_snowbot_flow(
                     retries=2,
                     delay=0.2,
                 )
+            except Exception:
+                pass
+            # Timeout / échec fenêtre : relancer proprement (kill orphelins + relaunch).
+            try:
+                is_timeout = isinstance(e, TimeoutError) or (
+                    "Timeout fenêtre" in str(e)
+                )
+                if is_timeout:
+                    flow_log("Relance automatique après timeout fenêtre")
+                    bus.reset_instance.emit(title)
             except Exception:
                 pass
             return
