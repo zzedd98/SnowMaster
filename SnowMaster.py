@@ -158,7 +158,6 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect,
     QSystemTrayIcon,
     QTextEdit,
-    QPlainTextEdit,
     QLineEdit,
     QProgressBar,
     QFrame,
@@ -255,155 +254,13 @@ scan_pids_logger.setLevel(logging.DEBUG)
 if not scan_pids_logger.handlers:
     scan_pids_logger.addHandler(logging.NullHandler())
 
-# ----- Console debug UI (capture uniquement si cochée) -----
-_UI_LOG_MAX = 4000
-_ui_log_buffer: Deque[str] = deque(maxlen=_UI_LOG_MAX)
-_ui_log_lock = threading.Lock()
-_ui_log_bridge = None  # LogBridge
-_ui_log_capture_enabled = False
-_orig_stdout = None
-_orig_stderr = None
+# ----- Console Windows native (show/hide, pas de capture UI) -----
+# Références des flux CONOUT$ pour éviter qu'ils soient GC et fermés.
+_native_console_stdio = None
+_console_ctrl_handler_ref = None  # garder vivant le callback SetConsoleCtrlHandler
 
 # Contexte logs lancement (thread-local) → "[PID - Titre] message"
 _flow_log_tls = threading.local()
-
-
-class LogBridge(QObject):
-    """Pont thread-safe : émet les lignes de log vers la console UI."""
-
-    line = Signal(str)
-
-
-class UiLogHandler(logging.Handler):
-    """Handler logging → buffer UI (seulement si capture activée)."""
-
-    def emit(self, record):
-        if not _ui_log_capture_enabled:
-            return
-        try:
-            msg = self.format(record)
-        except Exception:
-            msg = str(getattr(record, "msg", record))
-        _ui_log_append(msg)
-
-
-class _StdoutTee:
-    """Duplique stdout/stderr vers la console UI si capture activée."""
-
-    def __init__(self, stream, prefix: str = ""):
-        self._stream = stream
-        self._prefix = prefix
-        self._buf = ""
-
-    def write(self, data):
-        try:
-            if self._stream is not None:
-                self._stream.write(data)
-                try:
-                    self._stream.flush()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        if not _ui_log_capture_enabled:
-            return len(data) if data is not None else 0
-        try:
-            text = str(data)
-        except Exception:
-            return 0
-        if not text:
-            return 0
-        self._buf += text
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            line = line.rstrip("\r")
-            if line:
-                _ui_log_append(f"{self._prefix}{line}" if self._prefix else line)
-        return len(text)
-
-    def flush(self):
-        try:
-            if self._stream is not None:
-                self._stream.flush()
-        except Exception:
-            pass
-        if not _ui_log_capture_enabled:
-            self._buf = ""
-            return
-        if self._buf.strip():
-            _ui_log_append(
-                f"{self._prefix}{self._buf.rstrip()}"
-                if self._prefix
-                else self._buf.rstrip()
-            )
-            self._buf = ""
-
-    def isatty(self):
-        try:
-            return bool(self._stream and self._stream.isatty())
-        except Exception:
-            return False
-
-    @property
-    def encoding(self):
-        return getattr(self._stream, "encoding", "utf-8")
-
-
-def _ui_log_append(line: str):
-    """Écrit dans le buffer console UI uniquement si la capture est activée."""
-    if not _ui_log_capture_enabled:
-        return
-    try:
-        ts = datetime.now().strftime("%H:%M:%S")
-    except Exception:
-        ts = "--:--:--"
-    text = str(line).rstrip("\n\r")
-    if not text:
-        return
-    if len(text) >= 8 and text[2] == ":" and text[5] == ":":
-        formatted = text
-    else:
-        formatted = f"[{ts}] {text}"
-    with _ui_log_lock:
-        _ui_log_buffer.append(formatted)
-    bridge = _ui_log_bridge
-    if bridge is not None:
-        try:
-            bridge.line.emit(formatted)
-        except Exception:
-            pass
-
-
-def _install_ui_log_capture():
-    """Installe tee stdout/stderr + handler logging (idempotent)."""
-    global _ui_log_bridge, _orig_stdout, _orig_stderr
-    if _ui_log_bridge is None:
-        _ui_log_bridge = LogBridge()
-    fmt = logging.Formatter("%(levelname)s %(name)s: %(message)s")
-    handler = UiLogHandler()
-    handler.setLevel(logging.DEBUG)
-    handler.setFormatter(fmt)
-    for lg in (logger,):
-        if not any(isinstance(h, UiLogHandler) for h in lg.handlers):
-            lg.addHandler(handler)
-    if _orig_stdout is None:
-        _orig_stdout = sys.stdout
-        _orig_stderr = sys.stderr
-        sys.stdout = _StdoutTee(_orig_stdout)
-        sys.stderr = _StdoutTee(_orig_stderr)
-
-
-def enable_ui_log_capture():
-    """Active l'écriture vers la console UI (+ installe le tee si besoin)."""
-    global _ui_log_capture_enabled
-    _install_ui_log_capture()
-    _ui_log_capture_enabled = True
-
-
-def disable_ui_log_capture():
-    """Coupe l'écriture vers la console UI (plus rien n'est bufferisé)."""
-    global _ui_log_capture_enabled
-    _ui_log_capture_enabled = False
 
 
 def debug_console_visible_pref() -> bool:
@@ -411,6 +268,116 @@ def debug_console_visible_pref() -> bool:
         return bool(_prefs.get("ui", {}).get("debug_console_visible", False))
     except Exception:
         return False
+
+
+def _get_console_hwnd() -> int:
+    try:
+        return int(ctypes.windll.kernel32.GetConsoleWindow() or 0)
+    except Exception:
+        return 0
+
+
+def _protect_console_from_closing_app() -> None:
+    """Évite que la croix / Ctrl+C de la console tue tout le process GUI."""
+    global _console_ctrl_handler_ref
+    try:
+        hwnd = _get_console_hwnd()
+        if hwnd:
+            SC_CLOSE = 0xF060
+            MF_BYCOMMAND = 0x0000
+            hmenu = ctypes.windll.user32.GetSystemMenu(hwnd, False)
+            if hmenu:
+                ctypes.windll.user32.DeleteMenu(hmenu, SC_CLOSE, MF_BYCOMMAND)
+    except Exception:
+        pass
+    if _console_ctrl_handler_ref is not None:
+        return
+    try:
+        HandlerRoutine = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+
+        def _handler(ctrl_type):
+            # 0=C, 1=BREAK, 2=CLOSE : on ignore pour ne pas tuer l'UI
+            if int(ctrl_type) in (0, 1, 2):
+                return 1
+            return 0
+
+        _console_ctrl_handler_ref = HandlerRoutine(_handler)
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_console_ctrl_handler_ref, True)
+    except Exception:
+        _console_ctrl_handler_ref = None
+
+
+def _attach_stdio_to_console() -> None:
+    """Rebranche stdout/stderr sur la console Windows (pythonw / exe windowed)."""
+    global _native_console_stdio
+    try:
+        out = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+        err = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+        sys.stdout = out
+        sys.stderr = err
+        _native_console_stdio = (out, err)
+    except Exception:
+        pass
+
+
+def show_native_console() -> bool:
+    """Affiche la vraie console Windows (AllocConsole si absente)."""
+    hwnd = _get_console_hwnd()
+    created = False
+    if not hwnd:
+        try:
+            if not ctypes.windll.kernel32.AllocConsole():
+                return False
+            created = True
+        except Exception:
+            return False
+        try:
+            title = f"Console — {APP_DISPLAY_NAME}"
+        except Exception:
+            title = "Console"
+        try:
+            ctypes.windll.kernel32.SetConsoleTitleW(title)
+        except Exception:
+            pass
+        _attach_stdio_to_console()
+        hwnd = _get_console_hwnd()
+    if not hwnd:
+        return False
+    _protect_console_from_closing_app()
+    try:
+        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+    except Exception:
+        try:
+            ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
+        except Exception:
+            return False
+    if created:
+        try:
+            print(f"[{APP_DISPLAY_NAME}] Console native active.")
+        except Exception:
+            pass
+    return True
+
+
+def hide_native_console() -> None:
+    """Masque la console Windows (les print continuent, fenêtre invisible)."""
+    hwnd = _get_console_hwnd()
+    if not hwnd:
+        return
+    try:
+        win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+    except Exception:
+        try:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+        except Exception:
+            pass
+
+
+def apply_native_console_visibility(visible: bool) -> None:
+    if visible:
+        show_native_console()
+    else:
+        hide_native_console()
 
 
 def set_flow_log_context(title: Optional[str] = None, pid=None) -> None:
@@ -629,7 +596,7 @@ DEFAULT_PREFS = {
         "right_panel_visible": True,  # panneau droite Sous-contrôleurs / détails
         "compact_instances": False,  # cartes instances sans boutons (plus étroites)
         "always_on_top": False,  # garder SnowMaster au-dessus des autres fenêtres
-        "debug_console_visible": False,  # fenêtre console + capture logs (seulement si coché)
+        "debug_console_visible": False,  # afficher/masquer la vraie console Windows
         "refresh_interval_active_ms": 1000,
         "refresh_interval_inactive_ms": 2500,  # fenêtre inactive / minimisée
         "bus_coalesce_ms": 300,  # regroupement des heartbeats avant refresh UI
@@ -7096,87 +7063,6 @@ class CollapsibleGroupBox(QWidget):
         self._content_layout.addStretch(stretch)
 
 
-class DebugConsoleDialog(QDialog):
-    """Fenêtre de logs application en temps réel (uniquement si capture activée)."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Console — {APP_DISPLAY_NAME}")
-        self.setMinimumSize(720, 420)
-        self.resize(900, 520)
-        self.setWindowFlag(Qt.Window, True)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        toolbar = QHBoxLayout()
-        self.btn_clear = QPushButton("Effacer")
-        self.btn_clear.setCursor(Qt.PointingHandCursor)
-        self.btn_clear.clicked.connect(self._clear)
-        self.chk_autoscroll = QCheckBox("Auto-scroll")
-        self.chk_autoscroll.setChecked(True)
-        toolbar.addWidget(self.btn_clear)
-        toolbar.addWidget(self.chk_autoscroll)
-        toolbar.addStretch(1)
-        layout.addLayout(toolbar)
-
-        self.text = QPlainTextEdit()
-        self.text.setReadOnly(True)
-        self.text.setMaximumBlockCount(_UI_LOG_MAX)
-        self.text.setStyleSheet(
-            "QPlainTextEdit {"
-            " background:#0b1220; color:#e2e8f0;"
-            " border:1px solid rgba(148,163,184,0.28); border-radius:8px;"
-            " font-family: Consolas, 'Courier New', monospace; font-size:12px;"
-            "}"
-        )
-        layout.addWidget(self.text, 1)
-
-        with _ui_log_lock:
-            snapshot = list(_ui_log_buffer)
-        if snapshot:
-            self.text.setPlainText("\n".join(snapshot))
-            self._scroll_to_end()
-
-        if _ui_log_bridge is not None:
-            _ui_log_bridge.line.connect(self._on_line)
-
-    def _on_line(self, line: str):
-        self.text.appendPlainText(line)
-        if self.chk_autoscroll.isChecked():
-            self._scroll_to_end()
-
-    def _scroll_to_end(self):
-        try:
-            cursor = self.text.textCursor()
-            cursor.movePosition(QTextCursor.End)
-            self.text.setTextCursor(cursor)
-            self.text.ensureCursorVisible()
-        except Exception:
-            pass
-
-    def _clear(self):
-        with _ui_log_lock:
-            _ui_log_buffer.clear()
-        self.text.clear()
-
-    def closeEvent(self, event):
-        event.ignore()
-        self.hide()
-        disable_ui_log_capture()
-        parent = self.parent()
-        try:
-            if parent is not None and hasattr(parent, "chk_debug_console"):
-                parent.chk_debug_console.blockSignals(True)
-                parent.chk_debug_console.setChecked(False)
-                parent.chk_debug_console.blockSignals(False)
-                _prefs.setdefault("ui", {})["debug_console_visible"] = False
-                save_prefs(_prefs)
-        except Exception:
-            pass
-
-
 class HeartbeatHistoryDialog(QDialog):
     """Historique heartbeats d'une instance — refresh manuel, filtres via setHidden (pas de rebuild texte)."""
 
@@ -8856,11 +8742,10 @@ class SnowMasterGUI(QWidget):
         self.chk_debug_console = QCheckBox("Afficher la console")
         self.chk_debug_console.setChecked(debug_console_visible_pref())
         self.chk_debug_console.setToolTip(
-            "Coché : capture les logs et ouvre la console temps réel.\n"
-            "Décoché : aucune écriture dans la console (rien n'est bufferisé)."
+            "Coché : affiche la vraie console Windows de l'application.\n"
+            "Décoché : masque cette console (sans la détruire)."
         )
         self.chk_debug_console.stateChanged.connect(self.on_toggle_debug_console)
-        self._debug_console_dialog: Optional[DebugConsoleDialog] = None
 
         # Lecture initiale des prefs pour les instances
         instances_prefs = _prefs.get("instances", {})
@@ -9483,8 +9368,8 @@ class SnowMasterGUI(QWidget):
                 pass
 
         # Console debug : uniquement si la case est cochée (sinon aucune capture)
-        if self.chk_debug_console.isChecked():
-            QTimer.singleShot(300, self._show_debug_console)
+        # Appliquer tout de suite la visibilité console (évite un flash au démarrage).
+        apply_native_console_visibility(bool(self.chk_debug_console.isChecked()))
 
     def eventFilter(self, obj, event):
         if obj is self.list and event.type() == QEvent.Resize:
@@ -12916,30 +12801,7 @@ class SnowMasterGUI(QWidget):
         val = bool(self.chk_debug_console.isChecked())
         _prefs.setdefault("ui", {})["debug_console_visible"] = val
         save_prefs(_prefs)
-        if val:
-            self._show_debug_console()
-        else:
-            self._hide_debug_console()
-
-    def _ensure_debug_console(self) -> DebugConsoleDialog:
-        enable_ui_log_capture()
-        dlg = getattr(self, "_debug_console_dialog", None)
-        if dlg is None:
-            dlg = DebugConsoleDialog(self)
-            self._debug_console_dialog = dlg
-        return dlg
-
-    def _show_debug_console(self):
-        dlg = self._ensure_debug_console()
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
-
-    def _hide_debug_console(self):
-        disable_ui_log_capture()
-        dlg = getattr(self, "_debug_console_dialog", None)
-        if dlg is not None:
-            dlg.hide()
+        apply_native_console_visibility(val)
 
     def on_toggle_config_panel(self, checked: bool):
         """Affiche / masque le panneau central Configs & Boutons."""
@@ -15858,6 +15720,13 @@ def maybe_check_for_update_and_run_updater(parent_widget=None) -> bool:
 def main():
     load_paths()
     _sync_local_version_txt()
+
+    # Masquer tout de suite la console Windows si la case est décochée
+    # (cas python.exe : évite une fenêtre noire pendant le splash).
+    try:
+        apply_native_console_visibility(debug_console_visible_pref())
+    except Exception:
+        pass
 
     # start flask server in a background thread
     threading.Thread(target=run_server, daemon=True).start()
