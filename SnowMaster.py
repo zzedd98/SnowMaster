@@ -3949,6 +3949,9 @@ def api_register():
     with _state_lock:
         inst = _instances.get(title) or InstanceState(title)
         inst.title = title
+        # Mémoriser avant de forcer awaiting : l'early /register ne doit PAS
+        # repousser last_reset (sinon le timeout jaune 30s ne part jamais).
+        was_awaiting = bool(getattr(inst, "awaiting_first_hb", False))
         inst.awaiting_first_hb = True
         inst.stopped = False
         if "pid" in data:
@@ -3982,7 +3985,9 @@ def api_register():
             inst.sub_map = _parse_subcontrollers(data["subcontrollers"], time.time())
         if data.get("touch", True):
             now_ts = time.time()
-            inst.last_reset = now_ts  # <-- NOUVEAU : marquer le lancement
+            # last_reset = chrono du lancement UI uniquement (pas early register)
+            if not was_awaiting:
+                inst.last_reset = now_ts
             # Ne pas inventer un heartbeat « vivant » si aucun process n'est encore là
             # (sinon l'UI affiche une MAJ + _is_instance_running croit l'instance active).
             pid_ok = bool(inst.pid) and int(inst.pid) != 0
@@ -10224,8 +10229,8 @@ class SnowMasterGUI(QWidget):
                             self.list.setCurrentItem(_it)
                             self.update_card_selection_styles()
                             self.update_selected_details()
-                            # Jaune immédiat au clic, puis lancement
-                            self._mark_instance_launching_ui(title)
+                            # Ne pas peindre jaune avant spawn : on_card_relaunch le fait
+                            # après les checks (évite jaune fantôme si abort / race).
                             QTimer.singleShot(
                                 0, lambda t=title: self.on_card_relaunch(t)
                             )
@@ -10853,6 +10858,9 @@ class SnowMasterGUI(QWidget):
     def _spawn_runner_thread(self, exe, controller, images, ratio, title):
         # smid = str(uuid.uuid4())
         args = [f"--title={title}", f"--controller={controller}"]
+        app_log_info(
+            f"[SPAWN] '{title}': start thread exe={exe!r} controller={controller!r}"
+        )
         t = threading.Thread(
             target=run_snowbot_flow,
             args=(exe, controller, title, images, ratio, args),
@@ -10949,7 +10957,15 @@ class SnowMasterGUI(QWidget):
             self.update_global_dot()
         except Exception:
             pass
-        # Si aucun PID (même launcher) après le timeout → retenter sans attendre le scan périodique
+        # Re-check périodique tant que jaune (one-shot unique = risque de rater le timeout
+        # si last_reset / PID évoluent entre-temps).
+        self._schedule_yellow_watch(title)
+        return True
+
+    def _schedule_yellow_watch(self, title: str):
+        """Planifie un contrôle jaune ; se ré-arme tant que l'instance reste en awaiting."""
+        if not title:
+            return
         try:
             QTimer.singleShot(
                 int(float(AWAITING_LAUNCH_TIMEOUT_S) * 1000),
@@ -10957,10 +10973,12 @@ class SnowMasterGUI(QWidget):
             )
         except Exception:
             pass
-        return True
 
     def _check_yellow_no_pid_timeout(self, title: str):
-        """Après AWAITING_LAUNCH_TIMEOUT_S en jaune sans PID/HWND vivant → relance auto."""
+        """Après AWAITING_LAUNCH_TIMEOUT_S en jaune sans 1er HB → relance auto.
+
+        Un PID launcher encore vivant ne doit PAS bloquer : sans HB c'est un lancement raté.
+        """
         if not title:
             return
         with _state_lock:
@@ -10977,23 +10995,22 @@ class SnowMasterGUI(QWidget):
                 inst.last_heartbeat or 0.0
             )
 
-        # Un lancement plus récent a déjà reset le chrono
-        if launch_ts > 0 and (time.time() - launch_ts) < (
-            float(AWAITING_LAUNCH_TIMEOUT_S) - 0.5
-        ):
+        age = (time.time() - launch_ts) if launch_ts > 0 else 1e9
+        # Lancement plus récent : ré-armer la montre, ne pas relancer tout de suite
+        if age < (float(AWAITING_LAUNCH_TIMEOUT_S) - 0.5):
+            self._schedule_yellow_watch(title)
             return
 
-        pid_ok = is_pid_alive(pid) if pid else False
-        hwnd_ok = is_hwnd_valid(hwnd) if hwnd else False
-        if pid_ok or hwnd_ok:
-            return
-
+        # Toujours en jaune après le délai → (re)lancer, même si un PID zombie existe
         if not self._auto_relaunch_still_needed(title, "jaune_timeout"):
+            # Peut encore être busy/cooldown : réessayer plus tard
+            self._schedule_yellow_watch(title)
             return
 
         now = time.time()
         last = self._last_auto_relaunch_attempt.get(title, 0.0)
         if now - last < float(AUTO_RELAUNCH_COOLDOWN_S):
+            self._schedule_yellow_watch(title)
             return
 
         if manual_empty:
@@ -11002,19 +11019,28 @@ class SnowMasterGUI(QWidget):
             controller_path = self._resolve_controller_path(title, controller)
             if not controller_path:
                 scan_log(
-                    f"[YELLOW_TIMEOUT] '{title}': 30s sans PID, controller introuvable"
+                    f"[YELLOW_TIMEOUT] '{title}': 30s sans 1er HB, controller introuvable"
                 )
+                self._schedule_yellow_watch(title)
                 return
 
         scan_log(
-            f"[YELLOW_TIMEOUT] '{title}': {AWAITING_LAUNCH_TIMEOUT_S}s en jaune sans PID — relance"
+            f"[YELLOW_TIMEOUT] '{title}': {AWAITING_LAUNCH_TIMEOUT_S}s en jaune "
+            f"sans 1er HB (pid={pid}) — kill + relance"
         )
         self._last_auto_relaunch_attempt[title] = now
+        # Tuer l'arbre éventuel (launcher coincé) avant de respawn
+        if pid:
+            try:
+                terminate_process_tree(int(pid), timeout=3.0)
+            except Exception:
+                pass
         if controller_path:
             with _state_lock:
                 inst2 = _instances.get(title)
                 if inst2:
                     inst2.controller_path = controller_path
+        self._mark_instance_busy(title, reason="jaune_timeout")
         self.relaunch_requested.emit(title)
 
     def _schedule_post_launch_register(
@@ -11090,10 +11116,26 @@ class SnowMasterGUI(QWidget):
         if not inst:
             return
 
-        # Gris / stopped : pas de psutil frais. Sinon cache UI (scan périodique suffit).
-        need_fresh = (not inst.stopped) and bool(inst.pid or inst.hwnd)
-        if self._is_instance_running(inst, fresh=need_fresh):
-            return
+        # Déjà en lancement récent AVEC process → ne pas re-spawn (évite les doubles).
+        # Jaune sans process, ou jaune trop vieux (timeout) → on (re)lance.
+        if getattr(inst, "awaiting_first_hb", False):
+            launch_ts = float(getattr(inst, "last_reset", 0.0) or 0.0)
+            age = (time.time() - launch_ts) if launch_ts > 0 else 1e9
+            if age < float(AWAITING_LAUNCH_TIMEOUT_S):
+                pid_ok = is_pid_alive(inst.pid) if inst.pid else False
+                hwnd_ok = is_hwnd_valid(inst.hwnd) if inst.hwnd else False
+                if pid_ok or hwnd_ok:
+                    return
+            # Timeout / pas de process : tuer un éventuel launcher zombie avant respawn
+            if inst.pid:
+                try:
+                    terminate_process_tree(int(inst.pid), timeout=3.0)
+                except Exception:
+                    pass
+        else:
+            need_fresh = (not inst.stopped) and bool(inst.pid or inst.hwnd)
+            if self._is_instance_running(inst, fresh=need_fresh):
+                return
 
         # Jaune → spawn immédiat. Pas de scan doublons synchrone avant Popen.
         self._mark_instance_launching_ui(title)
@@ -12562,12 +12604,10 @@ class SnowMasterGUI(QWidget):
         hb_fresh = last_hb > 0 and (time.time() - last_hb) < float(HEARTBEAT_RED_S)
 
         if reason == "jaune_timeout":
-            # Seulement si toujours en lancement sans process réel
+            # Toujours en awaiting passé le délai → relancer.
+            # Un PID launcher vivant sans 1er HB = lancement raté (ne pas bloquer).
             if stopped or not awaiting:
                 return False
-            if pid_ok or hwnd_ok:
-                return False
-            # Timeout réel : la fenêtre busy doit être expirée (ou last_reset trop vieux)
             if last_reset > 0 and (time.time() - last_reset) < float(
                 AWAITING_LAUNCH_TIMEOUT_S
             ):
@@ -14329,8 +14369,13 @@ def post_json_with_retry(path: str, payload: dict, timeout=2.0, retries=5, delay
 CREATE_NEW_CONSOLE = 0x00000010
 
 
-def acquire_mouse_lock(owner, ttl=120.0, poll=0.5):
-    """Loop until we acquire the global mouse lock via HTTP endpoint."""
+def acquire_mouse_lock(owner, ttl=120.0, poll=0.5, max_wait: float = 180.0):
+    """Loop until we acquire the global mouse lock via HTTP endpoint.
+
+    max_wait : abandonne après N secondes (évite de bloquer indéfiniment
+    une file de lancements si un owner ne libère pas le lock).
+    """
+    t0 = time.time()
     while True:
         try:
             resp = post_json_with_retry(
@@ -14344,6 +14389,11 @@ def acquire_mouse_lock(owner, ttl=120.0, poll=0.5):
                 return True
         except Exception:
             pass
+        if max_wait is not None and (time.time() - t0) >= float(max_wait):
+            app_log_warn(
+                f"[MOUSE_LOCK] '{owner}': timeout acquire après {max_wait:.0f}s — continue sans lock"
+            )
+            return False
         time.sleep(poll)
 
 
