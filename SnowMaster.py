@@ -11267,8 +11267,10 @@ class SnowMasterGUI(QWidget):
             except Exception:
                 pass
 
-        # Reset runtime complet + busy + mouse lock
-        self._mark_instance_stopped(title, clear_busy=True, release_lock=True)
+        # Kill manuel : état = jamais lancée (pas le chemin reset/auto)
+        self._mark_instance_stopped(
+            title, clear_busy=True, release_lock=True, as_never_launched=True
+        )
 
         try:
             _post_json("/goodbye", {"title": title})
@@ -13630,18 +13632,36 @@ class SnowMasterGUI(QWidget):
         *,
         clear_busy: bool = True,
         release_lock: bool = True,
+        as_never_launched: bool = False,
     ):
-        """Arrêt complet : état = jamais lancée (gris), config fiche conservée."""
-        scan_log(f"[MARK_STOPPED] '{title}': arrêt complet (état jamais lancée)...")
+        """Arrête l'instance (process déjà tué à part).
+
+        as_never_launched=True  → kill manuel : tout effacé, carte grise « jamais lancée ».
+        as_never_launched=False → reset/auto : stop léger (pid/hwnd/jaune), garde Last Reset / historiques.
+        """
+        mode = "jamais lancée" if as_never_launched else "stop léger (reset/auto)"
+        scan_log(f"[MARK_STOPPED] '{title}': {mode}...")
         with _state_lock:
             inst = _instances.get(title)
             if inst:
-                inst.reset_as_never_launched()
+                if as_never_launched:
+                    inst.reset_as_never_launched()
+                else:
+                    # Stop avant relance : ne pas toucher last_reset / logs / hb_history
+                    inst.pid = None
+                    inst.hwnd = None
+                    inst.stopped = True
+                    inst.awaiting_first_hb = False
+                    inst.awaiting_since = 0.0
+                    inst.launcher_seen_at = 0.0
+                    inst.last_heartbeat = 0.0
+                    inst.restored_recently = False
+                    try:
+                        inst.sub_map.clear()
+                    except Exception:
+                        inst.sub_map = {}
                 _instances[title] = inst
-                scan_log(
-                    f"[MARK_STOPPED] '{title}': ✓ stoppée / jamais lancée "
-                    f"(config conservée)"
-                )
+                scan_log(f"[MARK_STOPPED] '{title}': ✓ {mode}")
             else:
                 scan_log(
                     f"[MARK_STOPPED] '{title}': ⚠️ Instance non trouvée dans _instances"
@@ -13653,21 +13673,22 @@ class SnowMasterGUI(QWidget):
                 self._last_auto_relaunch_attempt.pop(title, None)
             except Exception:
                 pass
-            # Annuler un reset encore en file pour ce titre
-            try:
-                pending = getattr(self, "_pending_resets", None)
-                if pending and title in pending:
-                    self._pending_resets = [t for t in pending if t != title]
-            except Exception:
-                pass
-            try:
-                with _pending_api_resets_lock:
-                    if title in _pending_api_resets:
-                        _pending_api_resets[:] = [
-                            t for t in _pending_api_resets if t != title
-                        ]
-            except Exception:
-                pass
+            # Kill manuel seulement : annuler les resets encore en file
+            if as_never_launched:
+                try:
+                    pending = getattr(self, "_pending_resets", None)
+                    if pending and title in pending:
+                        self._pending_resets = [t for t in pending if t != title]
+                except Exception:
+                    pass
+                try:
+                    with _pending_api_resets_lock:
+                        if title in _pending_api_resets:
+                            _pending_api_resets[:] = [
+                                t for t in _pending_api_resets if t != title
+                            ]
+                except Exception:
+                    pass
 
         if release_lock:
             try:
@@ -13757,7 +13778,10 @@ class SnowMasterGUI(QWidget):
             except Exception as e:
                 app_log_warn(f"[RESET] Terminate extra failed for {title} pid={p2}: {e}")
 
-        self._mark_instance_stopped(title)
+        # Reset/auto : stop léger (garde Last Reset / historiques), busy déjà posé par le caller
+        self._mark_instance_stopped(
+            title, clear_busy=False, release_lock=True, as_never_launched=False
+        )
         print(f"[RESET] '{title}' stoppé (killed={sorted(killed) or 'aucun'})")
 
     def _trigger_relaunch_from_reset(self, title: str):
@@ -13931,8 +13955,10 @@ class SnowMasterGUI(QWidget):
                         proc.kill()
             except Exception as e:
                 app_log_warn(f"Terminate failed for {title}: {e}")
-        # Utiliser _mark_instance_stopped pour garantir que tous les champs sont réinitialisés
-        self._mark_instance_stopped(title)
+        # Arrêt volontaire (goodbye / background) : comme un kill manuel
+        self._mark_instance_stopped(
+            title, clear_busy=True, release_lock=True, as_never_launched=True
+        )
         try:
             _post_json("/goodbye", {"title": title})
         except Exception:
