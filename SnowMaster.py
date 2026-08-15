@@ -395,6 +395,14 @@ def pre_launch_scan_enabled() -> bool:
         return True
 
 
+def aggressive_duplicate_kill_enabled() -> bool:
+    """Préférence : kill agressif de tous les doublons (sinon launchers seulement)."""
+    try:
+        return bool(_prefs.get("instances", {}).get("aggressive_duplicate_kill", False))
+    except Exception:
+        return False
+
+
 def scan_log(msg):
     """Log du scan des PIDs (console uniquement, plus de fichier dédié)."""
     try:
@@ -492,9 +500,12 @@ SERVER_SCRAPE_NAME = {
 # ======== AUTO RELAUNCH CONFIG ========
 AUTO_RELAUNCH_DEFAULT = True  # relance crash toujours active (plus de case à cocher)
 AUTO_RELAUNCH_COOLDOWN_S = 10  # anti-spam par instance
-# Lancement (voyant jaune) sans aucun PID/HWND (pas même le launcher) :
-# au-delà → relance auto (pas de passage au gris)
-AWAITING_LAUNCH_TIMEOUT_S = 30
+# Phase 1 (jaune) : délai max pour recevoir le 1er PID launcher
+AWAITING_LAUNCHER_PID_TIMEOUT_S = 30
+# Phase 2 (jaune, PID launcher connu) : délai max pour le 1er heartbeat
+AWAITING_FIRST_HB_TIMEOUT_S = 180  # 3 minutes
+# Alias rétrocompat (phase PID)
+AWAITING_LAUNCH_TIMEOUT_S = AWAITING_LAUNCHER_PID_TIMEOUT_S
 AUTO_REDDOT_RELAUNCH_DEFAULT = False
 AUTO_REDDOT_RELAUNCH_DELAY_DEFAULT = 300  # secondes en reddot avant reset
 REDDOT_SECOND_RESET_COOLDOWN_S = 30 * 60  # pas de 2e reset auto avant 30 min
@@ -550,6 +561,7 @@ DEFAULT_PREFS = {
         "scan_pid_interval_ms": 30000,  # scan léger PID/HWND (ms)
         "scan_pid_full_every": 10,  # 1 scan complet (doublons) tous les N légers (~5 min si 30s)
         "pre_launch_scan": True,  # avant lancement manuel : tuer d'éventuels PID --title restants
+        "aggressive_duplicate_kill": False,  # True = kill TOUS les doublons + relance
     },
     # Configuration pour Discord : envoi de hook quand le voyant global passe au rouge
     "discord": {
@@ -3309,7 +3321,8 @@ class InstanceState:
         self.sub_map: Dict[str, Dict[str, float]] = {}
         self.last_heartbeat: float = 0.0
         self.last_reset: float = 0.0  # horodatage d'une vraie requête /reset (UI « Last Reset »)
-        self.awaiting_since: float = 0.0  # début du lancement jaune (timeout / anti-double)
+        self.awaiting_since: float = 0.0  # début du lancement jaune (chrono phase PID)
+        self.launcher_seen_at: float = 0.0  # 1er PID launcher vu → démarre chrono HB 3 min
 
         self.logs: Deque[str] = deque(maxlen=MAX_LOGS_PER_INSTANCE)
         self.stopped: bool = False
@@ -3472,6 +3485,75 @@ def _instance_awaiting_since(inst: "InstanceState") -> float:
     except Exception:
         pass
     return 0.0
+
+
+def _note_launcher_seen(inst: "InstanceState", pid=None, hwnd=None) -> None:
+    """Marque le 1er PID/HWND launcher pendant un lancement jaune (démarre le chrono HB)."""
+    if inst is None or not getattr(inst, "awaiting_first_hb", False):
+        return
+    try:
+        if float(getattr(inst, "launcher_seen_at", 0.0) or 0.0) > 0:
+            return
+    except Exception:
+        pass
+    pid_ok = False
+    hwnd_ok = False
+    try:
+        pid_ok = bool(pid) and int(pid) != 0
+    except Exception:
+        pid_ok = False
+    try:
+        hwnd_ok = bool(hwnd) and int(hwnd) != 0
+    except Exception:
+        hwnd_ok = False
+    if not pid_ok and not hwnd_ok:
+        return
+    inst.launcher_seen_at = time.time()
+
+
+def _yellow_launch_phase(inst: "InstanceState") -> Tuple[str, float, float]:
+    """Phase jaune courante.
+
+    Returns:
+        (phase, deadline_ts, remaining_s)
+        phase: \"pid\" | \"hb\" | \"done\"
+    """
+    if inst is None or not getattr(inst, "awaiting_first_hb", False):
+        return "done", 0.0, 0.0
+    now = time.time()
+    launch_ts = _instance_awaiting_since(inst)
+    if launch_ts <= 0:
+        launch_ts = now
+
+    pid = getattr(inst, "pid", None)
+    hwnd = getattr(inst, "hwnd", None)
+    try:
+        pid_ok = bool(pid) and int(pid) != 0 and is_pid_alive(int(pid))
+    except Exception:
+        pid_ok = False
+    try:
+        hwnd_ok = bool(hwnd) and int(hwnd) != 0 and is_hwnd_valid(int(hwnd))
+    except Exception:
+        hwnd_ok = False
+
+    has_launcher = bool(pid_ok or hwnd_ok)
+    if has_launcher:
+        try:
+            seen = float(getattr(inst, "launcher_seen_at", 0.0) or 0.0)
+        except Exception:
+            seen = 0.0
+        if seen <= 0:
+            # PID déjà là mais jamais noté → démarrer le chrono HB maintenant
+            seen = now
+            try:
+                inst.launcher_seen_at = seen
+            except Exception:
+                pass
+        deadline = seen + float(AWAITING_FIRST_HB_TIMEOUT_S)
+        return "hb", deadline, deadline - now
+
+    deadline = launch_ts + float(AWAITING_LAUNCHER_PID_TIMEOUT_S)
+    return "pid", deadline, deadline - now
 
 
 def _record_instance_reset_history(title: str, now_ts: Optional[float] = None) -> None:
@@ -4191,6 +4273,7 @@ def api_register():
                 inst.hwnd = int(data["hwnd"])
             except:
                 pass
+        _note_launcher_seen(inst, getattr(inst, "pid", None), getattr(inst, "hwnd", None))
         # Instance manuelle : un register avec PID/HWND réels = fenêtre OK → bleu (pas jaune)
         if getattr(inst, "manual_empty", False):
             pid_ok = bool(inst.pid) and int(inst.pid) != 0
@@ -4273,6 +4356,7 @@ def api_heartbeat():
         inst.last_heartbeat = now_ts
         inst.awaiting_first_hb = False
         inst.awaiting_since = 0.0
+        inst.launcher_seen_at = 0.0
         # si c'était marqué restauré, on le retire pour repasser au vert
         if getattr(inst, "restored_recently", False):
             inst.restored_recently = False
@@ -9084,6 +9168,17 @@ class SnowMasterGUI(QWidget):
         )
         self.chk_pre_launch_scan.stateChanged.connect(self.on_toggle_pre_launch_scan)
 
+        self.chk_aggressive_dup_kill = QCheckBox("Agressif (kill doublons)")
+        self.chk_aggressive_dup_kill.setChecked(aggressive_duplicate_kill_enabled())
+        self.chk_aggressive_dup_kill.setToolTip(
+            "Coché : en cas de doublons (--title), tue TOUS les process puis relance.\n"
+            "Décoché : ne tue que les PID launcher (écran de chargement) ;\n"
+            "une instance déjà lancée (grande fenêtre) est laissée intacte."
+        )
+        self.chk_aggressive_dup_kill.stateChanged.connect(
+            self.on_toggle_aggressive_dup_kill
+        )
+
         # Lecture initiale des prefs pour les instances
         instances_prefs = _prefs.get("instances", {})
         default_delay = int(instances_prefs.get("launch_delay", 1))
@@ -9215,6 +9310,7 @@ class SnowMasterGUI(QWidget):
         inst_group_collapsible.addWidget(self.chk_always_on_top)
         inst_group_collapsible.addWidget(self.chk_debug_console)
         inst_group_collapsible.addWidget(self.chk_pre_launch_scan)
+        inst_group_collapsible.addWidget(self.chk_aggressive_dup_kill)
         # inst_group_collapsible.addWidget(self.btn_save_cfg)
         # inst_group_collapsible.addWidget(self.btn_load_cfg)
         # Checkbox: overwrite existing instances when loading a config
@@ -11227,12 +11323,13 @@ class SnowMasterGUI(QWidget):
                 duration_s
                 if duration_s is not None
                 else max(
-                    float(AWAITING_LAUNCH_TIMEOUT_S),
+                    float(AWAITING_LAUNCHER_PID_TIMEOUT_S)
+                    + float(AWAITING_FIRST_HB_TIMEOUT_S),
                     float(AUTO_RELAUNCH_COOLDOWN_S) * 2,
                 )
             )
         except Exception:
-            dur = float(AWAITING_LAUNCH_TIMEOUT_S)
+            dur = float(AWAITING_FIRST_HB_TIMEOUT_S)
         until = time.time() + max(5.0, dur)
         prev = float(self._instance_busy_until.get(title, 0.0) or 0.0)
         if until > prev:
@@ -11276,17 +11373,13 @@ class SnowMasterGUI(QWidget):
         if last > 0 and (time.time() - last) < float(AUTO_RELAUNCH_COOLDOWN_S):
             return True
 
-        # Lancement jaune récent (awaiting + awaiting_since)
+        # Lancement jaune récent (phase PID 30s ou phase HB 3 min)
         if inst is None:
             with _state_lock:
                 inst = _instances.get(title)
         if inst is not None and getattr(inst, "awaiting_first_hb", False):
-            launch_ts = _instance_awaiting_since(inst) or float(
-                getattr(inst, "last_heartbeat", 0.0) or 0.0
-            )
-            if launch_ts > 0 and (time.time() - launch_ts) < float(
-                AWAITING_LAUNCH_TIMEOUT_S
-            ):
+            _phase, _deadline, remaining = _yellow_launch_phase(inst)
+            if remaining > 0:
                 return True
         return False
 
@@ -11301,7 +11394,8 @@ class SnowMasterGUI(QWidget):
             inst.awaiting_first_hb = True
             inst.stopped = False
             inst.last_heartbeat = 0.0
-            inst.awaiting_since = time.time()  # chrono jaune — pas last_reset (UI Reset)
+            inst.awaiting_since = time.time()  # chrono phase 1 (PID launcher)
+            inst.launcher_seen_at = 0.0  # chrono phase 2 démarre au 1er PID
             inst.pid = None
             inst.hwnd = None
         self._mark_instance_busy(title, reason="launch")
@@ -11311,28 +11405,35 @@ class SnowMasterGUI(QWidget):
             self.update_global_dot()
         except Exception:
             pass
-        # Re-check périodique tant que jaune (one-shot unique = risque de rater le timeout
-        # si awaiting_since / PID évoluent entre-temps).
+        # Re-check périodique tant que jaune (phase PID puis phase HB).
         self._schedule_yellow_watch(title)
         return True
 
-    def _schedule_yellow_watch(self, title: str):
-        """Planifie un contrôle jaune ; se ré-arme tant que l'instance reste en awaiting."""
+    def _schedule_yellow_watch(self, title: str, delay_ms: Optional[int] = None):
+        """Planifie un contrôle jaune selon la phase (PID 30s / HB 3 min)."""
         if not title:
             return
         try:
+            if delay_ms is None:
+                with _state_lock:
+                    inst = _instances.get(title)
+                    if not inst or not getattr(inst, "awaiting_first_hb", False):
+                        return
+                    _phase, _deadline, remaining = _yellow_launch_phase(inst)
+                if remaining > 0.5:
+                    delay_ms = int(remaining * 1000) + 250
+                else:
+                    delay_ms = 400
+            delay_ms = max(400, int(delay_ms))
             QTimer.singleShot(
-                int(float(AWAITING_LAUNCH_TIMEOUT_S) * 1000),
-                lambda t=title: self._check_yellow_no_pid_timeout(t),
+                delay_ms,
+                lambda t=title: self._check_yellow_launch_timeout(t),
             )
         except Exception:
             pass
 
-    def _check_yellow_no_pid_timeout(self, title: str):
-        """Après AWAITING_LAUNCH_TIMEOUT_S en jaune sans 1er HB → relance auto.
-
-        Un PID launcher encore vivant ne doit PAS bloquer : sans HB c'est un lancement raté.
-        """
+    def _check_yellow_launch_timeout(self, title: str):
+        """Timeout jaune en 2 phases : 30s sans PID launcher, puis 3 min sans 1er HB."""
         if not title:
             return
         with _state_lock:
@@ -11341,23 +11442,21 @@ class SnowMasterGUI(QWidget):
                 return
             if not getattr(inst, "awaiting_first_hb", False):
                 return
+            # Si un PID vient d'apparaître, noter le début du chrono HB
+            _note_launcher_seen(inst, inst.pid, inst.hwnd)
+            phase, _deadline, remaining = _yellow_launch_phase(inst)
             pid = inst.pid
             hwnd = inst.hwnd
             manual_empty = bool(getattr(inst, "manual_empty", False))
             controller = inst.controller_path
-            launch_ts = _instance_awaiting_since(inst) or float(
-                inst.last_heartbeat or 0.0
-            )
 
-        age = (time.time() - launch_ts) if launch_ts > 0 else 1e9
-        # Lancement plus récent : ré-armer la montre, ne pas relancer tout de suite
-        if age < (float(AWAITING_LAUNCH_TIMEOUT_S) - 0.5):
+        # Pas encore timeout pour la phase courante → ré-armer
+        if remaining > 0.5:
             self._schedule_yellow_watch(title)
             return
 
-        # Toujours en jaune après le délai → (re)lancer, même si un PID zombie existe
+        # Timeout de la phase courante
         if not self._auto_relaunch_still_needed(title, "jaune_timeout"):
-            # Peut encore être busy/cooldown : réessayer plus tard
             self._schedule_yellow_watch(title)
             return
 
@@ -11373,17 +11472,24 @@ class SnowMasterGUI(QWidget):
             controller_path = self._resolve_controller_path(title, controller)
             if not controller_path:
                 scan_log(
-                    f"[YELLOW_TIMEOUT] '{title}': 30s sans 1er HB, controller introuvable"
+                    f"[YELLOW_TIMEOUT] '{title}': timeout phase={phase}, "
+                    f"controller introuvable"
                 )
                 self._schedule_yellow_watch(title)
                 return
 
-        scan_log(
-            f"[YELLOW_TIMEOUT] '{title}': {AWAITING_LAUNCH_TIMEOUT_S}s en jaune "
-            f"sans 1er HB (pid={pid}) — kill + relance"
-        )
+        if phase == "pid":
+            msg = (
+                f"[YELLOW_TIMEOUT] '{title}': {AWAITING_LAUNCHER_PID_TIMEOUT_S}s "
+                f"sans PID launcher — kill + relance"
+            )
+        else:
+            msg = (
+                f"[YELLOW_TIMEOUT] '{title}': {AWAITING_FIRST_HB_TIMEOUT_S}s "
+                f"après PID launcher sans 1er HB (pid={pid}) — kill + relance"
+            )
+        scan_log(msg)
         self._last_auto_relaunch_attempt[title] = now
-        # Tuer l'arbre éventuel (launcher coincé) avant de respawn
         if pid:
             try:
                 terminate_process_tree(int(pid), timeout=3.0)
@@ -11463,7 +11569,10 @@ class SnowMasterGUI(QWidget):
         self._schedule_post_launch_register(title, controller, exe, images, ratio)
 
     def _pre_launch_scan_kill(self, title: str) -> List[int]:
-        """Scan léger (cmdline, un titre) avant lancement manuel : tue les PID --title restants.
+        """Scan léger (cmdline, un titre) avant lancement manuel.
+
+        - Mode normal : ne tue que les PID launcher ; laisse une instance déjà lancée.
+        - Mode agressif : tue tous les PID --title.
 
         Returns:
             Liste des PIDs tués.
@@ -11479,9 +11588,12 @@ class SnowMasterGUI(QWidget):
             print(f"[PRE_LAUNCH] '{title}': aucun process --title trouvé")
             return []
 
+        aggressive = aggressive_duplicate_kill_enabled()
         killed: List[int] = []
+        kept_launched: List[int] = []
         print(
-            f"[PRE_LAUNCH] '{title}': {len(matches)} process trouvé(s) — fermeture avant lancement"
+            f"[PRE_LAUNCH] '{title}': {len(matches)} process "
+            f"(mode={'agressif' if aggressive else 'launchers seulement'})"
         )
         for info in matches:
             try:
@@ -11489,6 +11601,12 @@ class SnowMasterGUI(QWidget):
             except Exception:
                 continue
             if not pid_int or not is_pid_alive(pid_int):
+                continue
+            if not aggressive and not is_launcher_pid(pid_int, title):
+                kept_launched.append(pid_int)
+                print(
+                    f"[PRE_LAUNCH] '{title}': conserve PID {pid_int} (instance lancée)"
+                )
                 continue
             try:
                 terminate_process_tree(pid_int, timeout=3.0)
@@ -11501,13 +11619,16 @@ class SnowMasterGUI(QWidget):
             with _state_lock:
                 inst = _instances.get(title)
                 if inst:
-                    inst.pid = None
-                    inst.hwnd = None
-                    inst.last_heartbeat = 0.0
-                    # Pas stopped=True : on enchaîne sur un spawn manuel
+                    # Si une instance lancée reste, réaligner le PID stocké
+                    if kept_launched and is_pid_alive(kept_launched[0]):
+                        inst.pid = kept_launched[0]
+                    else:
+                        inst.pid = None
+                        inst.hwnd = None
+                        inst.last_heartbeat = 0.0
                     _instances[title] = inst
             app_log_info(
-                "[PRE_LAUNCH] '%s': anciens PID fermés %s", title, killed
+                "[PRE_LAUNCH] '%s': tués=%s gardés=%s", title, killed, kept_launched
             )
         return killed
 
@@ -11520,24 +11641,19 @@ class SnowMasterGUI(QWidget):
             return
 
         # Lancement manuel uniquement : scan léger anti-doublon (pas reset / auto).
-        killed_pre = []
         if manual:
-            killed_pre = self._pre_launch_scan_kill(title)
+            self._pre_launch_scan_kill(title)
             # Recharger l'état après éventuel kill
             with _state_lock:
                 inst = _instances.get(title) or inst
 
-        # Déjà en lancement récent AVEC process → ne pas re-spawn (évite les doubles).
-        # Jaune sans process, ou jaune trop vieux (timeout) → on (re)lance.
+        # Déjà en lancement : ne pas re-spawn tant que la phase PID/HB n'a pas expiré.
         if getattr(inst, "awaiting_first_hb", False):
-            launch_ts = _instance_awaiting_since(inst)
-            age = (time.time() - launch_ts) if launch_ts > 0 else 1e9
-            if age < float(AWAITING_LAUNCH_TIMEOUT_S):
-                pid_ok = is_pid_alive(inst.pid) if inst.pid else False
-                hwnd_ok = is_hwnd_valid(inst.hwnd) if inst.hwnd else False
-                if pid_ok or hwnd_ok:
-                    return
-            # Timeout / pas de process : tuer un éventuel launcher zombie avant respawn
+            _note_launcher_seen(inst, inst.pid, inst.hwnd)
+            _phase, _deadline, remaining = _yellow_launch_phase(inst)
+            if remaining > 0:
+                return
+            # Timeout phase : tuer un éventuel launcher zombie avant respawn
             if inst.pid:
                 try:
                     terminate_process_tree(int(inst.pid), timeout=3.0)
@@ -11545,8 +11661,7 @@ class SnowMasterGUI(QWidget):
                     pass
         else:
             need_fresh = (not inst.stopped) and bool(inst.pid or inst.hwnd)
-            # Si on vient de tuer des orphelins au pré-scan, ne pas no-op sur HB frais
-            if not killed_pre and self._is_instance_running(inst, fresh=need_fresh):
+            if self._is_instance_running(inst, fresh=need_fresh):
                 return
 
         # Jaune → spawn immédiat. Pas de scan doublons synchrone avant Popen.
@@ -11586,6 +11701,7 @@ class SnowMasterGUI(QWidget):
                     try:
                         inst.pid = int(p.pid)
                         inst.stopped = False
+                        _note_launcher_seen(inst, inst.pid, None)
                     except Exception:
                         pass
                     _instances[title] = inst
@@ -12315,7 +12431,8 @@ class SnowMasterGUI(QWidget):
         inst.manual_empty = True
         now_ts = time.time()
         inst.last_heartbeat = now_ts
-        inst.awaiting_since = now_ts  # chrono jaune — pas last_reset
+        inst.awaiting_since = now_ts  # chrono jaune phase PID — pas last_reset
+        inst.launcher_seen_at = 0.0  # chrono phase HB démarre au 1er PID
         inst.awaiting_first_hb = True
         inst.stopped = False
 
@@ -12358,21 +12475,23 @@ class SnowMasterGUI(QWidget):
                     pass
                 return
 
-            start_ts = time.time()
-            _log_empty(
-                f"[{title}] PID={p.pid} démarrage ok, attente grande fenêtre (voyant jaune)"
-            )
             with _state_lock:
                 try:
                     inst.pid = int(p.pid)
                     inst.stopped = False
-                    _instances[title] = inst
+                    _note_launcher_seen(inst, inst.pid, None)
                 except Exception:
                     pass
+                _instances[title] = inst
             try:
                 bus.instance_updated.emit(title)
             except Exception:
                 pass
+
+            start_ts = time.time()
+            _log_empty(
+                f"[{title}] PID={p.pid} démarrage ok, attente grande fenêtre (voyant jaune)"
+            )
 
             watch_pid, seen = _attach_empty_instance_window(title, p, start_ts, inst)
             _watch_empty_instance_tree(title, p, watch_pid, seen_pids=seen)
@@ -12726,31 +12845,31 @@ class SnowMasterGUI(QWidget):
                     pid = inst.pid
                     hwnd = inst.hwnd
                     if (not pid or pid == 0) and (not hwnd or hwnd == 0):
-                        # En cours de lancement : laisser le temps au process d'apparaître
+                        # En cours de lancement : laisser le temps au PID launcher d'apparaître
                         if getattr(inst, "awaiting_first_hb", False):
-                            launch_ts = _instance_awaiting_since(inst) or float(
-                                getattr(inst, "last_heartbeat", 0.0) or 0.0
-                            )
-                            age = (time.time() - launch_ts) if launch_ts > 0 else 1e9
-                            if age < float(AWAITING_LAUNCH_TIMEOUT_S):
+                            phase, _deadline, remaining = _yellow_launch_phase(inst)
+                            if phase == "pid" and remaining > 0:
                                 scan_log(
-                                    f"[SCAN_PIDS] '{title}': PID/HWND absents mais awaiting_first_hb "
-                                    f"(âge={age:.0f}s < {AWAITING_LAUNCH_TIMEOUT_S}s) — ignore"
+                                    f"[SCAN_PIDS] '{title}': PID/HWND absents mais phase PID "
+                                    f"(reste={remaining:.0f}s < {AWAITING_LAUNCHER_PID_TIMEOUT_S}s) — ignore"
                                 )
                                 continue
-                            scan_log(
-                                f"[SCAN_PIDS] '{title}': lancement jaune timeout "
-                                f"({age:.0f}s sans PID) — relance auto"
-                            )
-                            yellow_timeout_relaunches.append(
-                                {
-                                    "title": title,
-                                    "controller_path": inst.controller_path,
-                                    "manual_empty": bool(
-                                        getattr(inst, "manual_empty", False)
-                                    ),
-                                }
-                            )
+                            if phase == "pid" and remaining <= 0:
+                                scan_log(
+                                    f"[SCAN_PIDS] '{title}': timeout phase PID "
+                                    f"({AWAITING_LAUNCHER_PID_TIMEOUT_S}s sans launcher) — relance auto"
+                                )
+                                yellow_timeout_relaunches.append(
+                                    {
+                                        "title": title,
+                                        "controller_path": inst.controller_path,
+                                        "manual_empty": bool(
+                                            getattr(inst, "manual_empty", False)
+                                        ),
+                                    }
+                                )
+                                continue
+                            # phase hb sans pid ? anormal → laisser le watch UI gérer
                             continue
                         scan_log(
                             f"[SCAN_PIDS] '{title}': Instance avec PID={pid}, HWND={hwnd} invalides détectée (stopped={inst.stopped})"
@@ -12765,6 +12884,7 @@ class SnowMasterGUI(QWidget):
                             inst.hwnd = None
                             inst.awaiting_first_hb = False
                             inst.awaiting_since = 0.0
+                            inst.launcher_seen_at = 0.0
                             inst.last_heartbeat = 0.0
                             try:
                                 inst.sub_map.clear()
@@ -12776,6 +12896,28 @@ class SnowMasterGUI(QWidget):
                             )
                         continue
                     # Copier les valeurs nécessaires pour éviter les accès concurrents
+                    _note_launcher_seen(inst, pid, hwnd)
+                    phase, _deadline, remaining = _yellow_launch_phase(inst)
+                    # Phase HB expirée sans 1er HB → relance (même avec PID launcher vivant)
+                    if (
+                        getattr(inst, "awaiting_first_hb", False)
+                        and phase == "hb"
+                        and remaining <= 0
+                    ):
+                        scan_log(
+                            f"[SCAN_PIDS] '{title}': timeout phase HB "
+                            f"({AWAITING_FIRST_HB_TIMEOUT_S}s après PID sans 1er HB) — relance auto"
+                        )
+                        yellow_timeout_relaunches.append(
+                            {
+                                "title": title,
+                                "controller_path": inst.controller_path,
+                                "manual_empty": bool(
+                                    getattr(inst, "manual_empty", False)
+                                ),
+                            }
+                        )
+                        continue
                     instances_snapshot.append(
                         {
                             "title": title,
@@ -12787,6 +12929,11 @@ class SnowMasterGUI(QWidget):
                             ),
                             "manual_empty": bool(getattr(inst, "manual_empty", False)),
                             "awaiting_since": float(_instance_awaiting_since(inst) or 0.0),
+                            "launcher_seen_at": float(
+                                getattr(inst, "launcher_seen_at", 0.0) or 0.0
+                            ),
+                            "yellow_remaining": float(remaining),
+                            "yellow_phase": phase,
                         }
                     )
 
@@ -12851,12 +12998,49 @@ class SnowMasterGUI(QWidget):
 
                     title_procs = processes_by_title.get(title, []) if do_full else []
                     if do_full and len(title_procs) > 1:
+                        aggressive = aggressive_duplicate_kill_enabled()
+                        if aggressive:
+                            scan_log(
+                                f"[SCAN_PIDS] '{title}': ⚠️ DOUBLONS ({len(title_procs)} process) "
+                                f"— mode agressif : kill tous + relance"
+                            )
+                            self._kill_all_title_processes(title, title_procs)
+                            if inst_data.get("manual_empty"):
+                                actions_to_perform.append(
+                                    ("relaunch", title, None, "doublons")
+                                )
+                                continue
+                            controller_path = self._resolve_controller_path(
+                                title, inst_data["controller_path"]
+                            )
+                            if controller_path:
+                                actions_to_perform.append(
+                                    ("relaunch", title, controller_path, "doublons")
+                                )
+                            else:
+                                scan_log(
+                                    f"[SCAN_PIDS] '{title}': ✗ doublons tués mais controller introuvable"
+                                )
+                                app_log_error(
+                                    f"[SCAN_PIDS] '{title}': Doublons nettoyés mais controller_path introuvable"
+                                )
+                            continue
+
+                        # Mode normal : tuer seulement les launchers, garder l'instance lancée
                         scan_log(
-                            f"[SCAN_PIDS] '{title}': ⚠️ DOUBLONS détectés ({len(title_procs)} processus) "
-                            f"— kill tous + relance"
+                            f"[SCAN_PIDS] '{title}': ⚠️ DOUBLONS ({len(title_procs)} process) "
+                            f"— kill launchers seulement"
                         )
-                        # Comportement historique : fermer TOUS les process du titre, puis relancer.
-                        self._kill_all_title_processes(title, title_procs)
+                        kept = self._kill_launcher_duplicates_only(title, title_procs)
+                        if kept:
+                            scan_log(
+                                f"[SCAN_PIDS] '{title}': instance lancée conservée pid={kept}"
+                            )
+                            continue
+                        scan_log(
+                            f"[SCAN_PIDS] '{title}': plus aucun process lancé vivant "
+                            f"après nettoyage launchers → relance"
+                        )
                         if inst_data.get("manual_empty"):
                             actions_to_perform.append(
                                 ("relaunch", title, None, "doublons")
@@ -12866,15 +13050,12 @@ class SnowMasterGUI(QWidget):
                             title, inst_data["controller_path"]
                         )
                         if controller_path:
-                            scan_log(
-                                f"[SCAN_PIDS] '{title}': ✓ Controller trouvé: {controller_path}"
-                            )
                             actions_to_perform.append(
                                 ("relaunch", title, controller_path, "doublons")
                             )
                         else:
                             scan_log(
-                                f"[SCAN_PIDS] '{title}': ✗ ERREUR - Controller introuvable ! Instance restera fermée."
+                                f"[SCAN_PIDS] '{title}': ✗ ERREUR - Controller introuvable !"
                             )
                             app_log_error(
                                 f"[SCAN_PIDS] '{title}': Doublons nettoyés mais controller_path introuvable"
@@ -12889,19 +13070,39 @@ class SnowMasterGUI(QWidget):
                         is_hwnd_valid(inst_data["hwnd"]) if inst_data["hwnd"] else False
                     )
 
-                    # Lancement en cours : un PID launcher mort un instant ≠ crash à relancer
+                    # Lancement en cours : ne pas traiter comme crash tant que la phase n'a pas expiré
                     if inst_data.get("awaiting_first_hb"):
-                        lr = float(inst_data.get("awaiting_since") or 0.0)
-                        if lr > 0 and (now - lr) < float(AWAITING_LAUNCH_TIMEOUT_S):
+                        rem = float(inst_data.get("yellow_remaining") or 0.0)
+                        if rem > 0:
                             scan_log(
-                                f"[SCAN_PIDS] '{title}': awaiting_first_hb "
-                                f"(âge={now - lr:.0f}s) — skip crash check"
+                                f"[SCAN_PIDS] '{title}': awaiting "
+                                f"(phase={inst_data.get('yellow_phase')}, reste={rem:.0f}s) "
+                                f"— skip crash check"
                             )
                             continue
 
                     if not pid_ok and not hwnd_ok:
+                        # PID/HWND stockés morts : un autre process --title peut encore vivre
+                        # (ex. doublon busy ignoré, launcher mort, instance lancée OK).
+                        alt_procs = (
+                            list(title_procs)
+                            if (do_full and title_procs)
+                            else None
+                        )
+                        adopted = self._adopt_title_process_if_alive(
+                            title, alt_procs
+                        )
+                        if adopted:
+                            scan_log(
+                                f"[SCAN_PIDS] '{title}': PID/HWND stockés morts "
+                                f"(pid={inst_data['pid']}) mais process vivant "
+                                f"adopté pid={adopted} — pas de crash/relance"
+                            )
+                            continue
                         scan_log(
-                            f"[SCAN_PIDS] '{title}': ⚠️ CRASH détecté (PID={inst_data['pid']} mort, HWND={inst_data['hwnd']} invalide)"
+                            f"[SCAN_PIDS] '{title}': ⚠️ CRASH détecté "
+                            f"(PID={inst_data['pid']} mort, HWND={inst_data['hwnd']} invalide, "
+                            f"aucun autre process --title)"
                         )
                         if inst_data.get("manual_empty"):
                             # Instance manuelle : relancer sans controller
@@ -13001,44 +13202,43 @@ class SnowMasterGUI(QWidget):
             pid = inst.pid
             hwnd = inst.hwnd
             last_hb = float(inst.last_heartbeat or 0.0)
-            launch_ts = float(_instance_awaiting_since(inst) or 0.0)
+            if awaiting:
+                _note_launcher_seen(inst, pid, hwnd)
+            phase, _deadline, remaining = (
+                _yellow_launch_phase(inst) if awaiting else ("done", 0.0, 0.0)
+            )
 
         pid_ok = is_pid_alive(pid) if pid else False
         hwnd_ok = is_hwnd_valid(hwnd) if hwnd else False
         hb_fresh = last_hb > 0 and (time.time() - last_hb) < float(HEARTBEAT_RED_S)
 
         if reason == "jaune_timeout":
-            # Toujours en awaiting passé le délai → relancer.
-            # Un PID launcher vivant sans 1er HB = lancement raté (ne pas bloquer).
+            # Timeout de la phase courante (PID 30s ou HB 3 min) expiré → relancer
             if stopped or not awaiting:
                 return False
-            if launch_ts > 0 and (time.time() - launch_ts) < float(
-                AWAITING_LAUNCH_TIMEOUT_S
-            ):
+            if remaining > 0.5:
                 return False
             return True
 
         if reason == "crash":
             # Process mort = relancer même si le dernier HB est encore « vert ».
-            # Mais pas pendant un lancement/reset en cours (PID launcher peut être mort un instant).
-            if (
-                awaiting
-                and launch_ts > 0
-                and (time.time() - launch_ts) < float(AWAITING_LAUNCH_TIMEOUT_S)
-            ):
+            # Mais pas pendant un lancement encore dans sa fenêtre de grâce.
+            if awaiting and remaining > 0.5:
                 return False
             if pid_ok or hwnd_ok:
+                return False
+            # Autre PID même --title encore vivant → réattacher, pas relancer
+            if self._adopt_title_process_if_alive(title):
+                scan_log(
+                    f"[SCAN_PIDS] '{title}': crash annulé — autre process --title adopté"
+                )
                 return False
             return True
 
         # doublons (et autres) : ne pas toucher une instance saine
         if not stopped and (pid_ok or hwnd_ok):
             return False
-        if (
-            awaiting
-            and launch_ts > 0
-            and (time.time() - launch_ts) < float(AWAITING_LAUNCH_TIMEOUT_S)
-        ):
+        if awaiting and remaining > 0.5:
             return False
         # HB frais : utile seulement si on n'a pas déjà prouvé un crash PID/HWND
         if not stopped and hb_fresh and not awaiting and not manual_empty:
@@ -13137,10 +13337,145 @@ class SnowMasterGUI(QWidget):
         print(f"[RESET] Relance forcée '{title}'")
         self.on_card_relaunch_force(title, controller)
 
+    def _adopt_title_process_if_alive(
+        self, title: str, proc_list: Optional[List[dict]] = None
+    ) -> Optional[int]:
+        """Si un process --title vit encore, réattache l'instance (pid/hwnd) et retourne le PID.
+
+        Utile quand le PID stocké est mort mais qu'un doublon / autre process du même titre
+        tourne encore — évite un faux crash + relance en boucle.
+        """
+        if not title:
+            return None
+        procs = list(proc_list or [])
+        if not procs:
+            try:
+                procs = scan_processes_by_title_forced(title) or []
+            except Exception:
+                procs = []
+
+        candidates: List[Tuple[int, Optional[int], bool]] = []
+        for info in procs:
+            try:
+                pid_int = int((info or {}).get("pid") or 0)
+            except Exception:
+                continue
+            if not pid_int or not is_pid_alive(pid_int):
+                continue
+            hwnd_val = None
+            try:
+                raw_hwnd = (info or {}).get("hwnd")
+                if raw_hwnd:
+                    hwnd_val = int(raw_hwnd)
+            except Exception:
+                hwnd_val = None
+            if not hwnd_val or not is_hwnd_valid(hwnd_val):
+                try:
+                    hwnd_val = get_main_hwnd(pid_int)
+                except Exception:
+                    hwnd_val = None
+            try:
+                hwnd_ok = bool(hwnd_val) and is_hwnd_valid(int(hwnd_val))
+            except Exception:
+                hwnd_ok = False
+            launched = not is_launcher_pid(pid_int, title)
+            candidates.append((pid_int, int(hwnd_val) if hwnd_ok else None, launched))
+
+        if not candidates:
+            return None
+
+        # Préférer une instance déjà lancée avec HWND, puis lancée, puis n'importe lequel
+        candidates.sort(key=lambda c: (not c[2], c[1] is None, c[0]))
+        keep_pid, keep_hwnd, _launched = candidates[0]
+
+        with _state_lock:
+            inst = _instances.get(title)
+            if not inst:
+                return None
+            inst.pid = keep_pid
+            if keep_hwnd:
+                inst.hwnd = keep_hwnd
+            inst.stopped = False
+            _instances[title] = inst
+        try:
+            bus.instance_updated.emit(title)
+        except Exception:
+            pass
+        return keep_pid
+
+    def _kill_launcher_duplicates_only(
+        self, title: str, proc_list: Optional[List[dict]] = None
+    ) -> Optional[int]:
+        """Tue uniquement les PID launcher du titre ; conserve une instance déjà lancée.
+
+        Returns:
+            PID d'une instance lancée encore vivante, ou None s'il n'en reste pas.
+        """
+        procs = list(proc_list or [])
+        if not procs:
+            try:
+                procs = scan_processes_by_title_forced(title) or []
+            except Exception:
+                procs = []
+
+        killed: List[int] = []
+        kept_launched: List[int] = []
+        for info in procs:
+            try:
+                pid_int = int((info or {}).get("pid") or 0)
+            except Exception:
+                continue
+            if not pid_int or not is_pid_alive(pid_int):
+                continue
+            if is_launcher_pid(pid_int, title):
+                try:
+                    scan_log(
+                        f"[KILL_DUPLICATES] '{title}': Kill launcher PID {pid_int}..."
+                    )
+                    terminate_process_tree(pid_int, timeout=3.0)
+                    killed.append(pid_int)
+                except Exception as e:
+                    scan_log(
+                        f"[KILL_DUPLICATES] '{title}': ✗ échec kill launcher {pid_int}: {e}"
+                    )
+            else:
+                kept_launched.append(pid_int)
+                scan_log(
+                    f"[KILL_DUPLICATES] '{title}': conserve PID {pid_int} (lancée)"
+                )
+
+        if killed:
+            app_log_warn(
+                f"[SCAN_PIDS] Launchers tués pour '{title}' "
+                f"(killed={killed}, kept={kept_launched})"
+            )
+
+        # Préférer le PID déjà stocké s'il est encore dans les gardés
+        keep = None
+        with _state_lock:
+            inst = _instances.get(title)
+            stored = inst.pid if inst else None
+        if stored and stored in kept_launched and is_pid_alive(int(stored)):
+            keep = int(stored)
+        elif kept_launched:
+            keep = int(kept_launched[0])
+
+        if keep and is_pid_alive(keep):
+            with _state_lock:
+                inst = _instances.get(title)
+                if inst and not inst.stopped:
+                    inst.pid = keep
+                    _instances[title] = inst
+            return keep
+
+        # Plus rien de lancé → marquer stoppée pour permettre une relance
+        self._mark_instance_stopped(title)
+        return None
+
     def _kill_all_title_processes(
         self, title: str, proc_list: Optional[List[dict]] = None
     ) -> List[int]:
-        """Tue TOUS les process associés au --title (doublons), puis marque stoppée.
+        """Tue TOUS les process associés au --title (mode agressif), puis marque stoppée.
 
         Returns:
             Liste des PIDs tués.
@@ -13186,12 +13521,11 @@ class SnowMasterGUI(QWidget):
     def _kill_duplicate_processes(
         self, title: str, proc_list: List[dict], keep_pid: Optional[int] = None
     ) -> Optional[int]:
-        """Compat : tue tous les doublons (ignore keep_pid) et marque stoppée.
-
-        Returns toujours None pour forcer une relance côté scan.
-        """
-        self._kill_all_title_processes(title, proc_list)
-        return None
+        """Compat : selon le mode agressif, kill all ou launchers seulement."""
+        if aggressive_duplicate_kill_enabled():
+            self._kill_all_title_processes(title, proc_list)
+            return None
+        return self._kill_launcher_duplicates_only(title, proc_list)
 
     def _resolve_controller_path(
         self, title: str, current_path: Optional[str]
@@ -13706,6 +14040,14 @@ class SnowMasterGUI(QWidget):
         _prefs.setdefault("instances", {})["pre_launch_scan"] = val
         save_prefs(_prefs)
         app_log_info(f"Scan pré lancement {'activé' if val else 'désactivé'}")
+
+    def on_toggle_aggressive_dup_kill(self, _state):
+        val = bool(self.chk_aggressive_dup_kill.isChecked())
+        _prefs.setdefault("instances", {})["aggressive_duplicate_kill"] = val
+        save_prefs(_prefs)
+        app_log_info(
+            f"Kill doublons agressif {'activé' if val else 'désactivé'}"
+        )
 
     def _ensure_debug_console(self) -> DebugConsoleDialog:
         _install_ui_log_capture()
@@ -14914,6 +15256,59 @@ def get_window_area(hwnd):
         return 0
 
 
+def is_launcher_pid(pid: int, title: str = "") -> bool:
+    """True si le PID ressemble à un launcher (chargement), pas une instance déjà lancée.
+
+    Heuristiques :
+    - titre fenêtre « Lancement de … »
+    - aucune grande fenêtre (>= ~35 % de l'écran)
+    - aucune fenêtre visible → traité comme launcher (souvent process coincé)
+    """
+    try:
+        pid_i = int(pid)
+    except Exception:
+        return True
+    if not pid_i or not is_pid_alive(pid_i):
+        return True
+
+    try:
+        scr_area, _ = screen_area(use_virtual=False)
+        large_threshold = float(scr_area) * 0.35
+    except Exception:
+        large_threshold = 800 * 600
+
+    title_l = (title or "").strip().lower()
+    launch_prefix = f"lancement de {title_l}" if title_l else "lancement de "
+
+    try:
+        hwnds = _hwnds_for_pid_prefer_visible(pid_i)
+    except Exception:
+        hwnds = []
+
+    if not hwnds:
+        return True
+
+    saw_visible = False
+    for h in hwnds:
+        try:
+            if not win32gui.IsWindowVisible(h):
+                continue
+            saw_visible = True
+            txt = (win32gui.GetWindowText(h) or "").strip().lower()
+            area = get_window_area(h)
+            if txt.startswith("lancement de ") or (
+                title_l and txt.startswith(launch_prefix)
+            ):
+                continue
+            if area >= large_threshold:
+                return False  # grande fenêtre = instance lancée
+        except Exception:
+            continue
+
+    # Petites fenêtres seulement / titres de lancement → launcher
+    return True if saw_visible else True
+
+
 def find_hwnds_for_pid(pid):
     hwnds = []
 
@@ -15128,6 +15523,7 @@ def wait_for_windows_with_early_register(
             if inst and getattr(inst, "awaiting_first_hb", False):
                 inst.pid = int(p.pid)
                 inst.stopped = False
+                _note_launcher_seen(inst, inst.pid, None)
         try:
             bus.instance_updated.emit(title_for_register)
         except Exception:
@@ -15738,7 +16134,7 @@ def run_snowbot_flow(
             )
         except Exception:
             pass
-        # Garder le jaune : le scan PID relancera auto après AWAITING_LAUNCH_TIMEOUT_S
+        # Garder le jaune : le watch / scan relancera selon phase PID (30s) puis HB (3 min)
         try:
             with _state_lock:
                 inst = _instances.get(title)
