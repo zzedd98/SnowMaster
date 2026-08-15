@@ -158,6 +158,7 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect,
     QSystemTrayIcon,
     QTextEdit,
+    QPlainTextEdit,
     QLineEdit,
     QProgressBar,
     QFrame,
@@ -174,6 +175,7 @@ from PySide6.QtGui import (
     QGuiApplication,
     QKeySequence,
     QShortcut,
+    QTextCursor,
 )
 from PySide6.QtWidgets import QStyledItemDelegate
 from PySide6.QtGui import QPainter, QPainterPath, QPen, QBrush
@@ -252,6 +254,137 @@ scan_pids_logger.setLevel(logging.DEBUG)
 # Plus de fichier scan_pids_debug.log : uniquement NullHandler (et print console dans scan_log)
 if not scan_pids_logger.handlers:
     scan_pids_logger.addHandler(logging.NullHandler())
+
+# ----- Console debug UI (logs temps réel) -----
+_UI_LOG_MAX = 4000
+_ui_log_buffer: Deque[str] = deque(maxlen=_UI_LOG_MAX)
+_ui_log_lock = threading.Lock()
+_ui_log_bridge = None  # LogBridge (QObject), créé après QApplication
+_orig_stdout = None
+_orig_stderr = None
+
+
+class LogBridge(QObject):
+    """Pont thread-safe : émet les lignes de log vers la console UI."""
+
+    line = Signal(str)
+
+
+class UiLogHandler(logging.Handler):
+    """Handler logging → buffer + signal UI."""
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+        except Exception:
+            msg = str(getattr(record, "msg", record))
+        _ui_log_append(msg)
+
+
+class _StdoutTee:
+    """Duplique stdout/stderr vers la console UI sans casser la vraie console."""
+
+    def __init__(self, stream, prefix: str = ""):
+        self._stream = stream
+        self._prefix = prefix
+        self._buf = ""
+
+    def write(self, data):
+        try:
+            if self._stream is not None:
+                self._stream.write(data)
+                try:
+                    self._stream.flush()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            text = str(data)
+        except Exception:
+            return 0
+        if not text:
+            return 0
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.rstrip("\r")
+            if line:
+                _ui_log_append(f"{self._prefix}{line}" if self._prefix else line)
+        return len(text)
+
+    def flush(self):
+        try:
+            if self._stream is not None:
+                self._stream.flush()
+        except Exception:
+            pass
+        if self._buf.strip():
+            _ui_log_append(
+                f"{self._prefix}{self._buf.rstrip()}"
+                if self._prefix
+                else self._buf.rstrip()
+            )
+            self._buf = ""
+
+    def isatty(self):
+        try:
+            return bool(self._stream and self._stream.isatty())
+        except Exception:
+            return False
+
+    @property
+    def encoding(self):
+        return getattr(self._stream, "encoding", "utf-8")
+
+
+def _ui_log_append(line: str):
+    """Ajoute une ligne au buffer et notifie l'UI si disponible."""
+    try:
+        ts = datetime.now().strftime("%H:%M:%S")
+    except Exception:
+        ts = "--:--:--"
+    text = str(line).rstrip("\n\r")
+    if not text:
+        return
+    if len(text) >= 8 and text[2] == ":" and text[5] == ":":
+        formatted = text
+    else:
+        formatted = f"[{ts}] {text}"
+    with _ui_log_lock:
+        _ui_log_buffer.append(formatted)
+    bridge = _ui_log_bridge
+    if bridge is not None:
+        try:
+            bridge.line.emit(formatted)
+        except Exception:
+            pass
+
+
+def _install_ui_log_capture():
+    """Installe tee stdout/stderr + handler logging (idempotent)."""
+    global _ui_log_bridge, _orig_stdout, _orig_stderr
+    if _ui_log_bridge is None:
+        _ui_log_bridge = LogBridge()
+    fmt = logging.Formatter("%(levelname)s %(name)s: %(message)s")
+    handler = UiLogHandler()
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(fmt)
+    for lg in (logger,):
+        if not any(isinstance(h, UiLogHandler) for h in lg.handlers):
+            lg.addHandler(handler)
+    if _orig_stdout is None:
+        _orig_stdout = sys.stdout
+        _orig_stderr = sys.stderr
+        sys.stdout = _StdoutTee(_orig_stdout)
+        sys.stderr = _StdoutTee(_orig_stderr)
+
+
+def debug_console_visible_pref() -> bool:
+    try:
+        return bool(_prefs.get("ui", {}).get("debug_console_visible", False))
+    except Exception:
+        return False
 
 
 def scan_log(msg):
@@ -446,6 +579,7 @@ DEFAULT_PREFS = {
         "right_panel_visible": True,  # panneau droite Sous-contrôleurs / détails
         "compact_instances": False,  # cartes instances sans boutons (plus étroites)
         "always_on_top": False,  # garder SnowMaster au-dessus des autres fenêtres
+        "debug_console_visible": False,  # fenêtre console logs temps réel
         "refresh_interval_active_ms": 1000,
         "refresh_interval_inactive_ms": 2500,  # fenêtre inactive / minimisée
         "bus_coalesce_ms": 300,  # regroupement des heartbeats avant refresh UI
@@ -7127,6 +7261,88 @@ class CollapsibleGroupBox(QWidget):
         self._content_layout.addStretch(stretch)
 
 
+class DebugConsoleDialog(QDialog):
+    """Fenêtre de logs application en temps réel (print + logging)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Console — {APP_DISPLAY_NAME}")
+        self.setMinimumSize(720, 420)
+        self.resize(900, 520)
+        self.setWindowFlag(Qt.Window, True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        toolbar = QHBoxLayout()
+        self.btn_clear = QPushButton("Effacer")
+        self.btn_clear.setCursor(Qt.PointingHandCursor)
+        self.btn_clear.clicked.connect(self._clear)
+        self.chk_autoscroll = QCheckBox("Auto-scroll")
+        self.chk_autoscroll.setChecked(True)
+        toolbar.addWidget(self.btn_clear)
+        toolbar.addWidget(self.chk_autoscroll)
+        toolbar.addStretch(1)
+        layout.addLayout(toolbar)
+
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setMaximumBlockCount(_UI_LOG_MAX)
+        self.text.setStyleSheet(
+            "QPlainTextEdit {"
+            " background:#0b1220; color:#e2e8f0;"
+            " border:1px solid rgba(148,163,184,0.28); border-radius:8px;"
+            " font-family: Consolas, 'Courier New', monospace; font-size:12px;"
+            "}"
+        )
+        layout.addWidget(self.text, 1)
+
+        # Remplir avec le buffer existant
+        with _ui_log_lock:
+            snapshot = list(_ui_log_buffer)
+        if snapshot:
+            self.text.setPlainText("\n".join(snapshot))
+            self._scroll_to_end()
+
+        if _ui_log_bridge is not None:
+            _ui_log_bridge.line.connect(self._on_line)
+
+    def _on_line(self, line: str):
+        self.text.appendPlainText(line)
+        if self.chk_autoscroll.isChecked():
+            self._scroll_to_end()
+
+    def _scroll_to_end(self):
+        try:
+            cursor = self.text.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.text.setTextCursor(cursor)
+            self.text.ensureCursorVisible()
+        except Exception:
+            pass
+
+    def _clear(self):
+        with _ui_log_lock:
+            _ui_log_buffer.clear()
+        self.text.clear()
+
+    def closeEvent(self, event):
+        # Masquer plutôt que détruire — la capture de logs continue
+        event.ignore()
+        self.hide()
+        parent = self.parent()
+        try:
+            if parent is not None and hasattr(parent, "chk_debug_console"):
+                parent.chk_debug_console.blockSignals(True)
+                parent.chk_debug_console.setChecked(False)
+                parent.chk_debug_console.blockSignals(False)
+                _prefs.setdefault("ui", {})["debug_console_visible"] = False
+                save_prefs(_prefs)
+        except Exception:
+            pass
+
+
 class HeartbeatHistoryDialog(QDialog):
     """Historique heartbeats d'une instance — refresh manuel, filtres via setHidden (pas de rebuild texte)."""
 
@@ -8438,6 +8654,11 @@ class SnowMasterGUI(QWidget):
 
     def __init__(self):
         super().__init__()
+        # Capture print/logging pour la console debug (dès le démarrage GUI)
+        try:
+            _install_ui_log_capture()
+        except Exception:
+            pass
         self._bg_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="ankaworker"
         )
@@ -8836,6 +9057,15 @@ class SnowMasterGUI(QWidget):
         )
         self.chk_always_on_top.stateChanged.connect(self.on_toggle_always_on_top)
 
+        self.chk_debug_console = QCheckBox("Afficher la console")
+        self.chk_debug_console.setChecked(debug_console_visible_pref())
+        self.chk_debug_console.setToolTip(
+            "Coché : ouvre une fenêtre avec tous les logs de l'application en temps réel.\n"
+            "Utile pour déboguer resets, scans, lancements, etc."
+        )
+        self.chk_debug_console.stateChanged.connect(self.on_toggle_debug_console)
+        self._debug_console_dialog: Optional[DebugConsoleDialog] = None
+
         # Lecture initiale des prefs pour les instances
         instances_prefs = _prefs.get("instances", {})
         default_delay = int(instances_prefs.get("launch_delay", 1))
@@ -8965,6 +9195,7 @@ class SnowMasterGUI(QWidget):
         inst_group_collapsible.addWidget(self.chk_hb_history)
         inst_group_collapsible.addWidget(self.chk_euro_counter)
         inst_group_collapsible.addWidget(self.chk_always_on_top)
+        inst_group_collapsible.addWidget(self.chk_debug_console)
         # inst_group_collapsible.addWidget(self.btn_save_cfg)
         # inst_group_collapsible.addWidget(self.btn_load_cfg)
         # Checkbox: overwrite existing instances when loading a config
@@ -9446,6 +9677,10 @@ class SnowMasterGUI(QWidget):
                 self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
             except Exception:
                 pass
+
+        # Restaurer la console debug si cochée dans les prefs
+        if self.chk_debug_console.isChecked():
+            QTimer.singleShot(300, self._show_debug_console)
 
     def minimumSizeHint(self):
         """Autorise une rétraction quasi libre de la fenêtre principale."""
@@ -12535,39 +12770,12 @@ class SnowMasterGUI(QWidget):
 
                     title_procs = processes_by_title.get(title, []) if do_full else []
                     if do_full and len(title_procs) > 1:
-                        # Ne jamais nettoyer les doublons pendant un lancement/reset :
-                        # launcher + enfant partagent souvent le même --title ; un keep
-                        # stale/mort tuerait le process fraîchement lancé.
-                        if self._is_instance_busy(title) or inst_data.get(
-                            "awaiting_first_hb"
-                        ):
-                            scan_log(
-                                f"[SCAN_PIDS] '{title}': doublons ignorés "
-                                f"(lancement/busy en cours, {len(title_procs)} procs)"
-                            )
-                            continue
                         scan_log(
-                            f"[SCAN_PIDS] '{title}': ⚠️ DOUBLONS détectés ({len(title_procs)} processus)"
+                            f"[SCAN_PIDS] '{title}': ⚠️ DOUBLONS détectés ({len(title_procs)} processus) "
+                            f"— kill tous + relance"
                         )
-                        # Garder le PID stocké sur l'instance (dernier lancé / détails),
-                        # ne tuer que les orphelins — pas de relance si le PID gardé vit.
-                        # Re-lire le PID actuel (pas le snapshot figé) pour éviter un keep mort.
-                        keep_pid = inst_data.get("pid")
-                        with _state_lock:
-                            cur = _instances.get(title)
-                            if cur and cur.pid:
-                                keep_pid = cur.pid
-                        kept = self._kill_duplicate_processes(
-                            title, title_procs, keep_pid=keep_pid
-                        )
-                        if kept:
-                            scan_log(
-                                f"[SCAN_PIDS] '{title}': doublons nettoyés, PID gardé={kept}"
-                            )
-                            continue
-                        scan_log(
-                            f"[SCAN_PIDS] '{title}': aucun PID gardé vivant → relance..."
-                        )
+                        # Comportement historique : fermer TOUS les process du titre, puis relancer.
+                        self._kill_all_title_processes(title, title_procs)
                         if inst_data.get("manual_empty"):
                             actions_to_perform.append(
                                 ("relaunch", title, None, "doublons")
@@ -12848,135 +13056,35 @@ class SnowMasterGUI(QWidget):
         print(f"[RESET] Relance forcée '{title}'")
         self.on_card_relaunch_force(title, controller)
 
-    def _kill_duplicate_processes(
-        self, title: str, proc_list: List[dict], keep_pid: Optional[int] = None
-    ) -> Optional[int]:
-        """Tue les process du même --title sauf le PID à conserver (celui des détails).
+    def _kill_all_title_processes(
+        self, title: str, proc_list: Optional[List[dict]] = None
+    ) -> List[int]:
+        """Tue TOUS les process associés au --title (doublons), puis marque stoppée.
 
         Returns:
-            Le PID gardé s'il est encore vivant après nettoyage, sinon None
-            (appelant pourra relancer).
+            Liste des PIDs tués.
         """
-        keep_int: Optional[int] = None
-        try:
-            if keep_pid:
-                keep_int = int(keep_pid)
-        except Exception:
-            keep_int = None
-
-        # Si le PID stocké n'est pas vivant, ne pas le « garder » : on devra relancer.
-        if keep_int and not is_pid_alive(keep_int):
-            scan_log(
-                f"[KILL_DUPLICATES] '{title}': PID stocké={keep_int} mort — aucun keep"
-            )
-            keep_int = None
-
-        # Sans keep fiable : ne PAS massacrer tous les process du titre (un launcher
-        # fraîchement spawn serait tué). Choisir le plus récent encore vivant.
-        if not keep_int and proc_list:
-            newest_pid = None
-            newest_ct = -1.0
-            for info in proc_list:
-                try:
-                    pid_i = int(info.get("pid") or 0)
-                except Exception:
-                    continue
-                if not pid_i or not is_pid_alive(pid_i):
-                    continue
-                try:
-                    ct = float(psutil.Process(pid_i).create_time())
-                except Exception:
-                    ct = 0.0
-                if ct >= newest_ct:
-                    newest_ct = ct
-                    newest_pid = pid_i
-            if newest_pid:
-                keep_int = newest_pid
-                scan_log(
-                    f"[KILL_DUPLICATES] '{title}': keep de secours = PID le plus récent {keep_int}"
-                )
-
-        keep_set = set()
-        if keep_int:
-            keep_set.add(keep_int)
-            # Enfants du keep
+        procs = list(proc_list or [])
+        if not procs:
             try:
-                for ch in psutil.Process(keep_int).children(recursive=True):
-                    keep_set.add(int(ch.pid))
+                procs = find_processes_by_title(title) or []
             except Exception:
-                pass
-            # Ancêtres du keep (sinon tuer le launcher parent tue aussi le keep enfant)
-            try:
-                cur = psutil.Process(keep_int)
-                for _ in range(8):
-                    parent = cur.parent()
-                    if parent is None:
-                        break
-                    ppid = int(parent.pid)
-                    if ppid <= 0 or ppid in keep_set:
-                        break
-                    keep_set.add(ppid)
-                    # + frères utiles : enfants du parent déjà listés dans proc_list
-                    cur = parent
-            except Exception:
-                pass
-            # Tout pid de proc_list qui est parent/enfant d'un membre keep_set
-            try:
-                for info in proc_list:
-                    try:
-                        pid_i = int(info.get("pid") or 0)
-                    except Exception:
-                        continue
-                    if not pid_i or pid_i in keep_set:
-                        continue
-                    try:
-                        p = psutil.Process(pid_i)
-                        child_pids = {int(c.pid) for c in p.children(recursive=True)}
-                    except Exception:
-                        continue
-                    if keep_set & child_pids or pid_i in keep_set:
-                        keep_set.add(pid_i)
-                        keep_set |= child_pids
-            except Exception:
-                pass
+                procs = []
 
+        killed_pids: List[int] = []
         scan_log(
-            f"[KILL_DUPLICATES] '{title}': {len(proc_list)} process, keep={keep_int}, keep_set={sorted(keep_set)}"
+            f"[KILL_DUPLICATES] '{title}': kill ALL ({len(procs)} process) + relance prévue"
         )
-        killed_pids = []
-        failed_pids = []
-        kept_info = None
-
-        for info in proc_list:
-            pid = info.get("pid")
+        for info in procs:
+            pid = info.get("pid") if isinstance(info, dict) else None
             if not pid:
-                scan_log(f"[KILL_DUPLICATES] '{title}': Process sans PID ignoré")
                 continue
             try:
                 pid_int = int(pid)
             except Exception:
                 continue
-            if pid_int in keep_set:
-                kept_info = info
-                scan_log(f"[KILL_DUPLICATES] '{title}': conserve PID {pid_int}")
+            if not is_pid_alive(pid_int):
                 continue
-            # Ne jamais terminate_process_tree un ancêtre du keep (déjà dans keep_set),
-            # ni un process dont le tree couvre le keep.
-            try:
-                if keep_int and is_pid_alive(pid_int):
-                    descendants = {
-                        int(c.pid)
-                        for c in psutil.Process(pid_int).children(recursive=True)
-                    }
-                    if keep_int in descendants or (keep_set & descendants):
-                        keep_set.add(pid_int)
-                        scan_log(
-                            f"[KILL_DUPLICATES] '{title}': conserve PID {pid_int} "
-                            f"(ancêtre/tree du keep)"
-                        )
-                        continue
-            except Exception:
-                pass
             try:
                 scan_log(f"[KILL_DUPLICATES] '{title}': Kill PID {pid_int}...")
                 terminate_process_tree(pid_int, timeout=3.0)
@@ -12986,45 +13094,22 @@ class SnowMasterGUI(QWidget):
                 scan_log(
                     f"[KILL_DUPLICATES] '{title}': ✗ Échec kill PID {pid_int}: {e}"
                 )
-                failed_pids.append(pid_int)
 
         if killed_pids:
-            scan_log(
-                f"[KILL_DUPLICATES] '{title}': ✓ {len(killed_pids)} orphelins tués: {killed_pids}"
-            )
             app_log_warn(
-                f"[SCAN_PIDS] Doublons nettoyés pour '{title}' "
-                f"(killed={killed_pids}, keep={keep_int})"
+                f"[SCAN_PIDS] Doublons tués pour '{title}' (PIDs={killed_pids}) — relance"
             )
-
-        if failed_pids:
-            scan_log(
-                f"[KILL_DUPLICATES] '{title}': ⚠️ {len(failed_pids)} échecs: {failed_pids}"
-            )
-
-        if keep_int and is_pid_alive(keep_int):
-            # Réaligner hwnd éventuel sans toucher au statut running
-            try:
-                hwnd = None
-                if kept_info:
-                    hwnd = kept_info.get("hwnd")
-                with _state_lock:
-                    inst = _instances.get(title)
-                    if inst and not inst.stopped:
-                        inst.pid = keep_int
-                        if hwnd:
-                            try:
-                                inst.hwnd = int(hwnd)
-                            except Exception:
-                                pass
-                        _instances[title] = inst
-            except Exception:
-                pass
-            return keep_int
-
-        # Rien à garder : marque stoppée pour permettre une relance propre
-        scan_log(f"[KILL_DUPLICATES] '{title}': aucun PID gardé — marquage stoppée")
         self._mark_instance_stopped(title)
+        return killed_pids
+
+    def _kill_duplicate_processes(
+        self, title: str, proc_list: List[dict], keep_pid: Optional[int] = None
+    ) -> Optional[int]:
+        """Compat : tue tous les doublons (ignore keep_pid) et marque stoppée.
+
+        Returns toujours None pour forcer une relance côté scan.
+        """
+        self._kill_all_title_processes(title, proc_list)
         return None
 
     def _resolve_controller_path(
@@ -13524,6 +13609,35 @@ class SnowMasterGUI(QWidget):
         except Exception:
             pass
         app_log_info(f"Bouton € {'affiché' if val else 'masqué'}")
+
+    def on_toggle_debug_console(self, _state):
+        val = bool(self.chk_debug_console.isChecked())
+        _prefs.setdefault("ui", {})["debug_console_visible"] = val
+        save_prefs(_prefs)
+        if val:
+            self._show_debug_console()
+        else:
+            self._hide_debug_console()
+        app_log_info(f"Console debug {'affichée' if val else 'masquée'}")
+
+    def _ensure_debug_console(self) -> DebugConsoleDialog:
+        _install_ui_log_capture()
+        dlg = getattr(self, "_debug_console_dialog", None)
+        if dlg is None:
+            dlg = DebugConsoleDialog(self)
+            self._debug_console_dialog = dlg
+        return dlg
+
+    def _show_debug_console(self):
+        dlg = self._ensure_debug_console()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _hide_debug_console(self):
+        dlg = getattr(self, "_debug_console_dialog", None)
+        if dlg is not None:
+            dlg.hide()
 
     def on_toggle_config_panel(self, checked: bool):
         """Affiche / masque le panneau central Configs & Boutons."""
