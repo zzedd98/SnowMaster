@@ -41,7 +41,7 @@ import subprocess
 import ctypes
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Dict, Deque, Optional, List, Tuple
+from typing import Dict, Deque, Optional, List, Tuple, Callable
 import shlex
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -3367,6 +3367,59 @@ def _record_instance_reset_history(title: str, now_ts: Optional[float] = None) -
 _instances: Dict[str, InstanceState] = {}
 _state_lock = threading.Lock()
 
+# Resets demandés via HTTP (/reset_instance) — file thread-safe indépendante de Qt.
+# Avant : Flask faisait seulement bus.reset_instance.emit() ; si la boucle Qt était
+# saturée / le signal droppé, la file GUI restait vide → aucun kill.
+_pending_api_resets: List[str] = []
+_pending_api_resets_lock = threading.Lock()
+_reset_wake_fn: Optional[Callable[[], None]] = None
+
+
+def enqueue_reset_request(title: str) -> bool:
+    """Enfile un reset (appelé depuis Flask ou ailleurs). Retourne True si nouvellement ajouté."""
+    title = (title or "").strip()
+    if not title:
+        return False
+    added = False
+    with _pending_api_resets_lock:
+        if title not in _pending_api_resets:
+            _pending_api_resets.append(title)
+            added = True
+    try:
+        print(f"[RESET] enqueue title={title!r} nouveau={added}")
+    except Exception:
+        pass
+    try:
+        app_log_info("[RESET] enqueue title=%r nouveau=%s", title, added)
+    except Exception:
+        pass
+    # Réveil immédiat du worker (sans attendre le signal Qt / le scan 30s)
+    wake = _reset_wake_fn
+    if wake is not None:
+        try:
+            wake()
+        except Exception as e:
+            try:
+                print(f"[RESET] wake failed: {e}")
+            except Exception:
+                pass
+    return added
+
+
+def drain_reset_requests() -> List[str]:
+    """Vide la file API + déduplique. Thread-safe."""
+    with _pending_api_resets_lock:
+        titles = list(_pending_api_resets)
+        _pending_api_resets.clear()
+    # dédup en préservant l'ordre
+    seen = set()
+    out: List[str] = []
+    for t in titles:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
 # ----------------- Shared revenue data (prices & holdings) -----------------
 # Structure :
 # _revenue_data = {
@@ -3947,7 +4000,7 @@ def _parse_subcontrollers(data, now_ts) -> Dict[str, Dict[str, float]]:
 def api_reset_instance():
     """
     Body attendu: {"title": "Nom exact de l'instance"}
-    → émet bus.reset_instance(title) qui fera kill + relaunch côté GUI.
+    → enfile un reset thread-safe (kill + relaunch), sans dépendre uniquement du signal Qt.
     """
     data = _read_payload()
     title = (data.get("title") or data.get("name") or "").strip()
@@ -3955,11 +4008,23 @@ def api_reset_instance():
         return jsonify({"err": "missing title"}), 400
 
     try:
+        print(f"[RESET] HTTP /reset_instance reçu title={title!r}")
+    except Exception:
+        pass
+
+    # Enfile TOUJOURS ici (Flask thread) — ne pas attendre que Qt traite un signal.
+    enqueue_reset_request(title)
+
+    # Signal Qt en complément (UI / compat) — non bloquant si droppé.
+    try:
         bus.reset_instance.emit(title)
     except Exception as e:
-        return jsonify({"err": f"emit failed: {e}"}), 500
+        try:
+            print(f"[RESET] emit Qt ignoré: {e}")
+        except Exception:
+            pass
 
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "title": title})
 
 
 @flask_app.route("/register", methods=["POST"])
@@ -8369,6 +8434,7 @@ class CustomSpinBox(QWidget):
 class SnowMasterGUI(QWidget):
     # Signal pour demander un relaunch depuis un thread d'arrière-plan
     relaunch_requested = Signal(str)
+    reset_relaunch_requested = Signal(str)  # relance forcée après /reset_instance
 
     def __init__(self):
         super().__init__()
@@ -8378,6 +8444,7 @@ class SnowMasterGUI(QWidget):
         # Connecter le signal à un slot qui relance de manière asynchrone
         # Cela garantit l'exécution dans le thread principal mais sans bloquer
         self.relaunch_requested.connect(self._on_relaunch_requested)
+        self.reset_relaunch_requested.connect(self._relaunch_after_reset)
         self._auto_relaunch_scan_lock = threading.Lock()
         # self.setWindowTitle("❄️ SnowMaster")
         self.setWindowTitle(APP_DISPLAY_NAME)
@@ -8431,11 +8498,20 @@ class SnowMasterGUI(QWidget):
             {}
         )  # title -> ts fin cooldown 30 min
         self._reddot_blocked_logged: set = set()  # évite de spammer les logs scan
-        self._pending_resets: List[str] = []  # Queue de titres à reset
+        self._pending_resets: List[str] = []  # Queue de titres à reset (reddot / bus)
+        self._reset_process_lock = threading.Lock()  # un seul worker reset à la fois
         # title -> unix ts fin de fenêtre "busy" (relance / reset en cours)
         self._instance_busy_until: Dict[str, float] = {}
         self._hb_history_dialogs: Dict[str, HeartbeatHistoryDialog] = {}
         self._init_reddot_log_state()
+
+        # Réveil reset depuis Flask sans passer par la boucle Qt
+        global _reset_wake_fn
+
+        def _wake_pending_resets():
+            self._run_async(self._process_pending_resets)
+
+        _reset_wake_fn = _wake_pending_resets
 
         # Autopilot state
         ap = _prefs.get("autopilot", {})
@@ -10922,10 +10998,16 @@ class SnowMasterGUI(QWidget):
         """True si relance/reset en cours — awaiting_first_hb seul ne suffit pas."""
         if not title:
             return False
-        # Reset déjà en file d'attente
+        # Reset déjà en file d'attente (GUI ou API Flask)
         try:
             if title in (getattr(self, "_pending_resets", None) or []):
                 return True
+        except Exception:
+            pass
+        try:
+            with _pending_api_resets_lock:
+                if title in _pending_api_resets:
+                    return True
         except Exception:
             pass
         # Fenêtre busy explicite (spawn / reset / auto-relaunch planifié)
@@ -12675,28 +12757,96 @@ class SnowMasterGUI(QWidget):
         return True
 
     def _process_pending_resets(self):
-        """Traite les demandes de reset en attente."""
-        if not hasattr(self, "_pending_resets"):
+        """Traite les demandes de reset en attente (API Flask + file GUI)."""
+        if not self._reset_process_lock.acquire(blocking=False):
+            # Un autre worker tourne déjà ; son `finally` re-drainera la file.
             return
 
-        resets_to_process = []
-        with _state_lock:
-            if hasattr(self, "_pending_resets") and self._pending_resets:
-                resets_to_process = list(self._pending_resets)
-                self._pending_resets.clear()
+        try:
+            resets_to_process: List[str] = []
+            seen = set()
 
-        for title in resets_to_process:
+            # 1) File API (remplie directement par Flask — prioritaire)
+            for t in drain_reset_requests():
+                if t not in seen:
+                    seen.add(t)
+                    resets_to_process.append(t)
+
+            # 2) File GUI (reddot / signal bus)
+            with _state_lock:
+                pending_gui = list(getattr(self, "_pending_resets", None) or [])
+                if hasattr(self, "_pending_resets"):
+                    self._pending_resets.clear()
+            for t in pending_gui:
+                if t and t not in seen:
+                    seen.add(t)
+                    resets_to_process.append(t)
+
+            if not resets_to_process:
+                return
+
+            print(f"[RESET] traitement de {len(resets_to_process)} reset(s): {resets_to_process}")
+            app_log_info("[RESET] traitement de %s reset(s): %s", len(resets_to_process), resets_to_process)
+
+            for title in resets_to_process:
+                try:
+                    print(f"[RESET] kill+relaunch '{title}'...")
+                    self._mark_instance_busy(title, reason="reset")
+                    _record_instance_reset_history(title)
+                    self._kill_instance_sync(title)
+                    # Relance forcée : on_card_relaunch peut no-op si un /register tardif
+                    # a remis awaiting+pid pendant le kill.
+                    self._emit_reset_relaunch(title)
+                except Exception as e:
+                    app_log_error(f"[RESET] Erreur reset {title}: {e}")
+                    print(f"[RESET] Erreur reset {title}: {e}")
+                    self._clear_instance_busy(title)
+        finally:
             try:
-                self._mark_instance_busy(title, reason="reset")
-                _record_instance_reset_history(title)
-                # Kill le processus
-                self._kill_instance_sync(title)
-                # Émettre le signal pour relancer dans le thread UI
-                # (les signaux Qt sont thread-safe)
+                self._reset_process_lock.release()
+            except Exception:
+                pass
+            # Si de nouveaux resets sont arrivés pendant le traitement
+            try:
+                with _pending_api_resets_lock:
+                    more_api = bool(_pending_api_resets)
+                more_gui = bool(getattr(self, "_pending_resets", None))
+                if more_api or more_gui:
+                    self._run_async(self._process_pending_resets)
+            except Exception:
+                pass
+
+    def _emit_reset_relaunch(self, title: str):
+        """Planifie une relance forcée après reset (signal Qt thread-safe)."""
+        try:
+            self.reset_relaunch_requested.emit(title)
+        except Exception as e:
+            app_log_error(f"[RESET] emit relaunch failed for {title}: {e}")
+            try:
                 self.relaunch_requested.emit(title)
-            except Exception as e:
-                app_log_error(f"[RESET] Erreur reset {title}: {e}")
-                self._clear_instance_busy(title)
+            except Exception:
+                pass
+
+    def _relaunch_after_reset(self, title: str):
+        """Relance après reset : force spawn (ne pas no-op sur awaiting fantôme)."""
+        if not title:
+            return
+        inst, controller, exe, images, ratio = self._get_instance_launch_params(title)
+        if not inst:
+            app_log_error(f"[RESET] Relance '{title}': instance introuvable")
+            return
+        if getattr(inst, "manual_empty", False):
+            self.on_card_relaunch(title)
+            return
+        if not controller:
+            controller = self._resolve_controller_path(title, None)
+        if not controller:
+            # Dernier recours : chemin normal (peut ouvrir un dialog fichier)
+            print(f"[RESET] Relance '{title}': pas de controller → on_card_relaunch")
+            self.on_card_relaunch(title)
+            return
+        print(f"[RESET] Relance forcée '{title}'")
+        self.on_card_relaunch_force(title, controller)
 
     def _kill_duplicate_processes(
         self, title: str, proc_list: List[dict], keep_pid: Optional[int] = None
@@ -12997,13 +13147,37 @@ class SnowMasterGUI(QWidget):
             if inst:
                 pid = inst.pid
 
+        killed = set()
         if pid:
             try:
                 terminate_process_tree(int(pid), timeout=3.0)
+                killed.add(int(pid))
             except Exception as e:
-                app_log_warn(f"[RESET] Terminate failed for {title}: {e}")
+                app_log_warn(f"[RESET] Terminate failed for {title} pid={pid}: {e}")
+
+        # Tuer aussi tout process encore vivant avec le même --title (enfant orphelin)
+        try:
+            matches = find_processes_by_title(title) or []
+        except Exception:
+            matches = []
+        for info in matches:
+            try:
+                p2 = int(info.get("pid") or 0)
+            except Exception:
+                continue
+            if not p2 or p2 in killed:
+                continue
+            if not is_pid_alive(p2):
+                continue
+            try:
+                print(f"[RESET] kill extra PID {p2} pour '{title}'")
+                terminate_process_tree(p2, timeout=3.0)
+                killed.add(p2)
+            except Exception as e:
+                app_log_warn(f"[RESET] Terminate extra failed for {title} pid={p2}: {e}")
 
         self._mark_instance_stopped(title)
+        print(f"[RESET] '{title}' stoppé (killed={sorted(killed) or 'aucun'})")
 
     def _trigger_relaunch_from_reset(self, title: str):
         """Déclenche une relance après un reset."""
@@ -13203,17 +13377,13 @@ class SnowMasterGUI(QWidget):
         QTimer.singleShot(0, lambda t=title: self.on_card_relaunch(t))
 
     def on_bus_reset_instance(self, title: str):
-        """Stoppe puis relance l'instance demandée via la queue de resets."""
+        """Reset demandé via signal Qt (complément de la file API Flask)."""
         if not title:
             return
-        # Ajouter à la queue de resets qui sera traitée dans le prochain scan
-        with _state_lock:
-            if not hasattr(self, "_pending_resets"):
-                self._pending_resets = []
-            if title not in self._pending_resets:
-                self._pending_resets.append(title)
+        # La file API est déjà remplie par /reset_instance ; ici on couvre reddot/bus
+        # et on s'assure qu'un traitement est planifié.
+        enqueue_reset_request(title)
         self._mark_instance_busy(title, reason="reset_queued")
-        # Déclencher un traitement immédiat dans un thread background
         self._run_async(self._process_pending_resets)
 
     def _restore_window_geometry(self):
