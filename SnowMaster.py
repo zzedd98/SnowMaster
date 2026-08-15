@@ -254,13 +254,52 @@ scan_pids_logger.setLevel(logging.DEBUG)
 if not scan_pids_logger.handlers:
     scan_pids_logger.addHandler(logging.NullHandler())
 
-# ----- Console Windows native (show/hide, pas de capture UI) -----
+# ----- Console Windows native (show/hide) — compatible .exe --windowed -----
 # Références des flux CONOUT$ pour éviter qu'ils soient GC et fermés.
 _native_console_stdio = None
 _console_ctrl_handler_ref = None  # garder vivant le callback SetConsoleCtrlHandler
 
 # Contexte logs lancement (thread-local) → "[PID - Titre] message"
 _flow_log_tls = threading.local()
+
+# Prototypes Win32 corrects (sinon HWND 64-bit tronqué → ShowWindow no-op en .exe)
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_kernel32.GetConsoleWindow.restype = ctypes.c_void_p
+_kernel32.GetConsoleWindow.argtypes = []
+_kernel32.AllocConsole.restype = ctypes.c_bool
+_kernel32.AllocConsole.argtypes = []
+_kernel32.FreeConsole.restype = ctypes.c_bool
+_kernel32.FreeConsole.argtypes = []
+_kernel32.SetConsoleTitleW.argtypes = [ctypes.c_wchar_p]
+_kernel32.SetConsoleTitleW.restype = ctypes.c_bool
+_kernel32.SetStdHandle.argtypes = [ctypes.c_ulong, ctypes.c_void_p]
+_kernel32.SetStdHandle.restype = ctypes.c_bool
+_kernel32.GetStdHandle.argtypes = [ctypes.c_ulong]
+_kernel32.GetStdHandle.restype = ctypes.c_void_p
+_user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_user32.ShowWindow.restype = ctypes.c_bool
+_user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+_user32.SetForegroundWindow.restype = ctypes.c_bool
+_user32.BringWindowToTop.argtypes = [ctypes.c_void_p]
+_user32.BringWindowToTop.restype = ctypes.c_bool
+_user32.GetSystemMenu.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_user32.GetSystemMenu.restype = ctypes.c_void_p
+_user32.DeleteMenu.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+_user32.DeleteMenu.restype = ctypes.c_bool
+_kernel32.SetConsoleCtrlHandler.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+_kernel32.SetConsoleCtrlHandler.restype = ctypes.c_bool
+_kernel32.SetConsoleOutputCP.argtypes = [ctypes.c_uint]
+_kernel32.SetConsoleOutputCP.restype = ctypes.c_bool
+_kernel32.SetConsoleCP.argtypes = [ctypes.c_uint]
+_kernel32.SetConsoleCP.restype = ctypes.c_bool
+
+_STD_INPUT_HANDLE = ctypes.c_ulong(0xFFFFFFF6)   # -10
+_STD_OUTPUT_HANDLE = ctypes.c_ulong(0xFFFFFFF5)  # -11
+_STD_ERROR_HANDLE = ctypes.c_ulong(0xFFFFFFF4)   # -12
+_SW_HIDE = 0
+_SW_SHOW = 5
+_SW_RESTORE = 9
 
 
 def debug_console_visible_pref() -> bool:
@@ -272,7 +311,8 @@ def debug_console_visible_pref() -> bool:
 
 def _get_console_hwnd() -> int:
     try:
-        return int(ctypes.windll.kernel32.GetConsoleWindow() or 0)
+        hwnd = _kernel32.GetConsoleWindow()
+        return int(hwnd) if hwnd else 0
     except Exception:
         return 0
 
@@ -285,9 +325,9 @@ def _protect_console_from_closing_app() -> None:
         if hwnd:
             SC_CLOSE = 0xF060
             MF_BYCOMMAND = 0x0000
-            hmenu = ctypes.windll.user32.GetSystemMenu(hwnd, False)
+            hmenu = _user32.GetSystemMenu(ctypes.c_void_p(hwnd), False)
             if hmenu:
-                ctypes.windll.user32.DeleteMenu(hmenu, SC_CLOSE, MF_BYCOMMAND)
+                _user32.DeleteMenu(hmenu, SC_CLOSE, MF_BYCOMMAND)
     except Exception:
         pass
     if _console_ctrl_handler_ref is not None:
@@ -302,58 +342,134 @@ def _protect_console_from_closing_app() -> None:
             return 0
 
         _console_ctrl_handler_ref = HandlerRoutine(_handler)
-        ctypes.windll.kernel32.SetConsoleCtrlHandler(_console_ctrl_handler_ref, True)
+        _kernel32.SetConsoleCtrlHandler(_console_ctrl_handler_ref, True)
     except Exception:
         _console_ctrl_handler_ref = None
 
 
 def _attach_stdio_to_console() -> None:
-    """Rebranche stdout/stderr sur la console Windows (pythonw / exe windowed)."""
+    """Rebranche stdout/stderr sur la console (obligatoire en .exe --windowed)."""
     global _native_console_stdio
     try:
+        # Ferme d'anciens flux devnull / NullWriter du bootstrap frozen.
+        for stream_name in ("stdout", "stderr"):
+            try:
+                stream = getattr(sys, stream_name, None)
+                if stream is not None and hasattr(stream, "close"):
+                    # Ne pas fermer les vrais flux console déjà ouverts.
+                    name = getattr(stream, "name", "")
+                    if name and str(name).upper() not in ("CONOUT$", "CONIN$"):
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
         out = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
         err = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+        try:
+            inp = open("CONIN$", "r", encoding="utf-8", errors="replace")
+        except Exception:
+            inp = None
+
         sys.stdout = out
         sys.stderr = err
-        _native_console_stdio = (out, err)
+        if inp is not None:
+            sys.stdin = inp
+        _native_console_stdio = (out, err, inp)
+
+        # Aligne aussi les handles Win32 (certains libs C n'utilisent pas sys.stdout).
+        try:
+            import msvcrt
+
+            for fd, std_id in (
+                (out.fileno(), _STD_OUTPUT_HANDLE),
+                (err.fileno(), _STD_ERROR_HANDLE),
+            ):
+                handle = msvcrt.get_osfhandle(fd)
+                _kernel32.SetStdHandle(std_id, handle)
+            if inp is not None:
+                _kernel32.SetStdHandle(
+                    _STD_INPUT_HANDLE, msvcrt.get_osfhandle(inp.fileno())
+                )
+        except Exception:
+            pass
+
+        try:
+            _kernel32.SetConsoleOutputCP(65001)
+            _kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
     except Exception:
         pass
 
 
+def _show_console_hwnd(hwnd: int) -> bool:
+    if not hwnd:
+        return False
+    try:
+        _user32.ShowWindow(ctypes.c_void_p(hwnd), _SW_RESTORE)
+        _user32.ShowWindow(ctypes.c_void_p(hwnd), _SW_SHOW)
+        _user32.BringWindowToTop(ctypes.c_void_p(hwnd))
+        _user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
+        return True
+    except Exception:
+        try:
+            win32gui.ShowWindow(int(hwnd), win32con.SW_SHOW)
+            return True
+        except Exception:
+            return False
+
+
 def show_native_console() -> bool:
-    """Affiche la vraie console Windows (AllocConsole si absente)."""
+    """Affiche la vraie console Windows (AllocConsole si .exe windowed)."""
     hwnd = _get_console_hwnd()
     created = False
     if not hwnd:
+        # État bizarre éventuel : détacher puis allouer proprement.
         try:
-            if not ctypes.windll.kernel32.AllocConsole():
-                return False
-            created = True
+            _kernel32.FreeConsole()
         except Exception:
+            pass
+        try:
+            ok = bool(_kernel32.AllocConsole())
+        except Exception:
+            ok = False
+        if not ok:
             return False
+        created = True
         try:
             title = f"Console — {APP_DISPLAY_NAME}"
         except Exception:
-            title = "Console"
+            title = "Console — SnowMaster"
         try:
-            ctypes.windll.kernel32.SetConsoleTitleW(title)
+            _kernel32.SetConsoleTitleW(title)
         except Exception:
             pass
         _attach_stdio_to_console()
         hwnd = _get_console_hwnd()
+
     if not hwnd:
         return False
-    _protect_console_from_closing_app()
-    try:
-        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-    except Exception:
+
+    # Même si la console existait déjà (rare), s'assurer que Python écrit dedans.
+    if not created and getattr(sys, "frozen", False):
         try:
-            ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
+            name = str(getattr(sys.stdout, "name", "") or "").upper()
+            if name != "CONOUT$":
+                _attach_stdio_to_console()
         except Exception:
-            return False
+            _attach_stdio_to_console()
+
+    _protect_console_from_closing_app()
+    if not _show_console_hwnd(hwnd):
+        return False
+
     if created:
         try:
-            print(f"[{APP_DISPLAY_NAME}] Console native active.")
+            print(f"[{APP_DISPLAY_NAME}] Console native active (.exe windowed OK).")
+            sys.stdout.flush()
         except Exception:
             pass
     return True
@@ -365,19 +481,19 @@ def hide_native_console() -> None:
     if not hwnd:
         return
     try:
-        win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+        _user32.ShowWindow(ctypes.c_void_p(hwnd), _SW_HIDE)
     except Exception:
         try:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+            win32gui.ShowWindow(int(hwnd), win32con.SW_HIDE)
         except Exception:
             pass
 
 
-def apply_native_console_visibility(visible: bool) -> None:
+def apply_native_console_visibility(visible: bool) -> bool:
     if visible:
-        show_native_console()
-    else:
-        hide_native_console()
+        return bool(show_native_console())
+    hide_native_console()
+    return True
 
 
 def set_flow_log_context(title: Optional[str] = None, pid=None) -> None:
@@ -12799,9 +12915,44 @@ class SnowMasterGUI(QWidget):
 
     def on_toggle_debug_console(self, _state):
         val = bool(self.chk_debug_console.isChecked())
-        _prefs.setdefault("ui", {})["debug_console_visible"] = val
-        save_prefs(_prefs)
-        apply_native_console_visibility(val)
+        ok = False
+        try:
+            ok = bool(apply_native_console_visibility(val))
+        except Exception as e:
+            ok = False
+            try:
+                QMessageBox.warning(
+                    self,
+                    "Console",
+                    f"Impossible d'afficher la console Windows :\n{e}",
+                )
+            except Exception:
+                pass
+        if val and not ok:
+            try:
+                self.chk_debug_console.blockSignals(True)
+                self.chk_debug_console.setChecked(False)
+                self.chk_debug_console.blockSignals(False)
+            except Exception:
+                pass
+            try:
+                err = ctypes.get_last_error()
+                QMessageBox.warning(
+                    self,
+                    "Console",
+                    "Impossible d'allouer/afficher la console Windows "
+                    f"(AllocConsole, erreur {err}).\n"
+                    "Le .exe est bien en mode --windowed : il faut un rebuild "
+                    "avec ce correctif.",
+                )
+            except Exception:
+                pass
+            val = False
+        try:
+            _prefs.setdefault("ui", {})["debug_console_visible"] = bool(val)
+            save_prefs(_prefs)
+        except Exception:
+            pass
 
     def on_toggle_config_panel(self, checked: bool):
         """Affiche / masque le panneau central Configs & Boutons."""
