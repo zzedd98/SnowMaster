@@ -4002,11 +4002,14 @@ def api_reset_instance():
     data = _read_payload()
     title = (data.get("title") or data.get("name") or "").strip()
     if not title:
+        write_app_log("[RESET] /reset_instance reçu sans title — ignoré")
         return jsonify({"err": "missing title"}), 400
 
+    write_app_log(f"[RESET] /reset_instance reçu pour '{title}'")
     try:
         bus.reset_instance.emit(title)
     except Exception as e:
+        write_app_log(f"[RESET] Échec emit bus pour '{title}': {e}")
         return jsonify({"err": f"emit failed: {e}"}), 500
 
     return jsonify({"ok": True})
@@ -12330,14 +12333,17 @@ class SnowMasterGUI(QWidget):
 
         for title in resets_to_process:
             try:
+                write_app_log(f"[RESET] '{title}': exécution kill + relance")
                 _record_instance_reset_history(title)
                 # Kill le processus
                 self._kill_instance_sync(title)
                 # Émettre le signal pour relancer dans le thread UI
                 # (les signaux Qt sont thread-safe)
                 self.relaunch_requested.emit(title)
+                write_app_log(f"[RESET] '{title}': relance demandée")
             except Exception as e:
                 app_log_error(f"[RESET] Erreur reset {title}: {e}")
+                write_app_log(f"[RESET] '{title}': ✗ erreur: {e}")
 
     def _kill_duplicate_processes(self, title: str, proc_list: List[dict]):
         """Kill tous les processus dupliqués pour un titre donné."""
@@ -12685,12 +12691,17 @@ class SnowMasterGUI(QWidget):
         """Stoppe puis relance l'instance demandée via la queue de resets."""
         if not title:
             return
+        write_app_log(f"[RESET] '{title}': ajouté à la file de reset")
         # Ajouter à la queue de resets qui sera traitée dans le prochain scan
         with _state_lock:
             if not hasattr(self, "_pending_resets"):
                 self._pending_resets = []
             if title not in self._pending_resets:
                 self._pending_resets.append(title)
+            else:
+                write_app_log(
+                    f"[RESET] '{title}': déjà en file — pas de doublon"
+                )
         # Déclencher un traitement immédiat dans un thread background
         self._run_async(self._process_pending_resets)
 
@@ -14611,6 +14622,9 @@ def run_snowbot_flow(
                 )
                 if is_timeout:
                     flow_log("Relance automatique après timeout fenêtre")
+                    write_app_log(
+                        f"[RESET] '{title}': reset auto après timeout fenêtre"
+                    )
                     bus.reset_instance.emit(title)
             except Exception:
                 pass

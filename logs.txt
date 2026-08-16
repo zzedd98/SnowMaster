@@ -1,0 +1,12 @@
+[2026-08-16 04:22:39.124] === Démarrage application ===
+[2026-08-16 04:22:41.098] ERROR SnowMaster: Chargement de 2 bouton(s) depuis les préférences
+[2026-08-16 04:22:41.098] ERROR SnowMaster: Bouton chargé: title='close vidage go hdv', id='72b828a9-09a9-4c88-9b12-587376aac8db'
+[2026-08-16 04:22:41.098] ERROR SnowMaster: Bouton chargé: title='Lancer vidage', id='282d61d4-0fd3-4f45-a1c6-3a6ea4c0cab6'
+[2026-08-16 04:22:50.217] [RELAUNCH] '19': exe=c:\Users\User\Desktop\SnowBot2026\AnkaBotPC\AnkaBot.exe controller=C:/Users/User/Desktop/SnowBot2026/AnkabotScripts/TSD3/ztest.lua
+[2026-08-16 04:22:50.260] [? - 19] Erreur lancement: [WinError 740] L’opération demandée nécessite une élévation
+[2026-08-16 04:23:03.106] [MARK_STOPPED] '19': Marquage comme stoppée...
+[2026-08-16 04:23:03.107] [MARK_STOPPED] '19': ✓ Instance marquée comme stoppée
+[2026-08-16 04:23:11.139] [SCAN_PIDS] ========== Début du scan (léger) ==========
+[2026-08-16 04:23:11.141] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
+[2026-08-16 04:23:11.141] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-08-16 04:23:11.141] [SCAN_PIDS] Aucune instance active, fin du scan
