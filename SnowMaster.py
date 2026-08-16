@@ -3417,6 +3417,104 @@ def _record_instance_reset_history(title: str, now_ts: Optional[float] = None) -
 _instances: Dict[str, InstanceState] = {}
 _state_lock = threading.Lock()
 
+# Cache process AnkaBot (rempli par le scan lourd périodique) — évite un process_iter au lancement
+_ankabot_procs_cache_lock = threading.Lock()
+_ankabot_procs_by_title: Dict[str, List[dict]] = {}  # title -> infos process
+_ankabot_procs_cache_ts: float = 0.0
+
+
+def set_ankabot_process_cache(processes_by_title: Dict[str, List[dict]]) -> None:
+    """Remplace le cache (appelé depuis le scan lourd)."""
+    global _ankabot_procs_by_title, _ankabot_procs_cache_ts
+    with _ankabot_procs_cache_lock:
+        _ankabot_procs_by_title = {
+            str(t): [dict(p) for p in (procs or [])]
+            for t, procs in (processes_by_title or {}).items()
+            if t
+        }
+        _ankabot_procs_cache_ts = time.time()
+
+
+def get_cached_processes_by_title(title: str) -> List[dict]:
+    """Lit le cache pour un --title (filtre les PID encore vivants)."""
+    if not title:
+        return []
+    title_norm = title.strip().lower()
+    with _ankabot_procs_cache_lock:
+        procs = []
+        for t, lst in _ankabot_procs_by_title.items():
+            if str(t).strip().lower() == title_norm:
+                procs = list(lst)
+                break
+    alive = []
+    for info in procs:
+        try:
+            pid = int(info.get("pid") or 0)
+        except Exception:
+            continue
+        if pid and is_pid_alive(pid):
+            alive.append(info)
+    return alive
+
+
+def cache_add_ankabot_process(title: str, pid, hwnd=None, controller=None) -> None:
+    """Ajoute / met à jour un process dans le cache après un lancement OK."""
+    if not title or not pid:
+        return
+    try:
+        pid = int(pid)
+    except Exception:
+        return
+    info = {
+        "pid": pid,
+        "hwnd": int(hwnd) if hwnd else None,
+        "title": title,
+        "controller": controller,
+    }
+    title_norm = title.strip().lower()
+    with _ankabot_procs_cache_lock:
+        key = None
+        for t in _ankabot_procs_by_title.keys():
+            if str(t).strip().lower() == title_norm:
+                key = t
+                break
+        if key is None:
+            key = title
+            _ankabot_procs_by_title[key] = []
+        lst = _ankabot_procs_by_title[key]
+        replaced = False
+        for i, old in enumerate(lst):
+            try:
+                if int(old.get("pid") or 0) == pid:
+                    lst[i] = info
+                    replaced = True
+                    break
+            except Exception:
+                pass
+        if not replaced:
+            lst.append(info)
+
+
+def cache_remove_ankabot_pids(pids) -> None:
+    """Retire des PID du cache (après kill)."""
+    try:
+        want = {int(p) for p in (pids or []) if p}
+    except Exception:
+        return
+    if not want:
+        return
+    with _ankabot_procs_cache_lock:
+        for t in list(_ankabot_procs_by_title.keys()):
+            lst = [
+                info
+                for info in _ankabot_procs_by_title.get(t, [])
+                if int(info.get("pid") or 0) not in want
+            ]
+            if lst:
+                _ankabot_procs_by_title[t] = lst
+            else:
+                _ankabot_procs_by_title.pop(t, None)
+
 # ----------------- Shared revenue data (prices & holdings) -----------------
 # Structure :
 # _revenue_data = {
@@ -11032,6 +11130,7 @@ class SnowMasterGUI(QWidget):
                     return
 
                 start_ts = time.time()
+                cache_add_ankabot_process(title, p.pid)
                 with _state_lock:
                     try:
                         inst.pid = int(p.pid)
@@ -11062,6 +11161,7 @@ class SnowMasterGUI(QWidget):
                         ),
                         connexion_confidence=0.3,
                     )
+                    cache_add_ankabot_process(title, main_pid, main_hwnd)
                     try:
                         _post_json(
                             "/register",
@@ -11086,6 +11186,10 @@ class SnowMasterGUI(QWidget):
                     _log_empty(f"[{title}] Relance wait_for_large_window: {e}")
 
                 p.wait()
+                try:
+                    cache_remove_ankabot_pids([int(p.pid)])
+                except Exception:
+                    pass
                 with _state_lock:
                     inst.stopped = True
                     inst.awaiting_first_hb = False
@@ -11858,6 +11962,7 @@ class SnowMasterGUI(QWidget):
             _log_empty(
                 f"[{title}] PID={p.pid} démarrage ok, attente grande fenêtre (voyant jaune)"
             )
+            cache_add_ankabot_process(title, p.pid)
             with _state_lock:
                 try:
                     inst.pid = int(p.pid)
@@ -11890,6 +11995,7 @@ class SnowMasterGUI(QWidget):
                 _log_empty(
                     f"[{title}] Fenêtre détectée hwnd={main_hwnd} pid={main_pid}, register + renommage"
                 )
+                cache_add_ankabot_process(title, main_pid, main_hwnd)
                 try:
                     _post_json(
                         "/register",
@@ -11920,6 +12026,10 @@ class SnowMasterGUI(QWidget):
 
             # attente bloquante sur la fin du process (comme V3)
             p.wait()
+            try:
+                cache_remove_ankabot_pids([int(p.pid)])
+            except Exception:
+                pass
             with _state_lock:
                 inst.stopped = True
                 inst.awaiting_first_hb = False
@@ -12100,10 +12210,12 @@ class SnowMasterGUI(QWidget):
                     for t, inst in _instances.items():
                         if not inst.stopped:
                             known_titles.add(t)
+                scan_ok = False
                 try:
                     all_processes = scan_snowbot_processes_by_cmdline(
                         verbose=False, known_titles=known_titles
                     )
+                    scan_ok = True
                     scan_log(
                         f"[SCAN_PIDS] {len(all_processes)} processus {APP_EXE_NAME} trouvés (scan complet)"
                     )
@@ -12118,6 +12230,9 @@ class SnowMasterGUI(QWidget):
                         if proc_title not in processes_by_title:
                             processes_by_title[proc_title] = []
                         processes_by_title[proc_title].append(info)
+                # Cache pour les lancements (évite un process_iter sur le thread UI)
+                if scan_ok:
+                    set_ankabot_process_cache(processes_by_title)
             else:
                 scan_log("[SCAN_PIDS] Scan léger : pas d'énumération globale des processus")
 
@@ -12511,7 +12626,7 @@ class SnowMasterGUI(QWidget):
                 app_log_warn(f"[RESET] Terminate failed for {title}: {e}")
 
         # Pendant un lancement raté, l'état peut rester pid=0 alors qu'un process
-        # --title existe encore : on le retrouve via la cmdline.
+        # --title existe encore : on le retrouve via le cache (scan lourd).
         try:
             for info in find_processes_by_title(title) or []:
                 p = info.get("pid")
@@ -12530,6 +12645,9 @@ class SnowMasterGUI(QWidget):
                     app_log_warn(f"[RESET] Terminate title-PID {p} failed for {title}: {e}")
         except Exception as e:
             app_log_warn(f"[RESET] find_processes_by_title failed for {title}: {e}")
+
+        if killed:
+            cache_remove_ankabot_pids(killed)
 
         self._mark_instance_stopped(title)
 
@@ -12565,6 +12683,7 @@ class SnowMasterGUI(QWidget):
             terminate_process_tree(pid_int, timeout=5.0)
 
         if killed_pids:
+            cache_remove_ankabot_pids(killed_pids)
             app_log_warn(
                 f"Instances dupliquées détectées pour '{title}' (PIDs={killed_pids}), nettoyage forcé."
             )
@@ -14215,6 +14334,7 @@ def wait_for_windows_with_early_register(
     app_log_info(
         "Launched PID=%s @ %s", p.pid, datetime.fromtimestamp(start_ts).isoformat()
     )
+    cache_add_ankabot_process(title_for_register, p.pid)
     # Enregistrer tout de suite le PID launcher pour que le scan périodique
     # ne croie pas que l'instance est morte (pid=0) pendant l'attente fenêtre.
     try:
@@ -14258,6 +14378,10 @@ def wait_for_windows_with_early_register(
             )
             try:
                 terminate_process_tree(int(p.pid), timeout=3.0)
+            except Exception:
+                pass
+            try:
+                cache_remove_ankabot_pids([int(p.pid)])
             except Exception:
                 pass
             raise TimeoutError(
@@ -14631,6 +14755,7 @@ def run_snowbot_flow(
             return
 
         set_flow_log_context(title, main_pid)
+        cache_add_ankabot_process(title, main_pid, main_hwnd)
 
         try:
             try:
@@ -15159,35 +15284,35 @@ def scan_snowbot_processes_by_cmdline(
 
 
 def find_processes_by_title(title: str) -> List[dict]:
-    """Retourne la liste des processus AnkaBot dont l'argument --title correspond."""
+    """Retourne les process AnkaBot pour un --title via le cache (pas de process_iter)."""
     if not title:
         return []
     title_norm = title.strip().lower()
     if not title_norm:
         return []
+    matches = get_cached_processes_by_title(title)
+    seen = set()
+    for info in matches:
+        try:
+            seen.add(int(info.get("pid") or 0))
+        except Exception:
+            pass
     with _state_lock:
         inst = _instances.get(title)
     if inst and inst.pid and is_pid_alive(inst.pid):
-        return [
-            {
-                "pid": inst.pid,
-                "hwnd": inst.hwnd,
-                "title": title,
-                "controller": inst.controller_path,
-            }
-        ]
-    try:
-        processes = scan_snowbot_processes_by_cmdline(
-            verbose=False, known_titles={title}
-        )
-    except Exception as e:
-        app_log_error(f"scan_snowbot_processes_by_cmdline failed: {e}")
-        return []
-    matches: List[dict] = []
-    for info in processes.values():
-        proc_title = str(info.get("title") or "").strip().lower()
-        if proc_title and proc_title == title_norm:
-            matches.append(info)
+        try:
+            pid = int(inst.pid)
+        except Exception:
+            pid = 0
+        if pid and pid not in seen:
+            matches.append(
+                {
+                    "pid": pid,
+                    "hwnd": inst.hwnd,
+                    "title": title,
+                    "controller": getattr(inst, "controller_path", None),
+                }
+            )
     return matches
 
 
@@ -15434,6 +15559,17 @@ def restore_running_instances_from_cmdline():
             except Exception as e:
                 print("restore error for pid", pid, e)
                 continue
+
+    # Amorcer le cache process (même source que le scan lourd) pour les prochains lancements
+    try:
+        by_title: Dict[str, List[dict]] = {}
+        for info in (found or {}).values():
+            t = str((info or {}).get("title") or "").strip()
+            if t:
+                by_title.setdefault(t, []).append(info)
+        set_ankabot_process_cache(by_title)
+    except Exception:
+        pass
 
     if killed_old_snow:
         print(f"[restore] {killed_old_snow} ancien(s) SnowMaster tenté(s) kill.")
