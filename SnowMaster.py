@@ -393,6 +393,7 @@ CLR_GREY = "#6b7280"
 CLR_PURPLE = "#8b5cf6"  # violet pour instances restaurées récemment
 
 CLR_BLUE = "#3b82f6"  #  bleu pour les instances "vides" lancées manuellement ---
+CLR_TURQUOISE = "#14b8a6"  # file d'attente "Lancer tout"
 
 # ===== PRICES SCRAPING SCOPE =====
 ALLOWED_SERVERS_DISPLAY = [
@@ -5329,6 +5330,15 @@ def apply_dark_blue_style(app: QApplication):
             border: 2px solid rgba(59,130,246,0.92);
             background-color: rgba(37,99,235,0.21);
         }
+
+        QWidget#InstanceCard[state="turquoise"] {
+            border: 2px solid rgba(45,212,191,0.88);         /* turquoise file d'attente */
+            background-color: rgba(15,118,110,0.16);
+        }
+        QWidget#InstanceCard[state="turquoise"][selected="true"] {
+            border: 2px solid rgba(94,234,212,0.95);
+            background-color: rgba(20,184,166,0.22);
+        }
                       
         /* Carte statique (pas d'effet hover), pour la liste de gauche */
         QWidget#StaticCard { 
@@ -7948,6 +7958,8 @@ class InstanceItemWidget(QWidget):
             return "purple"
         if ch == CLR_BLUE.lower():
             return "blue"
+        if ch == CLR_TURQUOISE.lower():
+            return "turquoise"
         return "none"
 
     def _status_unchanged(
@@ -7962,7 +7974,7 @@ class InstanceItemWidget(QWidget):
         if self._cached_anim_on != anim_on:
             return False
         if anim_on:
-            if sev in ("green", "yellow", "red", "purple", "blue"):
+            if sev in ("green", "yellow", "red", "purple", "blue", "turquoise"):
                 return self._glow_mode == sev
             return self._glow_mode == "none"
         return self.graphicsEffect() is None and self._glow_mode == "none"
@@ -8011,7 +8023,7 @@ class InstanceItemWidget(QWidget):
                 if self._glow_anim is not None:
                     self._glow_anim.stop()
 
-                if sev in ("green", "yellow", "red", "purple", "blue"):
+                if sev in ("green", "yellow", "red", "purple", "blue", "turquoise"):
                     self._init_glow_widgets()
                     if sev == "green":
                         base_color = QColor(74, 222, 128, 28)
@@ -8025,6 +8037,9 @@ class InstanceItemWidget(QWidget):
                     elif sev == "purple":
                         base_color = QColor(196, 181, 253, 28)
                         peak_color = QColor(167, 139, 250, 150)
+                    elif sev == "turquoise":
+                        base_color = QColor(45, 212, 191, 28)
+                        peak_color = QColor(20, 184, 166, 150)
                     else:  # blue
                         base_color = QColor(96, 165, 250, 28)
                         peak_color = QColor(59, 130, 246, 150)
@@ -8649,6 +8664,7 @@ class SnowMasterGUI(QWidget):
         self._bulk_launch_done = 0
         self._bulk_launch_total = 0
         self._bulk_launch_gen = 0
+        self._bulk_launch_pending = set()
         for b in (
             self.btn_new,
             self.btn_launch_empty,
@@ -9797,6 +9813,13 @@ class SnowMasterGUI(QWidget):
         return age_s >= HEARTBEAT_RED_S
 
     def instance_color(self, inst: InstanceState) -> str:
+        # File d'attente "Lancer tout" : turquoise tant que pas encore lancé
+        try:
+            title = getattr(inst, "title", None) or ""
+            if title and title in getattr(self, "_bulk_launch_pending", set()):
+                return CLR_TURQUOISE
+        except Exception:
+            pass
         # instance "vide" : jaune pendant attente fenêtre, bleu une fois détectée, gris si stoppée
         if getattr(inst, "manual_empty", False):
             if inst.stopped:
@@ -11391,6 +11414,15 @@ class SnowMasterGUI(QWidget):
         self._bulk_launch_active = True
         self._bulk_launch_done = 0
         self._bulk_launch_total = len(titles)
+        # Turquoise = encore en file (pas déjà running)
+        pending = set()
+        for t in titles:
+            with _state_lock:
+                inst = _instances.get(t)
+            if inst and not self._is_instance_running(inst):
+                pending.add(t)
+        self._bulk_launch_pending = pending
+        self._refresh_bulk_pending_cards(list(pending))
         self._update_bulk_launch_button()
 
         for idx, t in enumerate(titles):
@@ -11399,12 +11431,41 @@ class SnowMasterGUI(QWidget):
                 delay_ms, lambda _t=t, _g=gen: self._bulk_launch_one(_t, _g)
             )
 
+    def _refresh_bulk_pending_cards(self, titles):
+        """Repaint immédiat des cartes concernées par la file 'Lancer tout'."""
+        for t in titles or []:
+            with _state_lock:
+                inst = _instances.get(t)
+            if inst:
+                try:
+                    self._ensure_item(t, inst)
+                except Exception:
+                    pass
+
     def _cancel_bulk_launch(self):
         """Annule les lancements encore planifiés du 'Lancer tout'."""
         if not getattr(self, "_bulk_launch_active", False):
             return
         self._bulk_launch_gen = int(getattr(self, "_bulk_launch_gen", 0) or 0) + 1
+        remaining = list(getattr(self, "_bulk_launch_pending", set()) or [])
+        self._bulk_launch_pending = set()
+        # Remettre en gris (stoppées) les instances encore en file
+        with _state_lock:
+            for t in remaining:
+                inst = _instances.get(t)
+                if not inst:
+                    continue
+                inst.stopped = True
+                inst.awaiting_first_hb = False
+                inst.pid = None
+                inst.hwnd = None
+                _instances[t] = inst
         self._restore_bulk_launch_button()
+        self._refresh_bulk_pending_cards(remaining)
+        try:
+            self.update_global_dot()
+        except Exception:
+            pass
 
     def _update_bulk_launch_button(self):
         """Affiche la progression du 'Lancer tout' (bouton grisé mais cliquable pour annuler)."""
@@ -11445,6 +11506,7 @@ class SnowMasterGUI(QWidget):
         self._bulk_launch_active = False
         self._bulk_launch_done = 0
         self._bulk_launch_total = 0
+        self._bulk_launch_pending = set()
         btn.setEnabled(True)
         btn.setText("Lancer tout")
         btn.setToolTip("")
@@ -11465,6 +11527,10 @@ class SnowMasterGUI(QWidget):
             or int(gen) != int(getattr(self, "_bulk_launch_gen", 0) or 0)
         ):
             return
+        try:
+            getattr(self, "_bulk_launch_pending", set()).discard(title)
+        except Exception:
+            pass
         try:
             self.on_card_relaunch(title)
         except Exception:
