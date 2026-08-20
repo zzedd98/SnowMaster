@@ -8619,6 +8619,11 @@ class SnowMasterGUI(QWidget):
         self.btn_all_reload = QPushButton("Lancer tout")
         self.btn_all_kill = QPushButton("Terminer tout")
         self.btn_all_del = QPushButton("Supprimer tout")
+        self._bulk_launch_active = False
+        self._bulk_launch_done = 0
+        self._bulk_launch_total = 0
+        self._bulk_launch_gen = 0
+        self._bulk_launch_btn_ss = ""
         for b in (
             self.btn_new,
             self.btn_launch_empty,
@@ -11332,8 +11337,11 @@ class SnowMasterGUI(QWidget):
         return res == QMessageBox.Yes
 
     def on_bulk_reload(self):
+        # Clic pendant un batch = annuler les lancements restants
+        if getattr(self, "_bulk_launch_active", False):
+            self._cancel_bulk_launch()
+            return
         with _state_lock:
-            # titles = list(_instances.keys())
             titles = self.selected_titles()
         if not titles:
             return
@@ -11343,16 +11351,101 @@ class SnowMasterGUI(QWidget):
         ):
             return
 
-        # récupérer délai (en secondes)
         try:
             delay_s = int(self.spin_launch_delay.value())
         except Exception:
             delay_s = 0
 
+        self._bulk_launch_gen = int(getattr(self, "_bulk_launch_gen", 0) or 0) + 1
+        gen = self._bulk_launch_gen
+        self._bulk_launch_active = True
+        self._bulk_launch_done = 0
+        self._bulk_launch_total = len(titles)
+        self._update_bulk_launch_button()
+
         for idx, t in enumerate(titles):
-            # planifie chaque relance espacée par delay_s
             delay_ms = int(idx * delay_s * 1000)
-            QTimer.singleShot(delay_ms, lambda _t=t: self.on_card_relaunch(_t))
+            QTimer.singleShot(
+                delay_ms, lambda _t=t, _g=gen: self._bulk_launch_one(_t, _g)
+            )
+
+    def _cancel_bulk_launch(self):
+        """Annule les lancements encore planifiés du 'Lancer tout'."""
+        if not getattr(self, "_bulk_launch_active", False):
+            return
+        self._bulk_launch_gen = int(getattr(self, "_bulk_launch_gen", 0) or 0) + 1
+        self._restore_bulk_launch_button()
+
+    def _update_bulk_launch_button(self):
+        """Affiche la progression du 'Lancer tout' (bouton grisé mais cliquable pour annuler)."""
+        btn = getattr(self, "btn_all_reload", None)
+        if btn is None:
+            return
+        total = int(getattr(self, "_bulk_launch_total", 0) or 0)
+        done = int(getattr(self, "_bulk_launch_done", 0) or 0)
+        if total <= 0:
+            return
+        btn.setEnabled(True)
+        btn.setText(f"{done}/{total} lancées")
+        btn.setToolTip(
+            f"Lancement en cours : {done}/{total}\nCliquer pour annuler"
+        )
+        if not getattr(self, "_bulk_launch_btn_ss", None):
+            self._bulk_launch_btn_ss = btn.styleSheet() or ""
+        btn.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #334155;
+                color: #94a3b8;
+                border: 1px solid #475569;
+                border-radius: 8px;
+                padding: 4px 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #475569;
+                color: #e2e8f0;
+            }
+            """
+        )
+
+    def _restore_bulk_launch_button(self):
+        """Remet le bouton 'Lancer tout' à l'état normal."""
+        btn = getattr(self, "btn_all_reload", None)
+        if btn is None:
+            return
+        self._bulk_launch_active = False
+        self._bulk_launch_done = 0
+        self._bulk_launch_total = 0
+        btn.setEnabled(True)
+        btn.setText("Lancer tout")
+        btn.setToolTip("")
+        try:
+            btn.setStyleSheet(getattr(self, "_bulk_launch_btn_ss", "") or "")
+        except Exception:
+            btn.setStyleSheet("")
+
+    def _bulk_launch_one(self, title: str, gen: int = 0):
+        """Lance une instance du batch 'Lancer tout' et met à jour la progression."""
+        if (
+            not getattr(self, "_bulk_launch_active", False)
+            or int(gen) != int(getattr(self, "_bulk_launch_gen", 0) or 0)
+        ):
+            return
+        try:
+            self.on_card_relaunch(title)
+        except Exception:
+            pass
+        if (
+            not getattr(self, "_bulk_launch_active", False)
+            or int(gen) != int(getattr(self, "_bulk_launch_gen", 0) or 0)
+        ):
+            return
+        self._bulk_launch_done = int(getattr(self, "_bulk_launch_done", 0) or 0) + 1
+        total = int(getattr(self, "_bulk_launch_total", 0) or 0)
+        self._update_bulk_launch_button()
+        if total > 0 and self._bulk_launch_done >= total:
+            self._restore_bulk_launch_button()
 
     def on_bulk_kill(self):
         with _state_lock:
