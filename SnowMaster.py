@@ -515,8 +515,8 @@ DEFAULT_PREFS = {
         "right_panel_visible": True,  # panneau droite Sous-contrôleurs / détails
         "compact_instances": False,  # cartes instances sans boutons (plus étroites)
         "always_on_top": False,  # garder SnowMaster au-dessus des autres fenêtres
-        "refresh_interval_active_ms": 15000,
-        "refresh_interval_inactive_ms": 15000,  # fenêtre inactive / minimisée
+        "refresh_interval_active_ms": 5000,
+        "refresh_interval_inactive_ms": 5000,  # fenêtre inactive / minimisée
         "bus_coalesce_ms": 300,  # regroupement des heartbeats avant refresh UI
         # Géométrie fenêtre principale (restaurée au démarrage)
         "window": {
@@ -9652,17 +9652,18 @@ class SnowMasterGUI(QWidget):
     def _sync_refresh_timer_interval(self):
         try:
             ui = _prefs.setdefault("ui", {})
-            # Migrer d'anciennes valeurs 1s / 2.5s → 15s (même logique, nouvel intervalle)
-            if ui.get("refresh_interval_active_ms") == 1000:
-                ui["refresh_interval_active_ms"] = 15000
-            if ui.get("refresh_interval_inactive_ms") == 2500:
-                ui["refresh_interval_inactive_ms"] = 15000
+            # Migrer d'anciennes valeurs (1s / 2.5s / 15s) → 5s
+            _old_refresh = {1000, 2500, 15000}
+            if ui.get("refresh_interval_active_ms") in _old_refresh:
+                ui["refresh_interval_active_ms"] = 5000
+            if ui.get("refresh_interval_inactive_ms") in _old_refresh:
+                ui["refresh_interval_inactive_ms"] = 5000
             if self.isMinimized() or not self.isActiveWindow():
-                ms = int(ui.get("refresh_interval_inactive_ms", 15000))
+                ms = int(ui.get("refresh_interval_inactive_ms", 5000))
             else:
-                ms = int(ui.get("refresh_interval_active_ms", 15000))
+                ms = int(ui.get("refresh_interval_active_ms", 5000))
         except Exception:
-            ms = 15000
+            ms = 5000
         ms = max(500, ms)
         if self.timer.interval() != ms:
             self.timer.setInterval(ms)
