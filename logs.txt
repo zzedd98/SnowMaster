@@ -10,3 +10,11 @@
 [2026-08-16 04:23:11.141] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
 [2026-08-16 04:23:11.141] [SCAN_PIDS] 0 instances actives à vérifier
 [2026-08-16 04:23:11.141] [SCAN_PIDS] Aucune instance active, fin du scan
+[2026-08-20 11:11:09.087] === Démarrage application ===
+[2026-08-20 11:11:18.553] ERROR SnowMaster: Chargement de 2 bouton(s) depuis les préférences
+[2026-08-20 11:11:18.555] ERROR SnowMaster: Bouton chargé: title='close vidage go hdv', id='72b828a9-09a9-4c88-9b12-587376aac8db'
+[2026-08-20 11:11:18.555] ERROR SnowMaster: Bouton chargé: title='Lancer vidage', id='282d61d4-0fd3-4f45-a1c6-3a6ea4c0cab6'
+[2026-08-20 11:11:48.628] [SCAN_PIDS] ========== Début du scan (léger) ==========
+[2026-08-20 11:11:48.634] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
+[2026-08-20 11:11:48.634] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-08-20 11:11:48.634] [SCAN_PIDS] Aucune instance active, fin du scan

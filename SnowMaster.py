@@ -175,6 +175,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QShortcut,
     QTextCursor,
+    QPixmap,
 )
 from PySide6.QtWidgets import QStyledItemDelegate
 from PySide6.QtGui import QPainter, QPainterPath, QPen, QBrush
@@ -553,7 +554,6 @@ def euro_counter_visible() -> bool:
         return bool(_prefs.get("ui", {}).get("euro_counter_visible", True))
     except Exception:
         return True
-
 
 
 def screen_to_use() -> int:
@@ -3242,7 +3242,9 @@ class InstanceState:
         self.ratio: float = 0.5
         self.restored_recently: bool = False  # <--- nouveau flag
         self.manual_empty: bool = False
-        self.reddot_resettable: bool = True  # False après 1er reset auto reddot (cooldown 30 min)
+        self.reddot_resettable: bool = (
+            True  # False après 1er reset auto reddot (cooldown 30 min)
+        )
         self.hb_history: Deque = deque(maxlen=MAX_HEARTBEAT_HISTORY)
         self._hb_dedup_key: Optional[tuple] = None
         self._hb_dedup_ts: float = 0.0
@@ -3330,9 +3332,7 @@ def _record_heartbeat_history(inst: InstanceState, data: dict, now_ts: float) ->
         parsed = _parse_subcontrollers(data.get("subcontrollers"), now_ts)
         for sid, info in parsed.items():
             alias = (
-                str(info.get("alias") or sid)
-                if isinstance(info, dict)
-                else str(sid)
+                str(info.get("alias") or sid) if isinstance(info, dict) else str(sid)
             )
             try:
                 sub_ts = (
@@ -3346,9 +3346,7 @@ def _record_heartbeat_history(inst: InstanceState, data: dict, now_ts: float) ->
     elif inst.sub_map:
         for sid, info in inst.sub_map.items():
             alias = (
-                str(info.get("alias") or sid)
-                if isinstance(info, dict)
-                else str(sid)
+                str(info.get("alias") or sid) if isinstance(info, dict) else str(sid)
             )
             try:
                 sub_ts = (
@@ -3375,13 +3373,9 @@ def _record_heartbeat_history(inst: InstanceState, data: dict, now_ts: float) ->
     inst._hb_dedup_ts = now_ts
 
     for sid, alias, sub_ts in sub_rows:
-        line_text, is_green = _format_hb_sub_line(
-            sub_ts, sid, alias, label, now_ts
-        )
+        line_text, is_green = _format_hb_sub_line(sub_ts, sid, alias, label, now_ts)
         inst.hb_history.append(
-            HeartbeatSubLine(
-                now_ts, sid, alias, sub_ts, label, is_green, line_text
-            )
+            HeartbeatSubLine(now_ts, sid, alias, sub_ts, label, is_green, line_text)
         )
 
 
@@ -3515,6 +3509,7 @@ def cache_remove_ankabot_pids(pids) -> None:
             else:
                 _ankabot_procs_by_title.pop(t, None)
 
+
 # ----------------- Shared revenue data (prices & holdings) -----------------
 # Structure :
 # _revenue_data = {
@@ -3628,6 +3623,32 @@ def get_icon(name: str) -> QIcon:
     except Exception:
         return QIcon()
     return QIcon()
+
+
+def get_reset_action_icon(size: int = 16) -> QIcon:
+    """Icône menu Reset = logo kill (stop) puis logo lancer (play), côte à côte."""
+    try:
+        stop = get_icon("stop")
+        play = get_icon("play")
+    except Exception:
+        return QIcon()
+    if (stop is None or stop.isNull()) and (play is None or play.isNull()):
+        return QIcon()
+    gap = max(2, size // 8)
+    w = size * 2 + gap
+    h = size
+    pm = QPixmap(w, h)
+    pm.fill(Qt.transparent)
+    painter = QPainter(pm)
+    try:
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        if stop is not None and not stop.isNull():
+            painter.drawPixmap(0, 0, stop.pixmap(size, size))
+        if play is not None and not play.isNull():
+            painter.drawPixmap(size + gap, 0, play.pixmap(size, size))
+    finally:
+        painter.end()
+    return QIcon(pm)
 
 
 _init_icons_from_prefs()
@@ -4540,7 +4561,12 @@ def _price_from_cell(text: str, currency: str) -> float:
     if currency == "dhs":
         if "dhs" in low or "dh/" in low:
             return val
-        if "€" not in low and "usdt" not in low and "usd" not in low and "cny" not in low:
+        if (
+            "€" not in low
+            and "usdt" not in low
+            and "usd" not in low
+            and "cny" not in low
+        ):
             return val
     return 0.0
 
@@ -4586,7 +4612,9 @@ def _resolve_price_columns(col_names: List[str]) -> Dict[str, int | None]:
     return idx
 
 
-def _extract_prices_from_row(texts: List[str], col_idx: Dict[str, int | None]) -> Dict[str, float]:
+def _extract_prices_from_row(
+    texts: List[str], col_idx: Dict[str, int | None]
+) -> Dict[str, float]:
     prices = _empty_price_triple()
     for cur in PRICE_CURRENCIES:
         ci = col_idx.get(cur)
@@ -4635,9 +4663,7 @@ def _servers_eur_for_holdings(data: dict) -> Dict[str, float]:
     if sources:
         return _average_eur_prices_from_sources(sources)
     raw = (data or {}).get("servers") or {}
-    return {
-        srv: _normalize_price_entry(val)["eur"] for srv, val in raw.items()
-    }
+    return {srv: _normalize_price_entry(val)["eur"] for srv, val in raw.items()}
 
 
 def _scrape_leskamas_with_playwright(
@@ -4785,7 +4811,9 @@ def _scrape_ventekamas_with_playwright(
             page.set_default_navigation_timeout(timeout)
             page.goto(url)
 
-            page.wait_for_selector("table.table-prices, table.with_frm_style", timeout=12000)
+            page.wait_for_selector(
+                "table.table-prices, table.with_frm_style", timeout=12000
+            )
 
             chosen = page.query_selector("table.table-prices")
             if chosen is None:
@@ -4891,9 +4919,7 @@ def _scraped_to_display_maps(scraped: dict) -> tuple:
     }
     servers_map: Dict[str, Dict[str, float]] = {}
     for scraped_name, price in scraped_map.items():
-        display = SCRAPED_TO_DISPLAY.get(
-            _normalize_server(scraped_name), scraped_name
-        )
+        display = SCRAPED_TO_DISPLAY.get(_normalize_server(scraped_name), scraped_name)
         servers_map[display] = _normalize_price_entry(price)
 
     if servers_map:
@@ -4965,7 +4991,8 @@ def _price_sources_for_ui(data: dict) -> Dict[str, Dict[str, Dict[str, float]]]:
     if not raw and data.get("servers"):
         raw = {
             PRIMARY_PRICE_SOURCE: {
-                s: _normalize_price_entry(v) for s, v in (data.get("servers") or {}).items()
+                s: _normalize_price_entry(v)
+                for s, v in (data.get("servers") or {}).items()
             }
         }
     return {
@@ -4994,10 +5021,7 @@ class _CurrencyComboPopupFilter(QObject):
         self._combo = combo
 
     def eventFilter(self, watched, event):
-        if (
-            event.type() == QEvent.MouseButtonPress
-            and event.button() == Qt.LeftButton
-        ):
+        if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
             self._combo.setFocus(Qt.MouseFocusReason)
             QTimer.singleShot(0, self._combo.showPopup)
             return True
@@ -5111,11 +5135,11 @@ def fetch_reference_prices_async(on_done=None):
                 _revenue_data["status_by_source"] = status_by_source
                 _revenue_data["servers"] = reference_servers
                 _revenue_data.setdefault("price_currency", DEFAULT_PRICE_CURRENCY)
-                _revenue_data.setdefault("price_display_mode", DEFAULT_PRICE_DISPLAY_MODE)
-                _revenue_data.setdefault("status", {})
-                _revenue_data["status"] = status_by_source.get(
-                    PRIMARY_PRICE_SOURCE, {}
+                _revenue_data.setdefault(
+                    "price_display_mode", DEFAULT_PRICE_DISPLAY_MODE
                 )
+                _revenue_data.setdefault("status", {})
+                _revenue_data["status"] = status_by_source.get(PRIMARY_PRICE_SOURCE, {})
                 _revenue_data.setdefault("holdings", {"TS": {}, "M": {}})
                 for kind in ("TS", "M"):
                     for s in (reference_servers or {}).keys():
@@ -5545,7 +5569,9 @@ REF_PRICE_ROW_GAP = 2
 _REF_PRICE_LABEL_BASE = "background:transparent; border:none; padding:0; margin:0;"
 
 
-def _ref_price_label_style(*, header: bool = False, color: str | None = None, bold: int = 700) -> str:
+def _ref_price_label_style(
+    *, header: bool = False, color: str | None = None, bold: int = 700
+) -> str:
     parts = [_REF_PRICE_LABEL_BASE, f"font-weight:{bold};"]
     if header:
         parts.append("color:#93c5fd;")
@@ -5554,7 +5580,9 @@ def _ref_price_label_style(*, header: bool = False, color: str | None = None, bo
     return " ".join(parts)
 
 
-def _configure_ref_price_label(lbl: QLabel, *, header: bool = False, color: str | None = None, bold: int = 700):
+def _configure_ref_price_label(
+    lbl: QLabel, *, header: bool = False, color: str | None = None, bold: int = 700
+):
     lbl.setAutoFillBackground(False)
     lbl.setStyleSheet(_ref_price_label_style(header=header, color=color, bold=bold))
 
@@ -5615,14 +5643,18 @@ class ReferencePriceRow(QWidget):
             self.price_labels[label] = cell
 
     def set_prices(
-        self, prices_by_source: Dict[str, object], currency: str = DEFAULT_PRICE_CURRENCY
+        self,
+        prices_by_source: Dict[str, object],
+        currency: str = DEFAULT_PRICE_CURRENCY,
     ):
         for label, lbl in self.price_labels.items():
             entry = _normalize_price_entry(prices_by_source.get(label, 0.0))
             lbl.setText(_format_price_amount(entry.get(currency, 0.0), currency))
 
     def set_footer_amounts(
-        self, amounts_by_source: Dict[str, float], currency: str = DEFAULT_PRICE_CURRENCY
+        self,
+        amounts_by_source: Dict[str, float],
+        currency: str = DEFAULT_PRICE_CURRENCY,
     ):
         for label, lbl in self.price_labels.items():
             lbl.setText(
@@ -5798,7 +5830,9 @@ class ReferencePriceGrid(QWidget):
         display_mode: str = DEFAULT_PRICE_DISPLAY_MODE,
     ):
         self._source_labels = list(source_labels)
-        self._currency = currency if currency in PRICE_CURRENCIES else DEFAULT_PRICE_CURRENCY
+        self._currency = (
+            currency if currency in PRICE_CURRENCIES else DEFAULT_PRICE_CURRENCY
+        )
         self._display_mode = (
             display_mode
             if display_mode in (PRICE_DISPLAY_UNIT, PRICE_DISPLAY_HOLDINGS)
@@ -5846,7 +5880,9 @@ class ReferencePriceGrid(QWidget):
         display_mode: str | None = None,
     ):
         if currency:
-            self._currency = currency if currency in PRICE_CURRENCIES else self._currency
+            self._currency = (
+                currency if currency in PRICE_CURRENCIES else self._currency
+            )
         if display_mode:
             self._display_mode = (
                 display_mode
@@ -5863,7 +5899,15 @@ class ReferencePriceGrid(QWidget):
             self._display_mode,
             tuple(
                 sorted(
-                    (site, tuple(sorted((srv, tuple(sorted(vals.items()))) for srv, vals in smap.items())))
+                    (
+                        site,
+                        tuple(
+                            sorted(
+                                (srv, tuple(sorted(vals.items())))
+                                for srv, vals in smap.items()
+                            )
+                        ),
+                    )
                     for site, smap in (self._sources or {}).items()
                 )
             ),
@@ -6291,8 +6335,7 @@ class RevenueKindDialog(QDialog):
         """Remet à 0 les kamas pour chaque serveur (type TS ou M courant)."""
         try:
             if not any(
-                row._current_kamas() != 0
-                for row in self._rows_by_server.values()
+                row._current_kamas() != 0 for row in self._rows_by_server.values()
             ):
                 return
         except Exception:
@@ -6493,9 +6536,7 @@ class RevenueDialog(QDialog):
         except Exception:
             saved_cur = DEFAULT_PRICE_CURRENCY
         cur_idx = (
-            PRICE_CURRENCIES.index(saved_cur)
-            if saved_cur in PRICE_CURRENCIES
-            else 0
+            PRICE_CURRENCIES.index(saved_cur) if saved_cur in PRICE_CURRENCIES else 0
         )
         self.cmb_currency.blockSignals(True)
         self.cmb_currency.setCurrentIndex(cur_idx)
@@ -7272,7 +7313,9 @@ class HeartbeatHistoryDialog(QDialog):
         self.btn_close = QPushButton("Fermer")
         for b in (self.btn_refresh, self.btn_clear, self.btn_close):
             b.setCursor(Qt.PointingHandCursor)
-        self.btn_clear.setToolTip("Efface définitivement l'historique en mémoire (irréversible).")
+        self.btn_clear.setToolTip(
+            "Efface définitivement l'historique en mémoire (irréversible)."
+        )
         self.btn_refresh.clicked.connect(self.refresh)
         self.btn_clear.clicked.connect(self.clear_history)
         self.btn_close.clicked.connect(self.close)
@@ -7402,9 +7445,7 @@ class HeartbeatHistoryDialog(QDialog):
                 chk.setCursor(Qt.PointingHandCursor)
                 chk.stateChanged.connect(self._on_sub_filter_changed)
                 self._sub_filter_boxes[sub] = chk
-                self._filter_layout.insertWidget(
-                    self._filter_layout.count() - 1, chk
-                )
+                self._filter_layout.insertWidget(self._filter_layout.count() - 1, chk)
             self.chk_filter_all.setEnabled(bool(subs))
             if not subs:
                 self.chk_filter_all.setChecked(True)
@@ -7419,7 +7460,9 @@ class HeartbeatHistoryDialog(QDialog):
         }
         return frozenset(selected) if selected else frozenset()
 
-    def _line_visible(self, line: HeartbeatSubLine, allowed: Optional[frozenset]) -> bool:
+    def _line_visible(
+        self, line: HeartbeatSubLine, allowed: Optional[frozenset]
+    ) -> bool:
         if line.is_reset:
             return True
         if allowed is None:
@@ -7566,7 +7609,9 @@ class HeartbeatHistoryDialog(QDialog):
 
         if not display_lines:
             self.lbl_range.setText("Aucune ligne en mémoire")
-            placeholder = "Aucun heartbeat enregistré — cliquez sur Actualiser après réception."
+            placeholder = (
+                "Aucun heartbeat enregistré — cliquez sur Actualiser après réception."
+            )
             for lst in (self.list_launch, self.list_session):
                 ph = QListWidgetItem(placeholder)
                 ph.setFlags(Qt.NoItemFlags)
@@ -7615,6 +7660,7 @@ class InstanceItemWidget(QWidget):
     requestFocus = Signal(str)
     requestRelaunch = Signal(str)
     requestKill = Signal(str)
+    requestReset = Signal(str)
     requestDelete = Signal(str)
     requestHistory = Signal(str)
 
@@ -7674,7 +7720,7 @@ class InstanceItemWidget(QWidget):
             b.setFixedSize(32, 32)
 
         self.btn_focus.setToolTip("Mettre au premier plan")
-        self.btn_reload.setToolTip("Relancer l'instance")
+        self.btn_reload.setToolTip("Lancer l'instance")
         self.btn_kill.setToolTip("Terminer le processus")
         self.btn_del.setToolTip("Supprimer le widget")
 
@@ -7781,13 +7827,17 @@ class InstanceItemWidget(QWidget):
         act_focus = QAction(_icon_or_empty("focus"), "Mettre au premier plan", menu)
         act_focus.triggered.connect(lambda: self.requestFocus.emit(self.title_id))
 
-        act_reload = QAction(_icon_or_empty("play"), "Relancer l'instance", menu)
+        act_reload = QAction(_icon_or_empty("play"), "Lancer l'instance", menu)
         act_reload.setEnabled(self.btn_reload.isEnabled())
         act_reload.setToolTip(self.btn_reload.toolTip() or "")
         act_reload.triggered.connect(lambda: self.requestRelaunch.emit(self.title_id))
 
         act_kill = QAction(_icon_or_empty("stop"), "Terminer le processus", menu)
         act_kill.triggered.connect(lambda: self.requestKill.emit(self.title_id))
+
+        act_reset = QAction(get_reset_action_icon(16), "Reset", menu)
+        act_reset.setToolTip("Terminer puis lancer l'instance")
+        act_reset.triggered.connect(lambda: self.requestReset.emit(self.title_id))
 
         act_del = QAction(_icon_or_empty("trash"), "Supprimer le widget", menu)
         act_del.triggered.connect(lambda: self.requestDelete.emit(self.title_id))
@@ -7798,6 +7848,7 @@ class InstanceItemWidget(QWidget):
         menu.addAction(act_focus)
         menu.addAction(act_reload)
         menu.addAction(act_kill)
+        menu.addAction(act_reset)
         menu.addAction(act_del)
         menu.addSeparator()
         menu.addAction(act_history)
@@ -8514,8 +8565,12 @@ class SnowMasterGUI(QWidget):
         self._last_auto_relaunch_attempt: Dict[str, float] = {}  # title -> ts
         self._last_auto_reddot_relaunch_attempt: Dict[str, float] = {}  # title -> ts
         self._reddot_since: Dict[str, float] = {}  # title -> ts début reddot
-        self._reddot_log_cache: Dict[str, float] = {}  # title -> ts dernier reset reddot (miroir reddot.log)
-        self._reddot_block_until: Dict[str, float] = {}  # title -> ts fin cooldown 30 min
+        self._reddot_log_cache: Dict[str, float] = (
+            {}
+        )  # title -> ts dernier reset reddot (miroir reddot.log)
+        self._reddot_block_until: Dict[str, float] = (
+            {}
+        )  # title -> ts fin cooldown 30 min
         self._reddot_blocked_logged: set = set()  # évite de spammer les logs scan
         self._pending_resets: List[str] = []  # Queue de titres à reset
         self._hb_history_dialogs: Dict[str, HeartbeatHistoryDialog] = {}
@@ -8561,7 +8616,7 @@ class SnowMasterGUI(QWidget):
 
         self.btn_new = QPushButton("＋ Nouvelle instance")
         self.btn_launch_empty = QPushButton("＋ Vide")
-        self.btn_all_reload = QPushButton("Relancer tout")
+        self.btn_all_reload = QPushButton("Lancer tout")
         self.btn_all_kill = QPushButton("Terminer tout")
         self.btn_all_del = QPushButton("Supprimer tout")
         for b in (
@@ -8593,8 +8648,6 @@ class SnowMasterGUI(QWidget):
         if not trash_icon_bulk.isNull():
             self.btn_all_del.setIcon(trash_icon_bulk)
             self.btn_all_del.setIconSize(QSize(18, 18))
-
-
 
         self.btn_new.clicked.connect(self.on_new_instance)
         self.btn_all_reload.clicked.connect(self.on_bulk_reload)
@@ -8842,7 +8895,7 @@ class SnowMasterGUI(QWidget):
             self, min_value=0, max_value=600, initial_value=default_delay, suffix=""
         )
         self.spin_launch_delay.setToolTip(
-            "Délai entre deux relances lors de 'Relancer tout' (en secondes). Utilisez la molette de la souris pour modifier."
+            "Délai entre deux relances lors de 'Lancer tout' (en secondes). Utilisez la molette de la souris pour modifier."
         )
         self.spin_launch_delay.valueChanged.connect(self.on_change_launch_delay)
 
@@ -8887,7 +8940,6 @@ class SnowMasterGUI(QWidget):
             "1 = écran tout à gauche, 2 = celui à sa droite, etc."
         )
         self.spin_screen_to_use.valueChanged.connect(self.on_change_screen_to_use)
-
 
         # ComboBox : Mode pour le chargement d'une config (load_only / load_and_launch)
         self.chk_instance_launch = QCheckBox("Load and launch")
@@ -8978,7 +9030,6 @@ class SnowMasterGUI(QWidget):
         #     self.on_toggle_overwrite_instances
         # )
         # inst_group_collapsible.addWidget(self.chk_overwrite_instances)
-
 
         # nouveaux champs pour instances (label + stepper sur une seule ligne)
         def _add_spin_row(label_text: str, spin: CustomSpinBox):
@@ -9117,8 +9168,6 @@ class SnowMasterGUI(QWidget):
         self.btn_panic.setStyleSheet(self._panic_style_normal)
         self.btn_panic.clicked.connect(self.on_panic_selected_instances)
         cfg_v.addWidget(self.btn_panic)
-
-
 
         # ----- Données & remplissage -----
         # On utilise le store global _revenue_data (protégé par _revenue_lock)
@@ -9468,7 +9517,6 @@ class SnowMasterGUI(QWidget):
         except Exception as e:
             app_log_error(f"Erreur lors du démarrage du bot Discord: {e}")
 
-
         # Appliquer l'épingle au premier plan si demandé (avant le premier show)
         if self.chk_always_on_top.isChecked():
             try:
@@ -9583,7 +9631,6 @@ class SnowMasterGUI(QWidget):
 
         _prefs.setdefault("instances", {})["order"] = []
         save_prefs(_prefs)
-
 
     def _card_width(self) -> int:
         return (
@@ -10047,7 +10094,6 @@ class SnowMasterGUI(QWidget):
         self._cached_reddot_count = reddot
         self._sync_actives_tab_highlight(active > 0)
 
-
         active_label = "instance" if active == 1 else "instances"
         txt = f"{active} {active_label}"
 
@@ -10392,6 +10438,7 @@ class SnowMasterGUI(QWidget):
             card.requestFocus.connect(self.on_card_focus)
             card.requestRelaunch.connect(self.on_card_relaunch)
             card.requestKill.connect(self.on_card_kill)
+            card.requestReset.connect(self.on_bus_reset_instance)
             card.requestDelete.connect(self.on_card_delete)
             card.requestHistory.connect(self.on_card_show_history)
 
@@ -10990,9 +11037,7 @@ class SnowMasterGUI(QWidget):
             controller = controller_path
 
         if not controller:
-            write_app_log(
-                f"[RELAUNCH_FORCE] '{title}': ABORT — controller introuvable"
-            )
+            write_app_log(f"[RELAUNCH_FORCE] '{title}': ABORT — controller introuvable")
             return
 
         # Killer les processus dupliqués si nécessaire
@@ -11013,9 +11058,7 @@ class SnowMasterGUI(QWidget):
         if not exe:
             exe = (EXE or "").strip() or None
 
-        write_app_log(
-            f"[RELAUNCH_FORCE] '{title}': exe={exe} controller={controller}"
-        )
+        write_app_log(f"[RELAUNCH_FORCE] '{title}': exe={exe} controller={controller}")
 
         # PAS de check _is_instance_running - on force la relance
         # print(f"[DEBUG on_card_relaunch_force] {title}: Marquage awaiting_first_hb=True, stopped=False")
@@ -11294,8 +11337,8 @@ class SnowMasterGUI(QWidget):
         if not titles:
             return
         if not self._ask(
-            "Relancer toutes les instances",
-            f"Voulez-vous relancer {len(titles)} instance(s) ?",
+            "Lancer toutes les instances",
+            f"Voulez-vous Lancer {len(titles)} instance(s) ?",
         ):
             return
 
@@ -12234,7 +12277,9 @@ class SnowMasterGUI(QWidget):
                 if scan_ok:
                     set_ankabot_process_cache(processes_by_title)
             else:
-                scan_log("[SCAN_PIDS] Scan léger : pas d'énumération globale des processus")
+                scan_log(
+                    "[SCAN_PIDS] Scan léger : pas d'énumération globale des processus"
+                )
 
             # Afficher les doublons détectés
             duplicates_found = {
@@ -12334,9 +12379,7 @@ class SnowMasterGUI(QWidget):
                         )
                         continue
 
-                    title_procs = (
-                        processes_by_title.get(title, []) if do_full else []
-                    )
+                    title_procs = processes_by_title.get(title, []) if do_full else []
                     if do_full and len(title_procs) > 1:
                         scan_log(
                             f"[SCAN_PIDS] '{title}': ⚠️ DOUBLONS détectés ({len(title_procs)} processus)"
@@ -12642,7 +12685,9 @@ class SnowMasterGUI(QWidget):
                     terminate_process_tree(p, timeout=3.0)
                     killed.add(p)
                 except Exception as e:
-                    app_log_warn(f"[RESET] Terminate title-PID {p} failed for {title}: {e}")
+                    app_log_warn(
+                        f"[RESET] Terminate title-PID {p} failed for {title}: {e}"
+                    )
         except Exception as e:
             app_log_warn(f"[RESET] find_processes_by_title failed for {title}: {e}")
 
@@ -12818,12 +12863,9 @@ class SnowMasterGUI(QWidget):
             if title not in self._pending_resets:
                 self._pending_resets.append(title)
             else:
-                write_app_log(
-                    f"[RESET] '{title}': déjà en file — pas de doublon"
-                )
+                write_app_log(f"[RESET] '{title}': déjà en file — pas de doublon")
         # Déclencher un traitement immédiat dans un thread background
         self._run_async(self._process_pending_resets)
-
 
     @staticmethod
     def _format_exe_dir_label(exe_path: Optional[str]) -> str:
@@ -12959,7 +13001,6 @@ class SnowMasterGUI(QWidget):
             self._save_splitter_sizes()
         except Exception:
             pass
-
 
         try:
             flush_save_prefs()
@@ -14373,9 +14414,7 @@ def wait_for_windows_with_early_register(
     while True:
         now = time.time()
         if now - start_ts > total_timeout:
-            flow_log(
-                f"Timeout {int(total_timeout)}s — arrêt du processus de lancement"
-            )
+            flow_log(f"Timeout {int(total_timeout)}s — arrêt du processus de lancement")
             try:
                 terminate_process_tree(int(p.pid), timeout=3.0)
             except Exception:
@@ -15488,9 +15527,15 @@ def restore_running_instances_from_cmdline():
                             inst.hwnd = int(info.get("hwnd"))
                         except:
                             pass
-                    if controller and not (getattr(inst, "controller_path", None) or "").strip():
+                    if (
+                        controller
+                        and not (getattr(inst, "controller_path", None) or "").strip()
+                    ):
                         inst.controller_path = controller
-                    if info.get("exe") and not (getattr(inst, "exe_path", None) or "").strip():
+                    if (
+                        info.get("exe")
+                        and not (getattr(inst, "exe_path", None) or "").strip()
+                    ):
                         inst.exe_path = info.get("exe")
                     try:
                         apply_disk_record_to_instance(
