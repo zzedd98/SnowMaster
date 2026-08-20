@@ -371,8 +371,8 @@ API_HOST = "127.0.0.1"
 API_PORT = 8787
 HEARTBEAT_RED_S = 480  # Délai par défaut avant qu'un voyant passe au rouge (8 minutes)
 
-# Contrôleur utilisé par le bouton PANIC (chemin vers le script contrôleur global)
-PANIC_CONTROLLER_PATH = ""
+# Fichier panic.txt (toggle Panic TS) — chemin dans settings.json → "panic_file"
+PANIC_FILE_PATH = ""
 MAX_LOGS_PER_INSTANCE = 1000
 MAX_HEARTBEAT_HISTORY = 1000  # buffer RAM par widget (deque)
 HEARTBEAT_HISTORY_DEDUP_S = 8  # ignore HB identiques rapprochés
@@ -497,8 +497,8 @@ DEFAULT_PREFS = {
     "reddot": 480,  # Heartbeat timeout par défaut : 8 minutes
     # Écran pour "mettre au premier plan" : 1 = tout à gauche, 2 = suivant à droite, etc.
     "screen_to_use": 1,
-    # Contrôleur global utilisé par le bouton PANIC (chemin complet du script)
-    "panic_controller": "",
+    # Fichier panic.txt pour le bouton Panic TS (chemin complet)
+    "panic_file": "",
     # Icônes UI : noms de fichiers sous SnowMaster/images/ (ex: "play.png") ou chemin absolu
     "icons": {
         "play": "play.png",
@@ -3564,6 +3564,32 @@ bus = EventBus()
 
 # Prefs (global)
 _prefs = load_prefs()
+
+
+def get_panic_file_path() -> str:
+    """Chemin du fichier panic.txt (settings.json → panic_file)."""
+    p = (PANIC_FILE_PATH or "").strip()
+    if p:
+        return p
+    try:
+        return str((_prefs or {}).get("panic_file") or "").strip()
+    except Exception:
+        return ""
+
+
+def is_panic_file_active() -> bool:
+    """True si panic.txt existe et contient du texte (panic activée)."""
+    path = get_panic_file_path()
+    if not path:
+        return False
+    try:
+        if not os.path.isfile(path):
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            return bool(f.read().strip())
+    except Exception:
+        return False
+
 
 # Icônes globales : chemins résolus à partir des prefs (fichiers sous SnowMaster/images/ ou chemins absolus).
 # On ne crée PAS de QIcon ici pour éviter l'erreur "QPixmap: Must construct a QGuiApplication before a QPixmap".
@@ -9134,15 +9160,27 @@ class SnowMasterGUI(QWidget):
         # Stretch pour pousser les éléments fixes en bas
         cfg_v.addStretch(1)
 
-        # Zone fixe en bas : bouton PANIC TS → bouton instance vide → compteur instances → bouton argent
-        # --- Bouton PANIC TS : lance le script contrôleur sur le 1er contrôleur des instances sélectionnées ---
-        self.btn_panic = QPushButton("PANIC TS")
+        # Zone fixe en bas : bouton Panic TS (toggle fichier panic.txt)
+        self.btn_panic = QPushButton("Activer Panic TS")
         self.btn_panic.setCursor(Qt.PointingHandCursor)
-        self.btn_panic.setToolTip(
-            "Lance immédiatement le script contrôleur sur le premier contrôleur des instances sélectionnées."
-        )
-        # Styles PANIC (normal / cooldown) + état interne de cooldown
-        self._panic_style_normal = """
+        self._panic_style_off = """
+            QPushButton {
+                background-color: #15803d;
+                color: #f0fdf4;
+                border-radius: 10px;
+                border: 1px solid #166534;
+                padding: 6px 10px;
+                font-weight: 700;
+            }
+            QPushButton:hover {
+                background-color: #16a34a;
+                border-color: #15803d;
+            }
+            QPushButton:pressed {
+                background-color: #166534;
+            }
+        """
+        self._panic_style_on = """
             QPushButton {
                 background-color: #b91c1c;
                 color: #f9fafb;
@@ -9159,19 +9197,8 @@ class SnowMasterGUI(QWidget):
                 background-color: #7f1d1d;
             }
         """
-        self._panic_style_cooldown = """
-            QPushButton {
-                background-color: #4b5563;
-                color: #e5e7eb;
-                border-radius: 10px;
-                border: 1px solid #374151;
-                padding: 6px 10px;
-                font-weight: 700;
-            }
-        """
-        self._panic_cooldown_active = False
-        self.btn_panic.setStyleSheet(self._panic_style_normal)
-        self.btn_panic.clicked.connect(self.on_panic_selected_instances)
+        self.btn_panic.clicked.connect(self.on_panic_toggle)
+        self._refresh_panic_button()
         cfg_v.addWidget(self.btn_panic)
 
         # ----- Données & remplissage -----
@@ -10524,6 +10551,10 @@ class SnowMasterGUI(QWidget):
     def refresh_cards_and_details(self):
         try:
             self._sync_refresh_timer_interval()
+            try:
+                self._refresh_panic_button()
+            except Exception:
+                pass
             titles = []
             for i in range(self.list.count()):
                 it = self.list.item(i)
@@ -11483,71 +11514,54 @@ class SnowMasterGUI(QWidget):
         # (optionnel) forcer un refresh UI cohérent
         self.refresh_list_full()
 
-    def on_panic_selected_instances(self):
-        """
-        Lance un flux 'PANIC TS' sur les instances actuellement sélectionnées :
-        - utilise le PID/HWND existant de chaque instance
-        - utilise le contrôleur global défini dans Settings.json (clé 'panic_controller')
-        - sélectionne le 1er contrôleur dans la fenêtre et charge/lance ce script
-        """
-        # Si un cooldown est actif ou si aucun contrôleur PANIC global n'est configuré, on ne fait rien
-        if self._panic_cooldown_active or not PANIC_CONTROLLER_PATH:
-            return
-
-        with _state_lock:
-            titles = self.selected_titles()
-            # Si aucune sélection, PANIC TS s'applique uniquement aux instances
-            # dont le titre est de la forme "Serveur Numéro" (ex: "Imagiro 1")
-            if not titles:
-                import re
-
-                pattern = re.compile(r"^[^\d]+?\s+\d+$")
-                titles = [
-                    t
-                    for t in _instances.keys()
-                    if isinstance(t, str) and pattern.match(t)
-                ]
-        if not titles:
-            return
-
-        # Démarrer le cooldown visuel + désactivation pendant 30 secondes
-        self._start_panic_cooldown()
-
-        for title in titles:
-            with _state_lock:
-                inst = _instances.get(title)
-            if not inst or not inst.pid:
-                continue
-
-            t = threading.Thread(
-                target=run_snowbot_flow_panic,
-                args=(title,),
-                daemon=True,
+    def on_panic_toggle(self):
+        """Active / désactive Panic TS en écrivant ou vidant panic.txt."""
+        path = get_panic_file_path()
+        if not path:
+            QMessageBox.warning(
+                self,
+                "Panic TS",
+                "Chemin du fichier panic non configuré.\n"
+                "Renseignez \"panic_file\" dans settings.json.",
             )
-            t.start()
-
-    def _start_panic_cooldown(self):
-        """Désactive le bouton PANIC TS pendant 30s avec un indicateur visuel."""
+            return
         try:
-            self._panic_cooldown_active = True
-            self.btn_panic.setEnabled(False)
-            self.btn_panic.setText("PANIC TS (en cours...)")
-            self.btn_panic.setStyleSheet(self._panic_style_cooldown)
-        except Exception:
-            pass
+            parent = os.path.dirname(os.path.abspath(path))
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            if is_panic_file_active():
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("")
+            else:
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(stamp + "\n")
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Panic TS", f"Impossible de modifier le fichier panic :\n{e}"
+            )
+            return
+        self._refresh_panic_button()
 
-        # Réactiver au bout de 30 secondes
-        QTimer.singleShot(30000, self._end_panic_cooldown)
-
-    def _end_panic_cooldown(self):
-        """Réactive le bouton PANIC TS et restaure son apparence."""
-        try:
-            self._panic_cooldown_active = False
-            self.btn_panic.setEnabled(True)
-            self.btn_panic.setText("PANIC TS")
-            self.btn_panic.setStyleSheet(self._panic_style_normal)
-        except Exception:
-            pass
+    def _refresh_panic_button(self):
+        """Met à jour le libellé / couleur du bouton selon le contenu de panic.txt."""
+        btn = getattr(self, "btn_panic", None)
+        if btn is None:
+            return
+        path = get_panic_file_path()
+        active = is_panic_file_active()
+        if active:
+            btn.setText("Désactiver Panic")
+            btn.setStyleSheet(self._panic_style_on)
+            btn.setToolTip(
+                f"Panic active — cliquer pour vider :\n{path or '(chemin non défini)'}"
+            )
+        else:
+            btn.setText("Activer Panic TS")
+            btn.setStyleSheet(self._panic_style_off)
+            btn.setToolTip(
+                f"Panic inactive — cliquer pour écrire date/heure dans :\n{path or '(chemin non défini)'}"
+            )
 
     def kill_and_clear_all(self):
         with _state_lock:
@@ -15017,14 +15031,8 @@ def run_snowbot_flow(
 
 
 def run_snowbot_flow_panic(title: str):
-    """
-    Variante PANIC basée sur une instance DÉJÀ lancée :
-    - on part du PID/HWND existant de l'instance
-    - PAS de nouveau lancement, PAS de /register ou autre POST JSON
-    - utilise le contrôleur global configuré dans les préférences (panic_controller)
-    - sélection directe du 1er contrôleur
-    - chargement puis lancement du script contrôleur PANIC
-    """
+    """Ancien flux PANIC sur instances — désactivé (remplacé par toggle panic.txt)."""
+    return
 
     # Contrôleur PANIC global : si non défini ou inexistant, on stoppe
     global PANIC_CONTROLLER_PATH
@@ -15777,7 +15785,7 @@ def ensure_admin_or_exit():
 
 # ======================== startup helpers ============================
 def load_paths():
-    global RESOURCES, EXE, HEARTBEAT_RED_S, PANIC_CONTROLLER_PATH
+    global RESOURCES, EXE, HEARTBEAT_RED_S, PANIC_FILE_PATH
     try:
         if os.path.exists(PREFS_FILE):
             with open(PREFS_FILE, "r", encoding="utf-8") as f:
@@ -15794,7 +15802,7 @@ def load_paths():
                 "Nvidia.exe",
             )
             HEARTBEAT_RED_S = prefs.get("reddot", HEARTBEAT_RED_S)
-            PANIC_CONTROLLER_PATH = (prefs.get("panic_controller") or "").strip()
+            PANIC_FILE_PATH = (prefs.get("panic_file") or "").strip()
     except Exception as e:
         print("WARN load_paths:", e)
 
