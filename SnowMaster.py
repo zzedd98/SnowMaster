@@ -8649,7 +8649,6 @@ class SnowMasterGUI(QWidget):
         self._bulk_launch_done = 0
         self._bulk_launch_total = 0
         self._bulk_launch_gen = 0
-        self._bulk_launch_btn_ss = ""
         for b in (
             self.btn_new,
             self.btn_launch_empty,
@@ -11421,8 +11420,6 @@ class SnowMasterGUI(QWidget):
         btn.setToolTip(
             f"Lancement en cours : {done}/{total}\nCliquer pour annuler"
         )
-        if not getattr(self, "_bulk_launch_btn_ss", None):
-            self._bulk_launch_btn_ss = btn.styleSheet() or ""
         btn.setStyleSheet(
             """
             QPushButton {
@@ -11441,7 +11438,7 @@ class SnowMasterGUI(QWidget):
         )
 
     def _restore_bulk_launch_button(self):
-        """Remet le bouton 'Lancer tout' à l'état normal."""
+        """Remet le bouton 'Lancer tout' à l'état normal (style app / bleu)."""
         btn = getattr(self, "btn_all_reload", None)
         if btn is None:
             return
@@ -11451,10 +11448,15 @@ class SnowMasterGUI(QWidget):
         btn.setEnabled(True)
         btn.setText("Lancer tout")
         btn.setToolTip("")
+        # Important : vider le QSS local pour retrouver le style global (bleu),
+        # ne pas réappliquer un stylesheet capturé pendant l'état grisé.
+        btn.setStyleSheet("")
         try:
-            btn.setStyleSheet(getattr(self, "_bulk_launch_btn_ss", "") or "")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+            btn.update()
         except Exception:
-            btn.setStyleSheet("")
+            pass
 
     def _bulk_launch_one(self, title: str, gen: int = 0):
         """Lance une instance du batch 'Lancer tout' et met à jour la progression."""
