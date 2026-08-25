@@ -34,3 +34,9 @@
 [2026-08-25 14:08:35.613] ERROR SnowMaster: Bouton chargé: title='Lancer vidage', id='282d61d4-0fd3-4f45-a1c6-3a6ea4c0cab6'
 [2026-08-25 14:08:41.230] [RELAUNCH] 'test': exe=c:\Users\User\Desktop\SnowBot2026\AnkaBotPC\AnkaBot.exe controller=C:/Users/User/Desktop/SnowBot2026/AnkabotScripts/TSD3/ztest.lua
 [2026-08-25 14:08:41.269] [? - test] Erreur lancement: [WinError 740] L’opération demandée nécessite une élévation
+[2026-08-25 15:00:58.855] === Démarrage application ===
+[2026-08-25 15:01:07.279] ERROR SnowMaster: Chargement de 2 bouton(s) depuis les préférences
+[2026-08-25 15:01:07.279] ERROR SnowMaster: Bouton chargé: title='close vidage go hdv', id='72b828a9-09a9-4c88-9b12-587376aac8db'
+[2026-08-25 15:01:07.279] ERROR SnowMaster: Bouton chargé: title='Lancer vidage', id='282d61d4-0fd3-4f45-a1c6-3a6ea4c0cab6'
+[2026-08-25 15:01:22.116] [RELAUNCH] 'test': exe=c:\Users\User\Desktop\SnowBot2026\AnkaBotPC\AnkaBot.exe controller=C:/Users/User/Desktop/SnowBot2026/AnkabotScripts/TSD3/ztest.lua
+[2026-08-25 15:01:22.162] [? - test] Erreur lancement: [WinError 740] L’opération demandée nécessite une élévation
