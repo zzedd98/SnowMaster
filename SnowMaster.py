@@ -393,7 +393,7 @@ CLR_GREY = "#6b7280"
 CLR_PURPLE = "#8b5cf6"  # violet pour instances restaurées récemment
 
 CLR_BLUE = "#3b82f6"  #  bleu pour les instances "vides" lancées manuellement ---
-CLR_TURQUOISE = "#14b8a6"  # file d'attente "Lancer tout"
+CLR_TURQUOISE = "#a16207"  # file d'attente "Lancer tout" (jaune foncé)
 
 # ===== PRICES SCRAPING SCOPE =====
 ALLOWED_SERVERS_DISPLAY = [
@@ -5332,12 +5332,12 @@ def apply_dark_blue_style(app: QApplication):
         }
 
         QWidget#InstanceCard[state="turquoise"] {
-            border: 2px solid rgba(45,212,191,0.88);         /* turquoise file d'attente */
-            background-color: rgba(15,118,110,0.16);
+            border: 2px solid rgba(161,98,7,0.92);          /* jaune foncé file d'attente */
+            background-color: rgba(113,63,18,0.22);
         }
         QWidget#InstanceCard[state="turquoise"][selected="true"] {
-            border: 2px solid rgba(94,234,212,0.95);
-            background-color: rgba(20,184,166,0.22);
+            border: 2px solid rgba(180,120,20,0.95);
+            background-color: rgba(133,77,14,0.30);
         }
                       
         /* Carte statique (pas d'effet hover), pour la liste de gauche */
@@ -8038,8 +8038,8 @@ class InstanceItemWidget(QWidget):
                         base_color = QColor(196, 181, 253, 28)
                         peak_color = QColor(167, 139, 250, 150)
                     elif sev == "turquoise":
-                        base_color = QColor(45, 212, 191, 28)
-                        peak_color = QColor(20, 184, 166, 150)
+                        base_color = QColor(161, 98, 7, 28)
+                        peak_color = QColor(133, 77, 14, 150)
                     else:  # blue
                         base_color = QColor(96, 165, 250, 28)
                         peak_color = QColor(59, 130, 246, 150)
