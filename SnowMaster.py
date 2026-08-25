@@ -8659,6 +8659,7 @@ class SnowMasterGUI(QWidget):
         self.btn_launch_empty = QPushButton("＋ Vide")
         self.btn_all_reload = QPushButton("Lancer tout")
         self.btn_all_kill = QPushButton("Terminer tout")
+        self.btn_clean = QPushButton("🧹 Clean")
         self.btn_all_del = QPushButton("Supprimer tout")
         self._bulk_launch_active = False
         self._bulk_launch_done = 0
@@ -8670,6 +8671,7 @@ class SnowMasterGUI(QWidget):
             self.btn_launch_empty,
             self.btn_all_reload,
             self.btn_all_kill,
+            self.btn_clean,
             self.btn_all_del,
         ):
             b.setCursor(Qt.PointingHandCursor)
@@ -8698,6 +8700,10 @@ class SnowMasterGUI(QWidget):
         self.btn_new.clicked.connect(self.on_new_instance)
         self.btn_all_reload.clicked.connect(self.on_bulk_reload)
         self.btn_all_kill.clicked.connect(self.on_bulk_kill)
+        self.btn_clean.setToolTip(
+            "Force la fermeture de tous les processus Application_v2.0.exe"
+        )
+        self.btn_clean.clicked.connect(self.on_clean_application)
         self.btn_all_del.clicked.connect(self.on_bulk_delete)
 
         # Toggles panneaux (config centrale / droite)
@@ -8778,6 +8784,7 @@ class SnowMasterGUI(QWidget):
             self.btn_launch_empty,
             self.btn_all_reload,
             self.btn_all_kill,
+            self.btn_clean,
             self.btn_all_del,
         ):
             w.setMinimumWidth(0)
@@ -8796,6 +8803,7 @@ class SnowMasterGUI(QWidget):
         header.addWidget(self.btn_launch_empty, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_all_reload, 0, Qt.AlignVCenter)
         header.addWidget(self.btn_all_kill, 0, Qt.AlignVCenter)
+        header.addWidget(self.btn_clean, 0, Qt.AlignVCenter)
         # header.addWidget(self.btn_all_del, 0, Qt.AlignVCenter)
         header.addWidget(self.lbl_instances_big, 0, Qt.AlignVCenter)
         header.addWidget(self.panel_euros, 0, Qt.AlignVCenter)
@@ -9457,11 +9465,6 @@ class SnowMasterGUI(QWidget):
         # brancher le signal DnD
         self.list.orderChanged.connect(self.on_instances_reordered)
         self.list.itemSelectionChanged.connect(self.update_card_selection_styles)
-
-        # fetch initial (placeholder) en arrière-plan au démarrage
-        fetch_reference_prices_async(
-            on_done=lambda: QTimer.singleShot(0, self.update_revenue_counter)
-        )
 
         # self.refresh_list_full()
         self.update_card_selection_styles()
@@ -11560,6 +11563,33 @@ class SnowMasterGUI(QWidget):
         for t in titles:
             self.on_card_kill(t)
         self.update_global_dot()
+
+    def on_clean_application(self):
+        """Force la fermeture de tous les processus Application_v2.0.exe."""
+
+        def _worker():
+            try:
+                flags = 0
+                if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    flags = subprocess.CREATE_NO_WINDOW
+                result = subprocess.run(
+                    ["taskkill", "/F", "/IM", "Application_v2.0.exe", "/T"],
+                    capture_output=True,
+                    text=True,
+                    creationflags=flags,
+                )
+                msg = (result.stderr or result.stdout or "").strip()
+                if result.returncode == 0:
+                    print("[Clean] Application_v2.0.exe terminé(s).")
+                else:
+                    print(
+                        f"[Clean] taskkill (code {result.returncode}): "
+                        f"{msg or 'aucun processus trouvé'}"
+                    )
+            except Exception as e:
+                print(f"[Clean] Erreur: {e}")
+
+        self._run_async(_worker)
 
     def on_bulk_delete(self):
         with _state_lock:
@@ -16316,8 +16346,12 @@ def main():
         main_win._fade_anim = anim
         anim.start()
 
-        QTimer.singleShot(0, lambda: bus.revenue_updated.emit())
-        QTimer.singleShot(0, lambda: fetch_reference_prices_async())
+        def _start_initial_scrape():
+            fetch_reference_prices_async(
+                on_done=lambda: QTimer.singleShot(0, main_win.update_revenue_counter)
+            )
+
+        anim.finished.connect(_start_initial_scrape)
 
     # Démarrer la préparation après un court délai pour laisser la barre démarrer
     QTimer.singleShot(220, _prepare_and_show_main)
