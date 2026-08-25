@@ -4968,7 +4968,7 @@ def _scraped_to_display_maps(scraped: dict) -> tuple:
 # Ajouter une entrée ici pour intégrer un nouveau site dynamiquement.
 PRICE_SCRAPE_SOURCES: List[Tuple[str, object]] = [
     ("LesKamas", _scrape_leskamas_with_playwright),
-    ("VenteKamas", _scrape_ventekamas_with_playwright),
+    # ("VenteKamas", _scrape_ventekamas_with_playwright),  # désactivé — ralentit le scraping
 ]
 PRIMARY_PRICE_SOURCE = PRICE_SCRAPE_SOURCES[0][0]
 
