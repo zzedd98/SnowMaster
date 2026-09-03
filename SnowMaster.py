@@ -8836,9 +8836,17 @@ class SnowMasterGUI(QWidget):
         self.instances_filter_tabs.setCursor(Qt.PointingHandCursor)
         self.instances_filter_tabs.addTab("Tout")
         self.instances_filter_tabs.addTab("Actives")
+        self.instances_filter_tabs.addTab("Auto")
+        self.instances_filter_tabs.addTab("Mano")
         self.instances_filter_tabs.setTabToolTip(0, "Toutes les instances")
         self.instances_filter_tabs.setTabToolTip(
             1, "Instances actives (auto ou manuelles)"
+        )
+        self.instances_filter_tabs.setTabToolTip(
+            2, "Instances automatisées"
+        )
+        self.instances_filter_tabs.setTabToolTip(
+            3, "Instances manuelles (ouvertes à la main)"
         )
         self.instances_filter_tabs.setProperty("filterMode", "all")
         self.instances_filter_tabs.currentChanged.connect(
@@ -10245,12 +10253,13 @@ class SnowMasterGUI(QWidget):
         return None
 
     def _instances_filter_mode(self) -> str:
-        """Retourne 'all' | 'active' selon l'onglet actif."""
+        """Retourne 'all' | 'active' | 'auto' | 'manual' selon l'onglet actif."""
         try:
             idx = int(self.instances_filter_tabs.currentIndex())
         except Exception:
             return "all"
-        return ("all", "active")[idx] if 0 <= idx <= 1 else "all"
+        modes = ("all", "active", "auto", "manual")
+        return modes[idx] if 0 <= idx < len(modes) else "all"
 
     def _sync_instances_filter_tab_style(self):
         """Applique le style vert sélectionné seulement si Actives + ≥1 instance active."""
@@ -10285,12 +10294,12 @@ class SnowMasterGUI(QWidget):
         is_manual = bool(getattr(inst, "manual_empty", False))
         if mode == "manual":
             return is_manual
-        # auto : chemin de contrôleur déjà configuré
-        ctrl = getattr(inst, "controller_path", None)
-        return bool(ctrl) and not is_manual
+        if mode == "auto":
+            return not is_manual
+        return True
 
     def _apply_instances_filter(self):
-        """Affiche/masque les cartes selon l'onglet Tout / Actives."""
+        """Affiche/masque les cartes selon l'onglet Tout / Actives / Auto / Mano."""
         if not hasattr(self, "list") or self.list is None:
             return
         mode = self._instances_filter_mode()
