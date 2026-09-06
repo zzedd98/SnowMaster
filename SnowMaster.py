@@ -7234,6 +7234,121 @@ class CollapsibleGroupBox(QWidget):
         self._content_layout.addStretch(stretch)
 
 
+class OrphanCleanupResultDialog(QDialog):
+    """Résultats du Clean orphelins — liste scrollable + action Chrome > 3 min."""
+
+    stale_chrome_finished = Signal(object)
+
+    def __init__(self, parent, report: dict):
+        super().__init__(parent)
+        self.setWindowTitle("Clean — processus orphelins")
+        self.setMinimumSize(720, 520)
+        self.resize(780, 580)
+        self._report = report if isinstance(report, dict) else {}
+        self._chrome_busy = False
+        self.stale_chrome_finished.connect(self._on_stale_chrome_finished)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        stale = self._report.get("stale_chrome") or []
+        summary = QLabel(
+            f"Clients protégés : {self._report.get('protected_clients', 0)}    |    "
+            f"Application_v2 : {self._report.get('scanned_app_v2', 0)}    |    "
+            f"Chrome : {self._report.get('scanned_chrome', 0)}    |    "
+            f"Chrome > 3 min : {len(stale)}"
+        )
+        summary.setWordWrap(True)
+        summary.setStyleSheet("color:#93c5fd; font-weight:600;")
+        root.addWidget(summary)
+
+        body = QHBoxLayout()
+        body.setSpacing(10)
+
+        self.txt = QTextEdit()
+        self.txt.setReadOnly(True)
+        self.txt.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.txt.setPlainText(_format_orphan_cleanup_report(self._report))
+        self.txt.setStyleSheet(
+            "QTextEdit {"
+            " background-color:#0b1220; color:#e5e7eb;"
+            " border:1px solid rgba(148,163,184,0.28); border-radius:8px;"
+            " font-family: Consolas, 'Courier New', monospace; font-size:12px;"
+            " padding:8px;"
+            "}"
+        )
+        body.addWidget(self.txt, 1)
+
+        side = QVBoxLayout()
+        side.setSpacing(8)
+        self.btn_stale_chrome = QPushButton("Clean Chrome\n> 3 min")
+        self.btn_stale_chrome.setCursor(Qt.PointingHandCursor)
+        self.btn_stale_chrome.setMinimumWidth(130)
+        self.btn_stale_chrome.setToolTip(
+            "Termine les navigateurs Chrome liés aux instances,\n"
+            "ouverts depuis plus de 3 minutes (même sous une instance active).\n"
+            "Utile pour les auth abandonnées qui bloquent des ressources."
+        )
+        self.btn_stale_chrome.clicked.connect(self._on_clean_stale_chrome)
+        if not stale:
+            self.btn_stale_chrome.setEnabled(False)
+            self.btn_stale_chrome.setToolTip(
+                "Aucun Chrome > 3 min détecté sous les instances lors du scan."
+            )
+        side.addWidget(self.btn_stale_chrome, 0, Qt.AlignTop)
+        side.addStretch(1)
+        body.addLayout(side, 0)
+
+        root.addLayout(body, 1)
+
+        bottom = QHBoxLayout()
+        bottom.addStretch(1)
+        btn_close = QPushButton("Fermer")
+        btn_close.setCursor(Qt.PointingHandCursor)
+        btn_close.clicked.connect(self.accept)
+        bottom.addWidget(btn_close)
+        root.addLayout(bottom)
+
+    def _on_clean_stale_chrome(self):
+        if self._chrome_busy:
+            return
+        self._chrome_busy = True
+        self.btn_stale_chrome.setEnabled(False)
+        self.btn_stale_chrome.setText("Clean…")
+
+        def _worker():
+            report = None
+            err = None
+            try:
+                report = cleanup_stale_chrome_processes(min_age_s=STALE_CHROME_AGE_S)
+            except Exception as e:
+                err = str(e)
+            self.stale_chrome_finished.emit({"report": report, "error": err})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_stale_chrome_finished(self, payload):
+        self._chrome_busy = False
+        self.btn_stale_chrome.setText("Clean Chrome\n> 3 min")
+        payload = payload or {}
+        err = payload.get("error")
+        report = payload.get("report")
+        if err:
+            self.btn_stale_chrome.setEnabled(True)
+            QMessageBox.warning(self, "Clean Chrome > 3 min", f"Erreur :\n{err}")
+            return
+        if not isinstance(report, dict):
+            report = {}
+        self.txt.append(
+            "\n\n—— Clean Chrome > 3 min ——\n" + _format_stale_chrome_report(report)
+        )
+        remaining = report.get("remaining_stale") or []
+        self.btn_stale_chrome.setEnabled(bool(remaining))
+        if not remaining:
+            self.btn_stale_chrome.setToolTip("Plus aucun Chrome > 3 min détecté.")
+
+
 class HeartbeatHistoryDialog(QDialog):
     """Historique heartbeats d'une instance — refresh manuel, filtres via setHidden (pas de rebuild texte)."""
 
@@ -8703,7 +8818,7 @@ class SnowMasterGUI(QWidget):
         self.btn_all_kill.clicked.connect(self.on_bulk_kill)
         self.btn_clean.setToolTip(
             "Nettoyer les processus orphelins (Application_v2 / Chrome abandonnés).\n"
-            "Exécuté uniquement à la demande — ne touche pas aux instances actives."
+            "Exécuté uniquement à la demande."
         )
         self.btn_clean.clicked.connect(self.on_clean_orphans)
         self.btn_all_del.clicked.connect(self.on_bulk_delete)
@@ -11580,14 +11695,6 @@ class SnowMasterGUI(QWidget):
         """Nettoyage orphelins : uniquement à la demande (pas de tâche périodique)."""
         if getattr(self, "_orphan_cleanup_running", False):
             return
-        if not self._ask(
-            "Nettoyer les processus orphelins",
-            "Rechercher et terminer les Application_v2.0.exe (et Chrome associés)\n"
-            "sans propriétaire AnkaBot/SnowBot actif ?\n\n"
-            "Les instances encore actives et leurs processus ne seront pas touchés.\n"
-            "Les cas ambigus seront signalés sans suppression.",
-        ):
-            return
 
         self._orphan_cleanup_running = True
         try:
@@ -11602,16 +11709,14 @@ class SnowMasterGUI(QWidget):
             try:
                 report = cleanup_orphan_processes()
                 try:
-                    print("[Orphelins]\n" + _format_orphan_cleanup_report(report))
+                    print("[Clean]\n" + _format_orphan_cleanup_report(report))
                 except Exception:
                     pass
             except Exception as e:
                 err = str(e)
-                app_log_error(f"[Orphelins] Erreur: {e}")
+                app_log_error(f"[Clean] Erreur: {e}")
             finally:
-                bus.orphan_cleanup_finished.emit(
-                    {"report": report, "error": err}
-                )
+                bus.orphan_cleanup_finished.emit({"report": report, "error": err})
 
         self._run_async(_worker)
 
@@ -11619,7 +11724,7 @@ class SnowMasterGUI(QWidget):
         self._orphan_cleanup_running = False
         try:
             self.btn_clean.setEnabled(True)
-            self.btn_clean.setText("🧹 Orphelins")
+            self.btn_clean.setText("🧹 Clean")
         except Exception:
             pass
         payload = payload or {}
@@ -11628,22 +11733,14 @@ class SnowMasterGUI(QWidget):
         if err:
             QMessageBox.warning(
                 self,
-                "Nettoyer les processus orphelins",
+                "Clean — processus orphelins",
                 f"Erreur pendant le nettoyage :\n{err}",
             )
             return
         if not isinstance(report, dict):
-            QMessageBox.information(
-                self,
-                "Nettoyer les processus orphelins",
-                "Nettoyage terminé (aucun détail).",
-            )
-            return
-        QMessageBox.information(
-            self,
-            "Nettoyer les processus orphelins",
-            _format_orphan_cleanup_report(report),
-        )
+            report = {}
+        dlg = OrphanCleanupResultDialog(self, report)
+        dlg.exec()
 
     def on_bulk_delete(self):
         with _state_lock:
@@ -15651,6 +15748,7 @@ def terminate_process_tree(pid: int, timeout: float = 5.0):
 
 # ===================== NETTOYAGE ORPHELINS (bouton uniquement) ======================
 _ORPHAN_CT_TOL = 1.0  # tolérance create_time (PID recyclé)
+STALE_CHROME_AGE_S = 180.0  # Chrome liés aux instances ouverts > 3 min
 _APPLICATION_V2_NAMES = frozenset(
     {"application_v2.0.exe", "application_v2.exe"}
 )
@@ -15940,6 +16038,7 @@ def cleanup_orphan_processes() -> dict:
         "ignored": [],
         "ambiguous": [],
         "failed": [],
+        "stale_chrome": [],
         "protected_clients": 0,
         "scanned_app_v2": 0,
         "scanned_chrome": 0,
@@ -16127,11 +16226,181 @@ def cleanup_orphan_processes() -> dict:
             }
         )
 
+    # Chrome > 3 min encore sous instances actives (candidats pour le bouton dédié)
+    report["stale_chrome"] = _orphan_find_stale_chrome(
+        chrome_list, by_pid, protected_pids, client_names, STALE_CHROME_AGE_S
+    )
+
+    return report
+
+
+def _orphan_chrome_age_s(info: dict, now: Optional[float] = None) -> float:
+    now = time.time() if now is None else now
+    ct = float(info.get("create_time") or 0)
+    if ct <= 0:
+        return 0.0
+    return max(0.0, now - ct)
+
+
+def _orphan_find_stale_chrome(
+    chrome_list: List[dict],
+    by_pid: Dict[int, dict],
+    protected_pids: set,
+    client_names: set,
+    min_age_s: float,
+) -> List[dict]:
+    """
+    Navigateurs Chrome (racine = parent non-chrome) liés aux instances,
+    ouverts depuis plus de min_age_s — même sous un client encore actif.
+    """
+    now = time.time()
+    stale: List[dict] = []
+    for ch in chrome_list:
+        pid = int(ch.get("pid") or 0)
+        if not pid:
+            continue
+        # Doit appartenir à un arbre client / App_v2 protégé, ou avoir un owner client
+        under_protected = pid in protected_pids
+        owner = _orphan_walk_owner_client(ch, by_pid, client_names)
+        owner_alive = bool(
+            owner and _orphan_same_identity(owner["pid"], owner.get("create_time") or 0)
+        )
+        parent = by_pid.get(int(ch.get("ppid") or 0))
+        if parent is None and ch.get("ppid"):
+            try:
+                parent = _orphan_proc_info(psutil.Process(int(ch["ppid"])))
+                if parent:
+                    by_pid[parent["pid"]] = parent
+            except Exception:
+                parent = None
+        parent_is_app_v2 = bool(parent and _orphan_is_app_v2(parent))
+        parent_is_client = bool(parent and _orphan_is_client(parent, client_names))
+        parent_is_chrome = bool(parent and _orphan_is_chrome(parent))
+
+        # Uniquement les racines de navigateur (pas chaque renderer)
+        if parent_is_chrome:
+            continue
+        if not (under_protected or owner_alive or parent_is_app_v2 or parent_is_client):
+            continue
+
+        age = _orphan_chrome_age_s(ch, now)
+        if age < float(min_age_s):
+            continue
+        item = dict(ch)
+        item["age_s"] = age
+        item["reason"] = f"Chrome ouvert depuis {int(age)}s (≥ {int(min_age_s)}s)"
+        stale.append(item)
+    stale.sort(key=lambda x: float(x.get("age_s") or 0), reverse=True)
+    return stale
+
+
+def cleanup_stale_chrome_processes(min_age_s: float = STALE_CHROME_AGE_S) -> dict:
+    """
+    À la demande uniquement : termine les Chrome liés aux instances
+    ouverts depuis plus de min_age_s, même si l'instance est encore vivante.
+    Ne touche ni AnkaBot/SnowBot ni Application_v2.
+    """
+    report = {
+        "killed": [],
+        "failed": [],
+        "ignored": [],
+        "candidates": [],
+        "remaining_stale": [],
+    }
+    client_names = _orphan_client_basenames()
+    by_pid: Dict[int, dict] = {}
+
+    protected_roots: List[dict] = []
+    seen_root = set()
+    for info in _orphan_registry_clients() + _orphan_collect_live_clients():
+        key = (info["pid"], round(float(info.get("create_time") or 0), 3))
+        if key in seen_root:
+            continue
+        seen_root.add(key)
+        protected_roots.append(info)
+        by_pid[info["pid"]] = info
+
+    protected_pids: set = set()
+    for root in protected_roots:
+        protected_pids |= _orphan_tree_pids(root["pid"])
+
+    chrome_list: List[dict] = []
+    me = os.getpid()
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            pid = p.info.get("pid")
+            if not pid or pid == me:
+                continue
+            lname = (p.info.get("name") or "").lower()
+            if lname not in _CHROME_NAMES and lname not in _APPLICATION_V2_NAMES:
+                continue
+            info = _orphan_proc_info(p)
+            if not info:
+                continue
+            by_pid[info["pid"]] = info
+            if _orphan_is_chrome(info):
+                chrome_list.append(info)
+            elif _orphan_is_app_v2(info) and info["pid"] in protected_pids:
+                protected_pids |= _orphan_tree_pids(info["pid"])
+        except Exception:
+            continue
+
+    # Élargit protected_pids avec les App_v2 sous clients
+    for pid, info in list(by_pid.items()):
+        if _orphan_is_app_v2(info):
+            owner = _orphan_walk_owner_client(info, by_pid, client_names)
+            if owner and (
+                owner["pid"] in protected_pids
+                or _orphan_same_identity(owner["pid"], owner.get("create_time") or 0)
+            ):
+                protected_pids |= _orphan_tree_pids(pid)
+
+    candidates = _orphan_find_stale_chrome(
+        chrome_list, by_pid, protected_pids, client_names, min_age_s
+    )
+    report["candidates"] = list(candidates)
+
+    killed_pids = set()
+    for ch in candidates:
+        if ch["pid"] in killed_pids:
+            continue
+        # Ne jamais tuer un client / Application_v2 par erreur
+        if _orphan_is_client(ch, client_names) or _orphan_is_app_v2(ch):
+            report["ignored"].append({**ch, "reason": "pas un Chrome cible"})
+            continue
+        k, f = _orphan_kill_tree_verified(ch)
+        for item in k:
+            # Ne compte comme succès Chrome que les chrome.exe
+            if _orphan_is_chrome(item) or item["pid"] == ch["pid"]:
+                item["reason"] = ch.get("reason") or f"Chrome > {int(min_age_s)}s"
+                report["killed"].append(item)
+            killed_pids.add(item["pid"])
+        for item in f:
+            report["failed"].append(item)
+
+    # Recalcule ce qui reste
+    chrome_left: List[dict] = []
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            pid = p.info.get("pid")
+            if not pid or pid == me:
+                continue
+            if (p.info.get("name") or "").lower() not in _CHROME_NAMES:
+                continue
+            info = _orphan_proc_info(p)
+            if info:
+                chrome_left.append(info)
+                by_pid[info["pid"]] = info
+        except Exception:
+            continue
+    report["remaining_stale"] = _orphan_find_stale_chrome(
+        chrome_left, by_pid, protected_pids, client_names, min_age_s
+    )
     return report
 
 
 def _format_orphan_cleanup_report(report: dict) -> str:
-    def _lines(items: List[dict], limit: int = 40) -> str:
+    def _lines(items: List[dict], limit: int = 500) -> str:
         if not items:
             return "  (aucun)"
         rows = []
@@ -16139,7 +16408,11 @@ def _format_orphan_cleanup_report(report: dict) -> str:
             name = it.get("name") or it.get("basename") or "?"
             pid = it.get("pid", "?")
             reason = it.get("reason") or ""
-            rows.append(f"  • {name} PID {pid}" + (f" — {reason}" if reason else ""))
+            age = it.get("age_s")
+            age_txt = f" [{int(age)}s]" if age is not None else ""
+            rows.append(
+                f"  • {name} PID {pid}{age_txt}" + (f" — {reason}" if reason else "")
+            )
         if len(items) > limit:
             rows.append(f"  … et {len(items) - limit} autre(s)")
         return "\n".join(rows)
@@ -16148,6 +16421,7 @@ def _format_orphan_cleanup_report(report: dict) -> str:
     ignored = report.get("ignored") or []
     ambiguous = report.get("ambiguous") or []
     failed = report.get("failed") or []
+    stale = report.get("stale_chrome") or []
     return (
         f"Clients protégés : {report.get('protected_clients', 0)}\n"
         f"Application_v2 scannés : {report.get('scanned_app_v2', 0)} | "
@@ -16155,7 +16429,38 @@ def _format_orphan_cleanup_report(report: dict) -> str:
         f"Terminés ({len(killed)}) :\n{_lines(killed)}\n\n"
         f"Ignorés / protégés ({len(ignored)}) :\n{_lines(ignored)}\n\n"
         f"Ambiguës (non touchées) ({len(ambiguous)}) :\n{_lines(ambiguous)}\n\n"
+        f"Chrome > 3 min sous instances ({len(stale)}) :\n{_lines(stale)}\n\n"
         f"Échecs ({len(failed)}) :\n{_lines(failed)}"
+    )
+
+
+def _format_stale_chrome_report(report: dict) -> str:
+    def _lines(items: List[dict], limit: int = 200) -> str:
+        if not items:
+            return "  (aucun)"
+        rows = []
+        for it in items[:limit]:
+            name = it.get("name") or it.get("basename") or "?"
+            pid = it.get("pid", "?")
+            reason = it.get("reason") or ""
+            age = it.get("age_s")
+            age_txt = f" [{int(age)}s]" if age is not None else ""
+            rows.append(
+                f"  • {name} PID {pid}{age_txt}" + (f" — {reason}" if reason else "")
+            )
+        if len(items) > limit:
+            rows.append(f"  … et {len(items) - limit} autre(s)")
+        return "\n".join(rows)
+
+    killed = report.get("killed") or []
+    failed = report.get("failed") or []
+    remaining = report.get("remaining_stale") or []
+    candidates = report.get("candidates") or []
+    return (
+        f"Candidats : {len(candidates)}\n"
+        f"Terminés ({len(killed)}) :\n{_lines(killed)}\n\n"
+        f"Échecs ({len(failed)}) :\n{_lines(failed)}\n\n"
+        f"Restants > 3 min ({len(remaining)}) :\n{_lines(remaining)}"
     )
 
 

@@ -64,3 +64,7 @@
 [2026-09-06 20:03:33.374] ERROR SnowMaster: Chargement de 2 bouton(s) depuis les préférences
 [2026-09-06 20:03:33.375] ERROR SnowMaster: Bouton chargé: title='close vidage go hdv', id='72b828a9-09a9-4c88-9b12-587376aac8db'
 [2026-09-06 20:03:33.376] ERROR SnowMaster: Bouton chargé: title='Lancer vidage', id='282d61d4-0fd3-4f45-a1c6-3a6ea4c0cab6'
+[2026-09-06 21:45:40.785] === Démarrage application ===
+[2026-09-06 21:45:42.192] ERROR SnowMaster: Chargement de 2 bouton(s) depuis les préférences
+[2026-09-06 21:45:42.193] ERROR SnowMaster: Bouton chargé: title='close vidage go hdv', id='72b828a9-09a9-4c88-9b12-587376aac8db'
+[2026-09-06 21:45:42.193] ERROR SnowMaster: Bouton chargé: title='Lancer vidage', id='282d61d4-0fd3-4f45-a1c6-3a6ea4c0cab6'
