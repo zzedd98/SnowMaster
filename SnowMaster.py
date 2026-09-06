@@ -498,6 +498,8 @@ DEFAULT_PREFS = {
     "reddot": 480,  # Heartbeat timeout par défaut : 8 minutes
     # Écran pour "mettre au premier plan" : 1 = tout à gauche, 2 = suivant à droite, etc.
     "screen_to_use": 1,
+    # Hauteur (px) appliquée à la fenêtre instance lors de « Mettre au premier plan »
+    "focus_window_height": 900,
     # Fichier panic.txt pour le bouton Panic TS (chemin complet)
     "panic_file": "",
     # Icônes UI : noms de fichiers sous SnowMaster/images/ (ex: "play.png") ou chemin absolu
@@ -563,6 +565,40 @@ def screen_to_use() -> int:
         return max(1, int(_prefs.get("screen_to_use", 1)))
     except Exception:
         return 1
+
+
+# Hauteur mini sûre pour les fenêtres client (AnkaBot/SnowBot) au premier plan.
+# En dessous, l'UI du client risque d'être tronquée / inutilisable.
+FOCUS_WINDOW_HEIGHT_MIN = 700
+FOCUS_WINDOW_HEIGHT_DEFAULT = 900
+
+
+def focus_window_height_pref() -> int:
+    """Hauteur configurée pour « Mettre au premier plan » (jamais sous le minimum)."""
+    try:
+        h = int(_prefs.get("focus_window_height", FOCUS_WINDOW_HEIGHT_DEFAULT))
+    except Exception:
+        h = FOCUS_WINDOW_HEIGHT_DEFAULT
+    if h < FOCUS_WINDOW_HEIGHT_MIN:
+        return FOCUS_WINDOW_HEIGHT_MIN
+    return h
+
+
+def resolve_focus_window_height(monitor_height: int) -> int:
+    """
+    Hauteur effective à appliquer : max(config, MIN), plafonnée à l'écran.
+    Ne force jamais une taille plus grande que l'écran disponible.
+    """
+    desired = focus_window_height_pref()
+    try:
+        usable = max(1, int(monitor_height) - 8)
+    except Exception:
+        usable = desired
+    target = max(FOCUS_WINDOW_HEIGHT_MIN, int(desired))
+    if usable < FOCUS_WINDOW_HEIGHT_MIN:
+        # Écran trop petit : on prend tout ce qui est utilisable, sans imposer le MIN
+        return usable
+    return min(target, usable)
 
 
 def hb_history_storage_enabled() -> bool:
@@ -2885,11 +2921,12 @@ def match_autopilot_schedule(prefs: dict) -> Optional[dict]:
 
 # ======================= WIN32 UTILS ======================
 def bring_to_front(hwnd):
-    """Met la fenêtre au premier plan sur l'écran configuré (screen_to_use)."""
+    """Met la fenêtre au premier plan sur l'écran configuré, avec la hauteur configurée."""
     try:
         monitor = get_monitor_by_screen_number(screen_to_use())
         screen_left = monitor["left"]
         screen_top = monitor["top"]
+        screen_height = int(monitor.get("height") or 0)
 
         # Placer au coin en haut à gauche de l'écran choisi
         x = screen_left
@@ -2899,16 +2936,34 @@ def bring_to_front(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         time.sleep(0.05)
 
-        # Déplacer vers l'écran choisi
-        win32gui.SetWindowPos(
-            hwnd,
-            win32con.HWND_TOP,
-            x,
-            y,
-            0,
-            0,
-            win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW,
-        )
+        # Largeur actuelle conservée ; hauteur = préférence (clampée au min / écran)
+        try:
+            rect = win32gui.GetWindowRect(hwnd)
+            width = max(1, int(rect[2] - rect[0]))
+        except Exception:
+            width = 0
+        target_h = resolve_focus_window_height(screen_height)
+
+        if width > 0 and target_h > 0:
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOP,
+                x,
+                y,
+                width,
+                target_h,
+                win32con.SWP_SHOWWINDOW,
+            )
+        else:
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOP,
+                x,
+                y,
+                0,
+                0,
+                win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW,
+            )
 
         # Mettre au premier plan
         win32gui.SetForegroundWindow(hwnd)
@@ -7235,41 +7290,41 @@ class CollapsibleGroupBox(QWidget):
 
 
 class OrphanCleanupResultDialog(QDialog):
-    """Résultats du Clean orphelins — liste scrollable + action Chrome > 3 min."""
+    """Résultats du Clean orphelins — liste scrollable + actions ciblées."""
 
     stale_chrome_finished = Signal(object)
+    ambiguous_finished = Signal(object)
+    refresh_finished = Signal(object)
 
     def __init__(self, parent, report: dict):
         super().__init__(parent)
         self.setWindowTitle("Clean — processus orphelins")
-        self.setMinimumSize(720, 520)
-        self.resize(780, 580)
+        self.setMinimumSize(980, 520)
+        self.resize(1040, 600)
         self._report = report if isinstance(report, dict) else {}
         self._chrome_busy = False
+        self._ambiguous_busy = False
+        self._refresh_busy = False
         self.stale_chrome_finished.connect(self._on_stale_chrome_finished)
+        self.ambiguous_finished.connect(self._on_ambiguous_finished)
+        self.refresh_finished.connect(self._on_refresh_finished)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        stale = self._report.get("stale_chrome") or []
-        summary = QLabel(
-            f"Clients protégés : {self._report.get('protected_clients', 0)}    |    "
-            f"Application_v2 : {self._report.get('scanned_app_v2', 0)}    |    "
-            f"Chrome : {self._report.get('scanned_chrome', 0)}    |    "
-            f"Chrome > 3 min : {len(stale)}"
-        )
-        summary.setWordWrap(True)
-        summary.setStyleSheet("color:#93c5fd; font-weight:600;")
-        root.addWidget(summary)
+        self.lbl_summary = QLabel()
+        self.lbl_summary.setWordWrap(True)
+        self.lbl_summary.setStyleSheet("color:#93c5fd; font-weight:600;")
+        root.addWidget(self.lbl_summary)
 
         body = QHBoxLayout()
         body.setSpacing(10)
 
         self.txt = QTextEdit()
         self.txt.setReadOnly(True)
-        self.txt.setLineWrapMode(QTextEdit.WidgetWidth)
-        self.txt.setPlainText(_format_orphan_cleanup_report(self._report))
+        self.txt.setLineWrapMode(QTextEdit.NoWrap)
+        self.txt.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.txt.setStyleSheet(
             "QTextEdit {"
             " background-color:#0b1220; color:#e5e7eb;"
@@ -7282,21 +7337,36 @@ class OrphanCleanupResultDialog(QDialog):
 
         side = QVBoxLayout()
         side.setSpacing(8)
+
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_refresh.setCursor(Qt.PointingHandCursor)
+        self.btn_refresh.setMinimumWidth(130)
+        self.btn_refresh.setToolTip(
+            "Relance le scan Clean pour mettre à jour la liste."
+        )
+        self.btn_refresh.clicked.connect(self._on_refresh)
+
         self.btn_stale_chrome = QPushButton("Clean Chrome\n> 3 min")
         self.btn_stale_chrome.setCursor(Qt.PointingHandCursor)
         self.btn_stale_chrome.setMinimumWidth(130)
         self.btn_stale_chrome.setToolTip(
             "Termine les navigateurs Chrome liés aux instances,\n"
-            "ouverts depuis plus de 3 minutes (même sous une instance active).\n"
-            "Utile pour les auth abandonnées qui bloquent des ressources."
+            "ouverts depuis plus de 3 minutes (même sous une instance active)."
         )
         self.btn_stale_chrome.clicked.connect(self._on_clean_stale_chrome)
-        if not stale:
-            self.btn_stale_chrome.setEnabled(False)
-            self.btn_stale_chrome.setToolTip(
-                "Aucun Chrome > 3 min détecté sous les instances lors du scan."
-            )
+
+        self.btn_ambiguous = QPushButton("Clean ambiguës")
+        self.btn_ambiguous.setCursor(Qt.PointingHandCursor)
+        self.btn_ambiguous.setMinimumWidth(130)
+        self.btn_ambiguous.setToolTip(
+            "Termine les processus listés en « Ambiguës »\n"
+            "(ex. Chrome sans lanceur Application_v2 confirmé)."
+        )
+        self.btn_ambiguous.clicked.connect(self._on_clean_ambiguous)
+
+        side.addWidget(self.btn_refresh, 0, Qt.AlignTop)
         side.addWidget(self.btn_stale_chrome, 0, Qt.AlignTop)
+        side.addWidget(self.btn_ambiguous, 0, Qt.AlignTop)
         side.addStretch(1)
         body.addLayout(side, 0)
 
@@ -7310,11 +7380,84 @@ class OrphanCleanupResultDialog(QDialog):
         bottom.addWidget(btn_close)
         root.addLayout(bottom)
 
+        self._apply_report(self._report)
+
+    def _any_busy(self) -> bool:
+        return self._chrome_busy or self._ambiguous_busy or self._refresh_busy
+
+    def _update_action_buttons(self):
+        busy = self._any_busy()
+        stale = self._report.get("stale_chrome") or []
+        ambiguous = self._report.get("ambiguous") or []
+        self.btn_refresh.setEnabled(not busy)
+        self.btn_stale_chrome.setEnabled(bool(stale) and not busy)
+        self.btn_ambiguous.setEnabled(bool(ambiguous) and not busy)
+        if not stale:
+            self.btn_stale_chrome.setToolTip(
+                "Aucun Chrome > 3 min détecté sous les instances lors du scan."
+            )
+        else:
+            self.btn_stale_chrome.setToolTip(
+                "Termine les navigateurs Chrome liés aux instances,\n"
+                "ouverts depuis plus de 3 minutes (même sous une instance active)."
+            )
+        if not ambiguous:
+            self.btn_ambiguous.setToolTip("Aucune entrée ambiguë à nettoyer.")
+        else:
+            self.btn_ambiguous.setToolTip(
+                "Termine les processus listés en « Ambiguës »\n"
+                "(ex. Chrome sans lanceur Application_v2 confirmé)."
+            )
+
+    def _apply_report(self, report: dict):
+        self._report = report if isinstance(report, dict) else {}
+        stale = self._report.get("stale_chrome") or []
+        ambiguous = self._report.get("ambiguous") or []
+        self.lbl_summary.setText(
+            f"Clients protégés : {self._report.get('protected_clients', 0)}    |    "
+            f"Application_v2 : {self._report.get('scanned_app_v2', 0)}    |    "
+            f"Chrome : {self._report.get('scanned_chrome', 0)}    |    "
+            f"Chrome > 3 min : {len(stale)}    |    "
+            f"Ambiguës : {len(ambiguous)}"
+        )
+        self.txt.setPlainText(_format_orphan_cleanup_report(self._report))
+        self._update_action_buttons()
+
+    def _on_refresh(self):
+        if self._any_busy():
+            return
+        self._refresh_busy = True
+        self._update_action_buttons()
+        self.btn_refresh.setText("…")
+
+        def _worker():
+            report = None
+            err = None
+            try:
+                report = cleanup_orphan_processes()
+            except Exception as e:
+                err = str(e)
+            self.refresh_finished.emit({"report": report, "error": err})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_refresh_finished(self, payload):
+        self._refresh_busy = False
+        self.btn_refresh.setText("Refresh")
+        payload = payload or {}
+        err = payload.get("error")
+        report = payload.get("report")
+        if err:
+            QMessageBox.warning(self, "Refresh", f"Erreur :\n{err}")
+            self._update_action_buttons()
+            return
+        self._apply_report(report if isinstance(report, dict) else {})
+
     def _on_clean_stale_chrome(self):
-        if self._chrome_busy:
+        if self._any_busy():
             return
         self._chrome_busy = True
-        self.btn_stale_chrome.setEnabled(False)
+        self._update_action_buttons()
         self.btn_stale_chrome.setText("Clean…")
 
         def _worker():
@@ -7335,8 +7478,8 @@ class OrphanCleanupResultDialog(QDialog):
         err = payload.get("error")
         report = payload.get("report")
         if err:
-            self.btn_stale_chrome.setEnabled(True)
             QMessageBox.warning(self, "Clean Chrome > 3 min", f"Erreur :\n{err}")
+            self._update_action_buttons()
             return
         if not isinstance(report, dict):
             report = {}
@@ -7344,9 +7487,62 @@ class OrphanCleanupResultDialog(QDialog):
             "\n\n—— Clean Chrome > 3 min ——\n" + _format_stale_chrome_report(report)
         )
         remaining = report.get("remaining_stale") or []
-        self.btn_stale_chrome.setEnabled(bool(remaining))
-        if not remaining:
-            self.btn_stale_chrome.setToolTip("Plus aucun Chrome > 3 min détecté.")
+        self._report["stale_chrome"] = remaining
+        self.lbl_summary.setText(
+            f"Clients protégés : {self._report.get('protected_clients', 0)}    |    "
+            f"Application_v2 : {self._report.get('scanned_app_v2', 0)}    |    "
+            f"Chrome : {self._report.get('scanned_chrome', 0)}    |    "
+            f"Chrome > 3 min : {len(remaining)}    |    "
+            f"Ambiguës : {len(self._report.get('ambiguous') or [])}"
+        )
+        self._update_action_buttons()
+
+    def _on_clean_ambiguous(self):
+        if self._any_busy():
+            return
+        items = list(self._report.get("ambiguous") or [])
+        if not items:
+            return
+        self._ambiguous_busy = True
+        self._update_action_buttons()
+        self.btn_ambiguous.setText("Clean…")
+
+        def _worker():
+            report = None
+            err = None
+            try:
+                report = cleanup_ambiguous_processes(items)
+            except Exception as e:
+                err = str(e)
+            self.ambiguous_finished.emit({"report": report, "error": err})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_ambiguous_finished(self, payload):
+        self._ambiguous_busy = False
+        self.btn_ambiguous.setText("Clean ambiguës")
+        payload = payload or {}
+        err = payload.get("error")
+        report = payload.get("report")
+        if err:
+            QMessageBox.warning(self, "Clean ambiguës", f"Erreur :\n{err}")
+            self._update_action_buttons()
+            return
+        if not isinstance(report, dict):
+            report = {}
+        self.txt.append(
+            "\n\n—— Clean ambiguës ——\n" + _format_ambiguous_cleanup_report(report)
+        )
+        remaining = report.get("remaining") or []
+        self._report["ambiguous"] = remaining
+        self.lbl_summary.setText(
+            f"Clients protégés : {self._report.get('protected_clients', 0)}    |    "
+            f"Application_v2 : {self._report.get('scanned_app_v2', 0)}    |    "
+            f"Chrome : {self._report.get('scanned_chrome', 0)}    |    "
+            f"Chrome > 3 min : {len(self._report.get('stale_chrome') or [])}    |    "
+            f"Ambiguës : {len(remaining)}"
+        )
+        self._update_action_buttons()
 
 
 class HeartbeatHistoryDialog(QDialog):
@@ -9120,6 +9316,22 @@ class SnowMasterGUI(QWidget):
         )
         self.spin_screen_to_use.valueChanged.connect(self.on_change_screen_to_use)
 
+        self.spin_focus_window_height = CustomSpinBox(
+            self,
+            min_value=FOCUS_WINDOW_HEIGHT_MIN,
+            max_value=2160,
+            initial_value=focus_window_height_pref(),
+            suffix=" px",
+        )
+        self.spin_focus_window_height.setToolTip(
+            "Hauteur de la fenêtre instance lors de « Mettre au premier plan ».\n"
+            f"Minimum sûr : {FOCUS_WINDOW_HEIGHT_MIN} px (évite de casser l'UI du client).\n"
+            "La hauteur est aussi plafonnée à celle de l'écran."
+        )
+        self.spin_focus_window_height.valueChanged.connect(
+            self.on_change_focus_window_height
+        )
+
         # ComboBox : Mode pour le chargement d'une config (load_only / load_and_launch)
         self.chk_instance_launch = QCheckBox("Load and launch")
         self.chk_instance_launch.setChecked(str(default_inst_mode) == "load_and_launch")
@@ -9226,6 +9438,7 @@ class SnowMasterGUI(QWidget):
         _add_spin_row("Délai reddot (min. 60s)", self.spin_reddot)
         _add_spin_row("Délai relance reddot (s)", self.spin_reddot_relaunch_delay)
         _add_spin_row("Écran premier plan", self.spin_screen_to_use)
+        _add_spin_row("Hauteur premier plan", self.spin_focus_window_height)
         # inst_group_collapsible.addWidget(self.chk_instance_launch)
 
         ap_group_collapsible = CollapsibleGroupBox("Autopilote")
@@ -13530,6 +13743,23 @@ class SnowMasterGUI(QWidget):
         save_prefs(_prefs)
         app_log_info(f"Écran premier plan mis à jour : {n}")
 
+    def on_change_focus_window_height(self, value: int):
+        """Met à jour la hauteur appliquée lors de « Mettre au premier plan »."""
+        h = int(value)
+        if h < FOCUS_WINDOW_HEIGHT_MIN:
+            h = FOCUS_WINDOW_HEIGHT_MIN
+            try:
+                self.spin_focus_window_height.blockSignals(True)
+                self.spin_focus_window_height.setValue(h)
+            finally:
+                try:
+                    self.spin_focus_window_height.blockSignals(False)
+                except Exception:
+                    pass
+        _prefs["focus_window_height"] = h
+        save_prefs(_prefs)
+        app_log_info(f"Hauteur premier plan mise à jour : {h}px")
+
     def on_change_reddot_relaunch_delay(self, value: int):
         """Met à jour le délai avant reset auto d'une instance en reddot."""
         self.reddot_relaunch_delay_s = int(value)
@@ -15892,14 +16122,111 @@ def _orphan_registry_clients() -> List[dict]:
             info = None
         if not info:
             continue
-        # Accepte le PID enregistré s'il ressemble au client OU s'il est juste vivant
-        # (pendant un lancement le PID peut être le launcher).
         info = dict(info)
         info["title"] = title
         info["from_registry"] = True
         if _orphan_is_client(info, client_names) or info.get("basename"):
             out.append(info)
     return out
+
+
+def _orphan_build_pid_title_map(protected_roots: List[dict]) -> Dict[int, str]:
+    """Mappe PID client (+ descendants) → titre d'instance SnowMaster."""
+    pid_to_title: Dict[int, str] = {}
+    # Registre UI
+    with _state_lock:
+        for title, inst in _instances.items():
+            t = str(title or "").strip()
+            if not t:
+                continue
+            try:
+                pid = int(getattr(inst, "pid", 0) or 0)
+            except Exception:
+                pid = 0
+            if pid:
+                pid_to_title[pid] = t
+    # Racines déjà enrichies (title)
+    for root in protected_roots or []:
+        t = str(root.get("title") or "").strip()
+        pid = int(root.get("pid") or 0)
+        if t and pid:
+            pid_to_title[pid] = t
+    # Cache process par titre
+    try:
+        with _ankabot_procs_cache_lock:
+            cache_snap = {
+                str(t): list(lst)
+                for t, lst in (_ankabot_procs_by_title or {}).items()
+                if t
+            }
+        for title, lst in cache_snap.items():
+            t = str(title or "").strip()
+            if not t:
+                continue
+            for info in lst:
+                try:
+                    pid = int(info.get("pid") or 0)
+                except Exception:
+                    pid = 0
+                if pid:
+                    pid_to_title.setdefault(pid, t)
+    except Exception:
+        pass
+    # Propage le titre aux descendants vivants de chaque racine titrée
+    for root_pid, title in list(pid_to_title.items()):
+        for child_pid in _orphan_tree_pids(root_pid):
+            pid_to_title.setdefault(int(child_pid), title)
+    return pid_to_title
+
+
+def _orphan_title_for_info(
+    info: dict,
+    pid_to_title: Dict[int, str],
+    by_pid: Dict[int, dict],
+    client_names: set,
+) -> str:
+    """Résout le titre d'instance pour un process (PID direct, owner, ou parenté)."""
+    if not info:
+        return ""
+    pid = int(info.get("pid") or 0)
+    if pid and pid in pid_to_title:
+        return pid_to_title[pid]
+    # Owner client dans la chaîne
+    owner = _orphan_walk_owner_client(info, by_pid, client_names)
+    if owner:
+        opid = int(owner.get("pid") or 0)
+        if opid and opid in pid_to_title:
+            return pid_to_title[opid]
+        t = str(owner.get("title") or "").strip()
+        if t:
+            return t
+    # Remonte les parents déjà mappés
+    cur = info
+    for _ in range(8):
+        ppid = int(cur.get("ppid") or 0)
+        if not ppid:
+            break
+        if ppid in pid_to_title:
+            return pid_to_title[ppid]
+        parent = by_pid.get(ppid)
+        if parent is None:
+            try:
+                parent = _orphan_proc_info(psutil.Process(ppid))
+            except Exception:
+                parent = None
+            if parent:
+                by_pid[ppid] = parent
+        if not parent:
+            break
+        cur = parent
+    return ""
+
+
+def _orphan_protected_reason(title: str) -> str:
+    t = (title or "").strip()
+    if t:
+        return f"instance « {t} » (protégé)"
+    return "instance active (protégé)"
 
 
 def _orphan_tree_pids(root_pid: int) -> set:
@@ -16062,6 +16389,7 @@ def cleanup_orphan_processes() -> dict:
     for root in protected_roots:
         protected_pids |= _orphan_tree_pids(root["pid"])
     report["protected_clients"] = len(protected_roots)
+    pid_to_title = _orphan_build_pid_title_map(protected_roots)
 
     # --- Snapshot Application_v2 + chrome (filtre nom, pas de kill global) ---
     app_v2_list: List[dict] = []
@@ -16099,10 +16427,12 @@ def cleanup_orphan_processes() -> dict:
             owner = _orphan_walk_owner_client(app, by_pid, client_names)
             if owner:
                 app_v2_owned[pid] = owner
+            title = _orphan_title_for_info(app, pid_to_title, by_pid, client_names)
             report["ignored"].append(
                 {
                     **app,
-                    "reason": "sous une instance / client encore actif (protégé)",
+                    "instance_title": title,
+                    "reason": _orphan_protected_reason(title),
                 }
             )
             continue
@@ -16110,10 +16440,14 @@ def cleanup_orphan_processes() -> dict:
         if owner and owner["pid"] in protected_pids:
             app_v2_owned[pid] = owner
             protected_pids |= _orphan_tree_pids(pid)
+            title = _orphan_title_for_info(app, pid_to_title, by_pid, client_names)
+            if not title and owner.get("title"):
+                title = str(owner.get("title") or "")
             report["ignored"].append(
                 {
                     **app,
-                    "reason": f"propriétaire client PID {owner['pid']} encore actif",
+                    "instance_title": title,
+                    "reason": _orphan_protected_reason(title),
                 }
             )
             continue
@@ -16122,10 +16456,14 @@ def cleanup_orphan_processes() -> dict:
             app_v2_owned[pid] = owner
             protected_pids |= _orphan_tree_pids(owner["pid"])
             protected_pids |= _orphan_tree_pids(pid)
+            title = _orphan_title_for_info(app, pid_to_title, by_pid, client_names)
+            if not title and owner.get("title"):
+                title = str(owner.get("title") or "")
             report["ignored"].append(
                 {
                     **app,
-                    "reason": f"propriétaire client PID {owner['pid']} vivant (détecté)",
+                    "instance_title": title,
+                    "reason": _orphan_protected_reason(title),
                 }
             )
             continue
@@ -16152,8 +16490,13 @@ def cleanup_orphan_processes() -> dict:
         if ch["pid"] in killed_pids:
             continue
         if ch["pid"] in protected_pids:
+            title = _orphan_title_for_info(ch, pid_to_title, by_pid, client_names)
             report["ignored"].append(
-                {**ch, "reason": "Chrome rattaché à une instance / client actif"}
+                {
+                    **ch,
+                    "instance_title": title,
+                    "reason": _orphan_protected_reason(title),
+                }
             )
             continue
         # Enfant d'un App_v2 encore vivant ?
@@ -16171,10 +16514,16 @@ def cleanup_orphan_processes() -> dict:
             if parent["pid"] in killed_pids:
                 continue  # déjà tué avec l'arbre
             if parent["pid"] in app_v2_owned or parent["pid"] in protected_pids:
+                title = _orphan_title_for_info(ch, pid_to_title, by_pid, client_names)
+                if not title:
+                    title = _orphan_title_for_info(
+                        parent, pid_to_title, by_pid, client_names
+                    )
                 report["ignored"].append(
                     {
                         **ch,
-                        "reason": f"lanceur Application_v2 PID {parent['pid']} encore actif / protégé",
+                        "instance_title": title,
+                        "reason": _orphan_protected_reason(title),
                     }
                 )
                 continue
@@ -16195,10 +16544,16 @@ def cleanup_orphan_processes() -> dict:
             continue
 
         if parent and _orphan_is_client(parent, client_names):
+            title = _orphan_title_for_info(ch, pid_to_title, by_pid, client_names)
+            if not title:
+                title = _orphan_title_for_info(
+                    parent, pid_to_title, by_pid, client_names
+                )
             report["ignored"].append(
                 {
                     **ch,
-                    "reason": f"parent client {APP_EXE_NAME} PID {parent['pid']} encore actif",
+                    "instance_title": title,
+                    "reason": _orphan_protected_reason(title),
                 }
             )
             continue
@@ -16207,10 +16562,14 @@ def cleanup_orphan_processes() -> dict:
         # Tentative de confirmation : ancêtre client encore visible dans la chaîne
         owner = _orphan_walk_owner_client(ch, by_pid, client_names)
         if owner and _orphan_same_identity(owner["pid"], owner.get("create_time") or 0):
+            title = _orphan_title_for_info(ch, pid_to_title, by_pid, client_names)
+            if not title and owner.get("title"):
+                title = str(owner.get("title") or "")
             report["ignored"].append(
                 {
                     **ch,
-                    "reason": f"client propriétaire PID {owner['pid']} encore actif — non touché",
+                    "instance_title": title,
+                    "reason": _orphan_protected_reason(title),
                 }
             )
             continue
@@ -16228,7 +16587,12 @@ def cleanup_orphan_processes() -> dict:
 
     # Chrome > 3 min encore sous instances actives (candidats pour le bouton dédié)
     report["stale_chrome"] = _orphan_find_stale_chrome(
-        chrome_list, by_pid, protected_pids, client_names, STALE_CHROME_AGE_S
+        chrome_list,
+        by_pid,
+        protected_pids,
+        client_names,
+        STALE_CHROME_AGE_S,
+        pid_to_title=pid_to_title,
     )
 
     return report
@@ -16248,12 +16612,14 @@ def _orphan_find_stale_chrome(
     protected_pids: set,
     client_names: set,
     min_age_s: float,
+    pid_to_title: Optional[Dict[int, str]] = None,
 ) -> List[dict]:
     """
     Navigateurs Chrome (racine = parent non-chrome) liés aux instances,
     ouverts depuis plus de min_age_s — même sous un client encore actif.
     """
     now = time.time()
+    pid_to_title = pid_to_title or {}
     stale: List[dict] = []
     for ch in chrome_list:
         pid = int(ch.get("pid") or 0)
@@ -16286,9 +16652,18 @@ def _orphan_find_stale_chrome(
         age = _orphan_chrome_age_s(ch, now)
         if age < float(min_age_s):
             continue
+        title = _orphan_title_for_info(ch, pid_to_title, by_pid, client_names)
+        if not title and owner and owner.get("title"):
+            title = str(owner.get("title") or "")
         item = dict(ch)
         item["age_s"] = age
-        item["reason"] = f"Chrome ouvert depuis {int(age)}s (≥ {int(min_age_s)}s)"
+        item["instance_title"] = title
+        if title:
+            item["reason"] = (
+                f"instance « {title} » — ouvert depuis {int(age)}s (≥ {int(min_age_s)}s)"
+            )
+        else:
+            item["reason"] = f"Chrome ouvert depuis {int(age)}s (≥ {int(min_age_s)}s)"
         stale.append(item)
     stale.sort(key=lambda x: float(x.get("age_s") or 0), reverse=True)
     return stale
@@ -16355,8 +16730,15 @@ def cleanup_stale_chrome_processes(min_age_s: float = STALE_CHROME_AGE_S) -> dic
             ):
                 protected_pids |= _orphan_tree_pids(pid)
 
+    pid_to_title = _orphan_build_pid_title_map(protected_roots)
+
     candidates = _orphan_find_stale_chrome(
-        chrome_list, by_pid, protected_pids, client_names, min_age_s
+        chrome_list,
+        by_pid,
+        protected_pids,
+        client_names,
+        min_age_s,
+        pid_to_title=pid_to_title,
     )
     report["candidates"] = list(candidates)
 
@@ -16394,7 +16776,12 @@ def cleanup_stale_chrome_processes(min_age_s: float = STALE_CHROME_AGE_S) -> dic
         except Exception:
             continue
     report["remaining_stale"] = _orphan_find_stale_chrome(
-        chrome_left, by_pid, protected_pids, client_names, min_age_s
+        chrome_left,
+        by_pid,
+        protected_pids,
+        client_names,
+        min_age_s,
+        pid_to_title=pid_to_title,
     )
     return report
 
@@ -16426,10 +16813,10 @@ def _format_orphan_cleanup_report(report: dict) -> str:
         f"Clients protégés : {report.get('protected_clients', 0)}\n"
         f"Application_v2 scannés : {report.get('scanned_app_v2', 0)} | "
         f"Chrome scannés : {report.get('scanned_chrome', 0)}\n\n"
-        f"Terminés ({len(killed)}) :\n{_lines(killed)}\n\n"
-        f"Ignorés / protégés ({len(ignored)}) :\n{_lines(ignored)}\n\n"
-        f"Ambiguës (non touchées) ({len(ambiguous)}) :\n{_lines(ambiguous)}\n\n"
         f"Chrome > 3 min sous instances ({len(stale)}) :\n{_lines(stale)}\n\n"
+        f"Ambiguës (non touchées) ({len(ambiguous)}) :\n{_lines(ambiguous)}\n\n"
+        f"Ignorés / protégés ({len(ignored)}) :\n{_lines(ignored)}\n\n"
+        f"Terminés ({len(killed)}) :\n{_lines(killed)}\n\n"
         f"Échecs ({len(failed)}) :\n{_lines(failed)}"
     )
 
@@ -16461,6 +16848,90 @@ def _format_stale_chrome_report(report: dict) -> str:
         f"Terminés ({len(killed)}) :\n{_lines(killed)}\n\n"
         f"Échecs ({len(failed)}) :\n{_lines(failed)}\n\n"
         f"Restants > 3 min ({len(remaining)}) :\n{_lines(remaining)}"
+    )
+
+
+def cleanup_ambiguous_processes(items: List[dict]) -> dict:
+    """
+    À la demande : termine les entrées « Ambiguës » du dernier scan
+    (identité pid + create_time vérifiée). Ne rescanne pas tout le système.
+    """
+    report = {"killed": [], "failed": [], "skipped": [], "remaining": []}
+    client_names = _orphan_client_basenames()
+    killed_pids = set()
+
+    for raw in items or []:
+        try:
+            pid = int(raw.get("pid") or 0)
+        except Exception:
+            pid = 0
+        if not pid or pid in killed_pids:
+            continue
+        # Sécurité : ne jamais tuer un client / Application_v2 via ce bouton
+        if _orphan_is_client(raw, client_names) or _orphan_is_app_v2(raw):
+            report["skipped"].append(
+                {**raw, "reason": "refusé : client / Application_v2 (pas une ambiguë Chrome)"}
+            )
+            continue
+        # Vérifie que c'est encore le même process (anti PID recyclé)
+        ct = float(raw.get("create_time") or 0)
+        if ct > 0 and not _orphan_same_identity(pid, ct):
+            report["skipped"].append(
+                {**raw, "reason": "déjà terminé ou PID recyclé — ignoré"}
+            )
+            continue
+        if not is_pid_alive(pid):
+            report["skipped"].append({**raw, "reason": "déjà terminé"})
+            continue
+
+        k, f = _orphan_kill_tree_verified(raw)
+        for item in k:
+            item["reason"] = "ambiguë nettoyée à la demande"
+            report["killed"].append(item)
+            killed_pids.add(item["pid"])
+        for item in f:
+            report["failed"].append(item)
+
+    # Recalcule les ambiguës encore vivantes parmi la liste d'origine
+    for raw in items or []:
+        try:
+            pid = int(raw.get("pid") or 0)
+        except Exception:
+            continue
+        if not pid or pid in killed_pids:
+            continue
+        ct = float(raw.get("create_time") or 0)
+        if ct > 0 and _orphan_same_identity(pid, ct):
+            report["remaining"].append(raw)
+        elif ct <= 0 and is_pid_alive(pid):
+            report["remaining"].append(raw)
+
+    return report
+
+
+def _format_ambiguous_cleanup_report(report: dict) -> str:
+    def _lines(items: List[dict], limit: int = 200) -> str:
+        if not items:
+            return "  (aucun)"
+        rows = []
+        for it in items[:limit]:
+            name = it.get("name") or it.get("basename") or "?"
+            pid = it.get("pid", "?")
+            reason = it.get("reason") or ""
+            rows.append(f"  • {name} PID {pid}" + (f" — {reason}" if reason else ""))
+        if len(items) > limit:
+            rows.append(f"  … et {len(items) - limit} autre(s)")
+        return "\n".join(rows)
+
+    killed = report.get("killed") or []
+    failed = report.get("failed") or []
+    skipped = report.get("skipped") or []
+    remaining = report.get("remaining") or []
+    return (
+        f"Terminés ({len(killed)}) :\n{_lines(killed)}\n\n"
+        f"Ignorés ({len(skipped)}) :\n{_lines(skipped)}\n\n"
+        f"Échecs ({len(failed)}) :\n{_lines(failed)}\n\n"
+        f"Ambiguës restantes ({len(remaining)}) :\n{_lines(remaining)}"
     )
 
 

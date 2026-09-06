@@ -68,3 +68,55 @@
 [2026-09-06 21:45:42.192] ERROR SnowMaster: Chargement de 2 bouton(s) depuis les préférences
 [2026-09-06 21:45:42.193] ERROR SnowMaster: Bouton chargé: title='close vidage go hdv', id='72b828a9-09a9-4c88-9b12-587376aac8db'
 [2026-09-06 21:45:42.193] ERROR SnowMaster: Bouton chargé: title='Lancer vidage', id='282d61d4-0fd3-4f45-a1c6-3a6ea4c0cab6'
+[2026-09-06 22:06:03.380] === Démarrage application ===
+[2026-09-06 22:06:04.679] ERROR SnowMaster: Chargement de 2 bouton(s) depuis les préférences
+[2026-09-06 22:06:04.679] ERROR SnowMaster: Bouton chargé: title='close vidage go hdv', id='72b828a9-09a9-4c88-9b12-587376aac8db'
+[2026-09-06 22:06:04.679] ERROR SnowMaster: Bouton chargé: title='Lancer vidage', id='282d61d4-0fd3-4f45-a1c6-3a6ea4c0cab6'
+[2026-09-06 22:06:34.732] [SCAN_PIDS] ========== Début du scan (léger) ==========
+[2026-09-06 22:06:34.732] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
+[2026-09-06 22:06:34.732] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-09-06 22:06:34.733] [SCAN_PIDS] Aucune instance active, fin du scan
+[2026-09-06 22:10:05.684] === Démarrage application ===
+[2026-09-06 22:10:06.932] ERROR SnowMaster: Chargement de 2 bouton(s) depuis les préférences
+[2026-09-06 22:10:06.932] ERROR SnowMaster: Bouton chargé: title='close vidage go hdv', id='72b828a9-09a9-4c88-9b12-587376aac8db'
+[2026-09-06 22:10:06.932] ERROR SnowMaster: Bouton chargé: title='Lancer vidage', id='282d61d4-0fd3-4f45-a1c6-3a6ea4c0cab6'
+[2026-09-06 22:10:36.982] [SCAN_PIDS] ========== Début du scan (léger) ==========
+[2026-09-06 22:10:36.987] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
+[2026-09-06 22:10:36.988] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-09-06 22:10:36.988] [SCAN_PIDS] Aucune instance active, fin du scan
+[2026-09-06 22:11:06.979] [SCAN_PIDS] ========== Début du scan (léger) ==========
+[2026-09-06 22:11:06.979] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
+[2026-09-06 22:11:06.980] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-09-06 22:11:06.980] [SCAN_PIDS] Aucune instance active, fin du scan
+[2026-09-06 22:11:36.983] [SCAN_PIDS] ========== Début du scan (léger) ==========
+[2026-09-06 22:11:36.983] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
+[2026-09-06 22:11:36.984] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-09-06 22:11:36.984] [SCAN_PIDS] Aucune instance active, fin du scan
+[2026-09-06 22:12:06.990] [SCAN_PIDS] ========== Début du scan (léger) ==========
+[2026-09-06 22:12:06.990] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
+[2026-09-06 22:12:06.991] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-09-06 22:12:06.991] [SCAN_PIDS] Aucune instance active, fin du scan
+[2026-09-06 22:12:36.978] [SCAN_PIDS] ========== Début du scan (léger) ==========
+[2026-09-06 22:12:36.978] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
+[2026-09-06 22:12:36.979] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-09-06 22:12:36.979] [SCAN_PIDS] Aucune instance active, fin du scan
+[2026-09-06 22:13:06.981] [SCAN_PIDS] ========== Début du scan (léger) ==========
+[2026-09-06 22:13:06.981] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
+[2026-09-06 22:13:06.982] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-09-06 22:13:06.982] [SCAN_PIDS] Aucune instance active, fin du scan
+[2026-09-06 22:13:36.994] [SCAN_PIDS] ========== Début du scan (léger) ==========
+[2026-09-06 22:13:36.994] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
+[2026-09-06 22:13:36.995] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-09-06 22:13:36.995] [SCAN_PIDS] Aucune instance active, fin du scan
+[2026-09-06 22:14:07.004] [SCAN_PIDS] ========== Début du scan (léger) ==========
+[2026-09-06 22:14:07.004] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
+[2026-09-06 22:14:07.005] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-09-06 22:14:07.005] [SCAN_PIDS] Aucune instance active, fin du scan
+[2026-09-06 22:14:36.999] [SCAN_PIDS] ========== Début du scan (léger) ==========
+[2026-09-06 22:14:36.999] [SCAN_PIDS] Scan léger : pas d'énumération globale des processus
+[2026-09-06 22:14:37.000] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-09-06 22:14:37.000] [SCAN_PIDS] Aucune instance active, fin du scan
+[2026-09-06 22:15:06.994] [SCAN_PIDS] ========== Début du scan (complet) ==========
+[2026-09-06 22:15:06.997] [SCAN_PIDS] 0 processus AnkaBot trouvés (scan complet)
+[2026-09-06 22:15:06.998] [SCAN_PIDS] 0 instances actives à vérifier
+[2026-09-06 22:15:06.998] [SCAN_PIDS] Aucune instance active, fin du scan
