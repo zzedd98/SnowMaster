@@ -3559,6 +3559,7 @@ class EventBus(QObject):
     )  # <--- AJOUT (success, count, error_message)
     reset_instance = Signal(str)
     goodbye_kill = Signal(str)  # NEW
+    orphan_cleanup_finished = Signal(object)  # rapport dict du nettoyage orphelins
 
 
 bus = EventBus()
@@ -8701,9 +8702,10 @@ class SnowMasterGUI(QWidget):
         self.btn_all_reload.clicked.connect(self.on_bulk_reload)
         self.btn_all_kill.clicked.connect(self.on_bulk_kill)
         self.btn_clean.setToolTip(
-            "Force la fermeture de tous les processus Application_v2.0.exe"
+            "Nettoyer les processus orphelins (Application_v2 / Chrome abandonnés).\n"
+            "Exécuté uniquement à la demande — ne touche pas aux instances actives."
         )
-        self.btn_clean.clicked.connect(self.on_clean_application)
+        self.btn_clean.clicked.connect(self.on_clean_orphans)
         self.btn_all_del.clicked.connect(self.on_bulk_delete)
 
         # Toggles panneaux (config centrale / droite)
@@ -9445,6 +9447,7 @@ class SnowMasterGUI(QWidget):
         # NOUVEAU : reset => kill + relaunch
         bus.reset_instance.connect(self.on_bus_reset_instance)
         bus.goodbye_kill.connect(self.on_bus_goodbye_kill)  # NEW
+        bus.orphan_cleanup_finished.connect(self._on_orphan_cleanup_finished)
 
         # connect bus signal pour recevoir les mises à jour venant de Flask / fetch
         bus.revenue_updated.connect(self._on_revenue_updated)
@@ -11573,32 +11576,74 @@ class SnowMasterGUI(QWidget):
             self.on_card_kill(t)
         self.update_global_dot()
 
-    def on_clean_application(self):
-        """Force la fermeture de tous les processus Application_v2.0.exe."""
+    def on_clean_orphans(self):
+        """Nettoyage orphelins : uniquement à la demande (pas de tâche périodique)."""
+        if getattr(self, "_orphan_cleanup_running", False):
+            return
+        if not self._ask(
+            "Nettoyer les processus orphelins",
+            "Rechercher et terminer les Application_v2.0.exe (et Chrome associés)\n"
+            "sans propriétaire AnkaBot/SnowBot actif ?\n\n"
+            "Les instances encore actives et leurs processus ne seront pas touchés.\n"
+            "Les cas ambigus seront signalés sans suppression.",
+        ):
+            return
+
+        self._orphan_cleanup_running = True
+        try:
+            self.btn_clean.setEnabled(False)
+            self.btn_clean.setText("🧹 …")
+        except Exception:
+            pass
 
         def _worker():
+            report = None
+            err = None
             try:
-                flags = 0
-                if hasattr(subprocess, "CREATE_NO_WINDOW"):
-                    flags = subprocess.CREATE_NO_WINDOW
-                result = subprocess.run(
-                    ["taskkill", "/F", "/IM", "Application_v2.0.exe", "/T"],
-                    capture_output=True,
-                    text=True,
-                    creationflags=flags,
-                )
-                msg = (result.stderr or result.stdout or "").strip()
-                if result.returncode == 0:
-                    print("[Clean] Application_v2.0.exe terminé(s).")
-                else:
-                    print(
-                        f"[Clean] taskkill (code {result.returncode}): "
-                        f"{msg or 'aucun processus trouvé'}"
-                    )
+                report = cleanup_orphan_processes()
+                try:
+                    print("[Orphelins]\n" + _format_orphan_cleanup_report(report))
+                except Exception:
+                    pass
             except Exception as e:
-                print(f"[Clean] Erreur: {e}")
+                err = str(e)
+                app_log_error(f"[Orphelins] Erreur: {e}")
+            finally:
+                bus.orphan_cleanup_finished.emit(
+                    {"report": report, "error": err}
+                )
 
         self._run_async(_worker)
+
+    def _on_orphan_cleanup_finished(self, payload):
+        self._orphan_cleanup_running = False
+        try:
+            self.btn_clean.setEnabled(True)
+            self.btn_clean.setText("🧹 Orphelins")
+        except Exception:
+            pass
+        payload = payload or {}
+        err = payload.get("error")
+        report = payload.get("report")
+        if err:
+            QMessageBox.warning(
+                self,
+                "Nettoyer les processus orphelins",
+                f"Erreur pendant le nettoyage :\n{err}",
+            )
+            return
+        if not isinstance(report, dict):
+            QMessageBox.information(
+                self,
+                "Nettoyer les processus orphelins",
+                "Nettoyage terminé (aucun détail).",
+            )
+            return
+        QMessageBox.information(
+            self,
+            "Nettoyer les processus orphelins",
+            _format_orphan_cleanup_report(report),
+        )
 
     def on_bulk_delete(self):
         with _state_lock:
@@ -15602,6 +15647,516 @@ def terminate_process_tree(pid: int, timeout: float = 5.0):
             p.kill()
         except Exception:
             pass
+
+
+# ===================== NETTOYAGE ORPHELINS (bouton uniquement) ======================
+_ORPHAN_CT_TOL = 1.0  # tolérance create_time (PID recyclé)
+_APPLICATION_V2_NAMES = frozenset(
+    {"application_v2.0.exe", "application_v2.exe"}
+)
+_CHROME_NAMES = frozenset({"chrome.exe"})
+
+
+def _orphan_norm_basename(path_or_name: Optional[str]) -> str:
+    s = (path_or_name or "").strip()
+    if not s:
+        return ""
+    try:
+        return os.path.basename(s).lower()
+    except Exception:
+        return s.lower()
+
+
+def _orphan_proc_info(proc: psutil.Process) -> Optional[dict]:
+    """Snapshot pid / create_time / exe / parent — identité anti-recyclage PID."""
+    try:
+        with proc.oneshot():
+            pid = int(proc.pid)
+            try:
+                ct = float(proc.create_time())
+            except Exception:
+                ct = 0.0
+            try:
+                name = (proc.name() or "").strip()
+            except Exception:
+                name = ""
+            try:
+                exe = (proc.exe() or "").strip()
+            except Exception:
+                exe = ""
+            try:
+                ppid = int(proc.ppid() or 0)
+            except Exception:
+                ppid = 0
+        return {
+            "pid": pid,
+            "create_time": ct,
+            "name": name,
+            "exe": exe,
+            "ppid": ppid,
+            "basename": _orphan_norm_basename(exe) or _orphan_norm_basename(name),
+        }
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return None
+    except Exception:
+        return None
+
+
+def _orphan_same_identity(pid: int, create_time: float) -> bool:
+    if not pid or create_time <= 0:
+        return is_pid_alive(pid)
+    try:
+        p = psutil.Process(int(pid))
+        return abs(float(p.create_time()) - float(create_time)) <= _ORPHAN_CT_TOL
+    except Exception:
+        return False
+
+
+def _orphan_client_basenames() -> set:
+    names = set()
+    base = _get_configured_client_basename()
+    if base:
+        names.add(base)
+    for n in (APP_EXE_NAME, "AnkaBot", "SnowBot"):
+        s = str(n or "").strip().lower()
+        if not s:
+            continue
+        names.add(s if s.endswith(".exe") else f"{s}.exe")
+    names.update({"ankabot.exe", "snowbot.exe"})
+    return {n for n in names if n}
+
+
+def _orphan_is_client(info: dict, client_names: set) -> bool:
+    b = (info.get("basename") or "").lower()
+    n = _orphan_norm_basename(info.get("name"))
+    return b in client_names or n in client_names
+
+
+def _orphan_is_app_v2(info: dict) -> bool:
+    b = (info.get("basename") or "").lower()
+    n = _orphan_norm_basename(info.get("name"))
+    return b in _APPLICATION_V2_NAMES or n in _APPLICATION_V2_NAMES
+
+
+def _orphan_is_chrome(info: dict) -> bool:
+    b = (info.get("basename") or "").lower()
+    n = _orphan_norm_basename(info.get("name"))
+    return b in _CHROME_NAMES or n in _CHROME_NAMES
+
+
+def _orphan_collect_live_clients() -> List[dict]:
+    """Clients AnkaBot/SnowBot réellement actifs (pas seulement l'UI SnowMaster)."""
+    client_names = _orphan_client_basenames()
+    out: List[dict] = []
+    me = os.getpid()
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            pid = p.info.get("pid")
+            if not pid or pid == me:
+                continue
+            name = (p.info.get("name") or "").lower()
+            if name not in client_names and _orphan_norm_basename(name) not in client_names:
+                # filtre rapide : évite d'ouvrir chaque processus
+                if "anka" not in name and "snowbot" not in name:
+                    continue
+            info = _orphan_proc_info(p)
+            if not info:
+                continue
+            # Ne jamais prendre le master GUI pour un client
+            bn = info["basename"]
+            if any(tok in bn for tok in MASTER_GUI_NAME_TOKENS):
+                continue
+            if not _orphan_is_client(info, client_names):
+                continue
+            out.append(info)
+        except Exception:
+            continue
+    return out
+
+
+def _orphan_registry_clients() -> List[dict]:
+    """PIDs du registre SnowMaster encore vivants, avec create_time."""
+    snap: List[Tuple[str, int]] = []
+    with _state_lock:
+        for title, inst in _instances.items():
+            try:
+                pid = int(getattr(inst, "pid", 0) or 0)
+            except Exception:
+                pid = 0
+            if pid:
+                snap.append((title, pid))
+    out: List[dict] = []
+    client_names = _orphan_client_basenames()
+    for title, pid in snap:
+        try:
+            info = _orphan_proc_info(psutil.Process(pid))
+        except Exception:
+            info = None
+        if not info:
+            continue
+        # Accepte le PID enregistré s'il ressemble au client OU s'il est juste vivant
+        # (pendant un lancement le PID peut être le launcher).
+        info = dict(info)
+        info["title"] = title
+        info["from_registry"] = True
+        if _orphan_is_client(info, client_names) or info.get("basename"):
+            out.append(info)
+    return out
+
+
+def _orphan_tree_pids(root_pid: int) -> set:
+    pids = {int(root_pid)}
+    try:
+        root = psutil.Process(int(root_pid))
+        for ch in root.children(recursive=True):
+            try:
+                pids.add(int(ch.pid))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return pids
+
+
+def _orphan_walk_owner_client(
+    info: dict, by_pid: Dict[int, dict], client_names: set, max_depth: int = 8
+) -> Optional[dict]:
+    """Remonte la parenté ; valide create_time pour détecter un PID recyclé."""
+    cur = info
+    for _ in range(max_depth):
+        ppid = int(cur.get("ppid") or 0)
+        if not ppid or ppid == cur.get("pid"):
+            return None
+        parent = by_pid.get(ppid)
+        if parent is None:
+            try:
+                parent = _orphan_proc_info(psutil.Process(ppid))
+            except Exception:
+                parent = None
+            if parent:
+                by_pid[ppid] = parent
+        if not parent:
+            return None
+        # Parent démarré après l'enfant → PID parent recyclé, chaîne invalide
+        ct_c = float(cur.get("create_time") or 0)
+        ct_p = float(parent.get("create_time") or 0)
+        if ct_c > 0 and ct_p > 0 and ct_p > ct_c + _ORPHAN_CT_TOL:
+            return None
+        if _orphan_is_client(parent, client_names):
+            return parent
+        cur = parent
+    return None
+
+
+def _orphan_kill_tree_verified(root_info: dict, timeout: float = 4.0) -> Tuple[List[dict], List[dict]]:
+    """
+    Tue root + descendants si l'identité (pid, create_time) est toujours valide.
+    Retourne (killed, failed).
+    """
+    killed: List[dict] = []
+    failed: List[dict] = []
+    pid = int(root_info.get("pid") or 0)
+    ct = float(root_info.get("create_time") or 0)
+    if not pid:
+        return killed, failed
+    if ct > 0 and not _orphan_same_identity(pid, ct):
+        failed.append(
+            {
+                **root_info,
+                "reason": "identité PID/create_time invalide (processus recyclé ou déjà mort)",
+            }
+        )
+        return killed, failed
+
+    targets: List[dict] = []
+    try:
+        proc = psutil.Process(pid)
+        root_now = _orphan_proc_info(proc)
+        if not root_now:
+            failed.append({**root_info, "reason": "processus déjà terminé"})
+            return killed, failed
+        if ct > 0 and abs(float(root_now["create_time"]) - ct) > _ORPHAN_CT_TOL:
+            failed.append({**root_info, "reason": "PID recyclé avant kill"})
+            return killed, failed
+        targets.append(root_now)
+        try:
+            for ch in proc.children(recursive=True):
+                ci = _orphan_proc_info(ch)
+                if ci:
+                    targets.append(ci)
+        except Exception:
+            pass
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        failed.append({**root_info, "reason": "accès refusé ou déjà mort"})
+        return killed, failed
+
+    # terminate puis kill si besoin
+    live_procs = []
+    for t in targets:
+        try:
+            p = psutil.Process(int(t["pid"]))
+            live_procs.append(p)
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        except Exception:
+            pass
+    try:
+        gone, alive = psutil.wait_procs(live_procs, timeout=timeout)
+    except Exception:
+        gone, alive = [], live_procs
+    for p in alive:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    try:
+        psutil.wait_procs(alive, timeout=1.5)
+    except Exception:
+        pass
+
+    for t in targets:
+        still = _orphan_same_identity(int(t["pid"]), float(t.get("create_time") or 0))
+        if still and is_pid_alive(t["pid"]):
+            failed.append({**t, "reason": "n'a pas pu être terminé"})
+        else:
+            killed.append(t)
+    return killed, failed
+
+
+def cleanup_orphan_processes() -> dict:
+    """
+    Nettoyage ponctuel (appelé UNIQUEMENT par le bouton) :
+      1) Application_v2.0.exe sans client AnkaBot/SnowBot propriétaire encore actif
+         → terminer le processus et ses descendants.
+      2) Chrome dont le lanceur Application_v2 a disparu : ne supprimer que si
+         l'appartenance au client est confirmée via la parenté observée au moment
+         du scan (sinon signaler sans tuer). Aucun suivi permanent en arrière-plan.
+    Ne tue jamais chrome/node/python « en masse » par nom.
+    """
+    report = {
+        "killed": [],
+        "ignored": [],
+        "ambiguous": [],
+        "failed": [],
+        "protected_clients": 0,
+        "scanned_app_v2": 0,
+        "scanned_chrome": 0,
+    }
+
+    client_names = _orphan_client_basenames()
+    by_pid: Dict[int, dict] = {}
+
+    # --- Clients protégés : registre SnowMaster + processus clients réellement actifs ---
+    protected_roots: List[dict] = []
+    seen_root = set()
+    for info in _orphan_registry_clients() + _orphan_collect_live_clients():
+        key = (info["pid"], round(float(info.get("create_time") or 0), 3))
+        if key in seen_root:
+            continue
+        seen_root.add(key)
+        protected_roots.append(info)
+        by_pid[info["pid"]] = info
+
+    protected_pids: set = set()
+    for root in protected_roots:
+        protected_pids |= _orphan_tree_pids(root["pid"])
+    report["protected_clients"] = len(protected_roots)
+
+    # --- Snapshot Application_v2 + chrome (filtre nom, pas de kill global) ---
+    app_v2_list: List[dict] = []
+    chrome_list: List[dict] = []
+    me = os.getpid()
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            pid = p.info.get("pid")
+            if not pid or pid == me:
+                continue
+            lname = (p.info.get("name") or "").lower()
+            if lname not in _APPLICATION_V2_NAMES and lname not in _CHROME_NAMES:
+                continue
+            info = _orphan_proc_info(p)
+            if not info:
+                continue
+            by_pid[info["pid"]] = info
+            if _orphan_is_app_v2(info):
+                app_v2_list.append(info)
+            elif _orphan_is_chrome(info):
+                chrome_list.append(info)
+        except Exception:
+            continue
+
+    report["scanned_app_v2"] = len(app_v2_list)
+    report["scanned_chrome"] = len(chrome_list)
+
+    # Mapping App_v2 vivants → owner client (pour confirmer chrome enfants)
+    app_v2_owned: Dict[int, dict] = {}  # app_v2 pid -> owner client info
+    orphan_app_v2: List[dict] = []
+
+    for app in app_v2_list:
+        pid = app["pid"]
+        if pid in protected_pids:
+            owner = _orphan_walk_owner_client(app, by_pid, client_names)
+            if owner:
+                app_v2_owned[pid] = owner
+            report["ignored"].append(
+                {
+                    **app,
+                    "reason": "sous une instance / client encore actif (protégé)",
+                }
+            )
+            continue
+        owner = _orphan_walk_owner_client(app, by_pid, client_names)
+        if owner and owner["pid"] in protected_pids:
+            app_v2_owned[pid] = owner
+            protected_pids |= _orphan_tree_pids(pid)
+            report["ignored"].append(
+                {
+                    **app,
+                    "reason": f"propriétaire client PID {owner['pid']} encore actif",
+                }
+            )
+            continue
+        if owner and _orphan_same_identity(owner["pid"], owner.get("create_time") or 0):
+            # Client vivant hors registre mais détecté par parenté
+            app_v2_owned[pid] = owner
+            protected_pids |= _orphan_tree_pids(owner["pid"])
+            protected_pids |= _orphan_tree_pids(pid)
+            report["ignored"].append(
+                {
+                    **app,
+                    "reason": f"propriétaire client PID {owner['pid']} vivant (détecté)",
+                }
+            )
+            continue
+        orphan_app_v2.append(app)
+
+    # 1) Tuer les Application_v2 orphelins (+ descendants, dont Chrome encore rattachés)
+    killed_pids = set()
+    for app in orphan_app_v2:
+        k, f = _orphan_kill_tree_verified(app)
+        for item in k:
+            item["reason"] = (
+                f"Application_v2 orphelin (pas de {APP_EXE_NAME} propriétaire actif)"
+            )
+            report["killed"].append(item)
+            killed_pids.add(item["pid"])
+            protected_pids.discard(item["pid"])
+        for item in f:
+            report["failed"].append(item)
+
+    # 2) Chrome dont le parent Application_v2 a disparu
+    #    Confirmation uniquement via parenté / identité observée à cet instant
+    #    (pas de registre permanent en arrière-plan).
+    for ch in chrome_list:
+        if ch["pid"] in killed_pids:
+            continue
+        if ch["pid"] in protected_pids:
+            report["ignored"].append(
+                {**ch, "reason": "Chrome rattaché à une instance / client actif"}
+            )
+            continue
+        # Enfant d'un App_v2 encore vivant ?
+        parent = by_pid.get(int(ch.get("ppid") or 0))
+        if parent is None and ch.get("ppid"):
+            try:
+                parent = _orphan_proc_info(psutil.Process(int(ch["ppid"])))
+                if parent:
+                    by_pid[parent["pid"]] = parent
+            except Exception:
+                parent = None
+
+        if parent and _orphan_is_app_v2(parent):
+            # Parent App_v2 vivant : soit déjà traité (tué), soit protégé
+            if parent["pid"] in killed_pids:
+                continue  # déjà tué avec l'arbre
+            if parent["pid"] in app_v2_owned or parent["pid"] in protected_pids:
+                report["ignored"].append(
+                    {
+                        **ch,
+                        "reason": f"lanceur Application_v2 PID {parent['pid']} encore actif / protégé",
+                    }
+                )
+                continue
+            # Parent App_v2 vivant mais orphelin non encore dans killed ? normalement déjà tué
+            report["ignored"].append(
+                {
+                    **ch,
+                    "reason": f"toujours sous Application_v2 PID {parent['pid']}",
+                }
+            )
+            continue
+
+        if parent and _orphan_is_chrome(parent):
+            # Sous-processus Chrome : géré avec le chrome principal s'il est orphelin
+            report["ignored"].append(
+                {**ch, "reason": "sous-processus Chrome (géré avec le navigateur parent)"}
+            )
+            continue
+
+        if parent and _orphan_is_client(parent, client_names):
+            report["ignored"].append(
+                {
+                    **ch,
+                    "reason": f"parent client {APP_EXE_NAME} PID {parent['pid']} encore actif",
+                }
+            )
+            continue
+
+        # Parent disparu ou recyclé : sans suivi préalable, appartenance Ambiguë
+        # Tentative de confirmation : ancêtre client encore visible dans la chaîne
+        owner = _orphan_walk_owner_client(ch, by_pid, client_names)
+        if owner and _orphan_same_identity(owner["pid"], owner.get("create_time") or 0):
+            report["ignored"].append(
+                {
+                    **ch,
+                    "reason": f"client propriétaire PID {owner['pid']} encore actif — non touché",
+                }
+            )
+            continue
+
+        # Confirmation forte impossible sans historique de lancement → signaler seulement
+        report["ambiguous"].append(
+            {
+                **ch,
+                "reason": (
+                    "lanceur Application_v2 absent / parenté rompue — "
+                    "appartenance AnkaBot non confirmable sans suivi préalable ; non supprimé"
+                ),
+            }
+        )
+
+    return report
+
+
+def _format_orphan_cleanup_report(report: dict) -> str:
+    def _lines(items: List[dict], limit: int = 40) -> str:
+        if not items:
+            return "  (aucun)"
+        rows = []
+        for it in items[:limit]:
+            name = it.get("name") or it.get("basename") or "?"
+            pid = it.get("pid", "?")
+            reason = it.get("reason") or ""
+            rows.append(f"  • {name} PID {pid}" + (f" — {reason}" if reason else ""))
+        if len(items) > limit:
+            rows.append(f"  … et {len(items) - limit} autre(s)")
+        return "\n".join(rows)
+
+    killed = report.get("killed") or []
+    ignored = report.get("ignored") or []
+    ambiguous = report.get("ambiguous") or []
+    failed = report.get("failed") or []
+    return (
+        f"Clients protégés : {report.get('protected_clients', 0)}\n"
+        f"Application_v2 scannés : {report.get('scanned_app_v2', 0)} | "
+        f"Chrome scannés : {report.get('scanned_chrome', 0)}\n\n"
+        f"Terminés ({len(killed)}) :\n{_lines(killed)}\n\n"
+        f"Ignorés / protégés ({len(ignored)}) :\n{_lines(ignored)}\n\n"
+        f"Ambiguës (non touchées) ({len(ambiguous)}) :\n{_lines(ambiguous)}\n\n"
+        f"Échecs ({len(failed)}) :\n{_lines(failed)}"
+    )
 
 
 def restore_running_instances_from_cmdline():
