@@ -498,8 +498,6 @@ DEFAULT_PREFS = {
     "reddot": 480,  # Heartbeat timeout par défaut : 8 minutes
     # Écran pour "mettre au premier plan" : 1 = tout à gauche, 2 = suivant à droite, etc.
     "screen_to_use": 1,
-    # Hauteur (px) appliquée à la fenêtre instance lors de « Mettre au premier plan »
-    "focus_window_height": 900,
     # Fichier panic.txt pour le bouton Panic TS (chemin complet)
     "panic_file": "",
     # Icônes UI : noms de fichiers sous SnowMaster/images/ (ex: "play.png") ou chemin absolu
@@ -565,40 +563,6 @@ def screen_to_use() -> int:
         return max(1, int(_prefs.get("screen_to_use", 1)))
     except Exception:
         return 1
-
-
-# Hauteur mini sûre pour les fenêtres client (AnkaBot/SnowBot) au premier plan.
-# En dessous, l'UI du client risque d'être tronquée / inutilisable.
-FOCUS_WINDOW_HEIGHT_MIN = 700
-FOCUS_WINDOW_HEIGHT_DEFAULT = 900
-
-
-def focus_window_height_pref() -> int:
-    """Hauteur configurée pour « Mettre au premier plan » (jamais sous le minimum)."""
-    try:
-        h = int(_prefs.get("focus_window_height", FOCUS_WINDOW_HEIGHT_DEFAULT))
-    except Exception:
-        h = FOCUS_WINDOW_HEIGHT_DEFAULT
-    if h < FOCUS_WINDOW_HEIGHT_MIN:
-        return FOCUS_WINDOW_HEIGHT_MIN
-    return h
-
-
-def resolve_focus_window_height(monitor_height: int) -> int:
-    """
-    Hauteur effective à appliquer : max(config, MIN), plafonnée à l'écran.
-    Ne force jamais une taille plus grande que l'écran disponible.
-    """
-    desired = focus_window_height_pref()
-    try:
-        usable = max(1, int(monitor_height) - 8)
-    except Exception:
-        usable = desired
-    target = max(FOCUS_WINDOW_HEIGHT_MIN, int(desired))
-    if usable < FOCUS_WINDOW_HEIGHT_MIN:
-        # Écran trop petit : on prend tout ce qui est utilisable, sans imposer le MIN
-        return usable
-    return min(target, usable)
 
 
 def hb_history_storage_enabled() -> bool:
@@ -2921,12 +2885,11 @@ def match_autopilot_schedule(prefs: dict) -> Optional[dict]:
 
 # ======================= WIN32 UTILS ======================
 def bring_to_front(hwnd):
-    """Met la fenêtre au premier plan sur l'écran configuré, avec la hauteur configurée."""
+    """Met la fenêtre au premier plan sur l'écran configuré (screen_to_use)."""
     try:
         monitor = get_monitor_by_screen_number(screen_to_use())
         screen_left = monitor["left"]
         screen_top = monitor["top"]
-        screen_height = int(monitor.get("height") or 0)
 
         # Placer au coin en haut à gauche de l'écran choisi
         x = screen_left
@@ -2936,34 +2899,16 @@ def bring_to_front(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         time.sleep(0.05)
 
-        # Largeur actuelle conservée ; hauteur = préférence (clampée au min / écran)
-        try:
-            rect = win32gui.GetWindowRect(hwnd)
-            width = max(1, int(rect[2] - rect[0]))
-        except Exception:
-            width = 0
-        target_h = resolve_focus_window_height(screen_height)
-
-        if width > 0 and target_h > 0:
-            win32gui.SetWindowPos(
-                hwnd,
-                win32con.HWND_TOP,
-                x,
-                y,
-                width,
-                target_h,
-                win32con.SWP_SHOWWINDOW,
-            )
-        else:
-            win32gui.SetWindowPos(
-                hwnd,
-                win32con.HWND_TOP,
-                x,
-                y,
-                0,
-                0,
-                win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW,
-            )
+        # Déplacer vers l'écran choisi
+        win32gui.SetWindowPos(
+            hwnd,
+            win32con.HWND_TOP,
+            x,
+            y,
+            0,
+            0,
+            win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW,
+        )
 
         # Mettre au premier plan
         win32gui.SetForegroundWindow(hwnd)
@@ -9316,22 +9261,6 @@ class SnowMasterGUI(QWidget):
         )
         self.spin_screen_to_use.valueChanged.connect(self.on_change_screen_to_use)
 
-        self.spin_focus_window_height = CustomSpinBox(
-            self,
-            min_value=FOCUS_WINDOW_HEIGHT_MIN,
-            max_value=2160,
-            initial_value=focus_window_height_pref(),
-            suffix=" px",
-        )
-        self.spin_focus_window_height.setToolTip(
-            "Hauteur de la fenêtre instance lors de « Mettre au premier plan ».\n"
-            f"Minimum sûr : {FOCUS_WINDOW_HEIGHT_MIN} px (évite de casser l'UI du client).\n"
-            "La hauteur est aussi plafonnée à celle de l'écran."
-        )
-        self.spin_focus_window_height.valueChanged.connect(
-            self.on_change_focus_window_height
-        )
-
         # ComboBox : Mode pour le chargement d'une config (load_only / load_and_launch)
         self.chk_instance_launch = QCheckBox("Load and launch")
         self.chk_instance_launch.setChecked(str(default_inst_mode) == "load_and_launch")
@@ -9438,7 +9367,6 @@ class SnowMasterGUI(QWidget):
         _add_spin_row("Délai reddot (min. 60s)", self.spin_reddot)
         _add_spin_row("Délai relance reddot (s)", self.spin_reddot_relaunch_delay)
         _add_spin_row("Écran premier plan", self.spin_screen_to_use)
-        _add_spin_row("Hauteur premier plan", self.spin_focus_window_height)
         # inst_group_collapsible.addWidget(self.chk_instance_launch)
 
         ap_group_collapsible = CollapsibleGroupBox("Autopilote")
@@ -13742,23 +13670,6 @@ class SnowMasterGUI(QWidget):
         _prefs["screen_to_use"] = n
         save_prefs(_prefs)
         app_log_info(f"Écran premier plan mis à jour : {n}")
-
-    def on_change_focus_window_height(self, value: int):
-        """Met à jour la hauteur appliquée lors de « Mettre au premier plan »."""
-        h = int(value)
-        if h < FOCUS_WINDOW_HEIGHT_MIN:
-            h = FOCUS_WINDOW_HEIGHT_MIN
-            try:
-                self.spin_focus_window_height.blockSignals(True)
-                self.spin_focus_window_height.setValue(h)
-            finally:
-                try:
-                    self.spin_focus_window_height.blockSignals(False)
-                except Exception:
-                    pass
-        _prefs["focus_window_height"] = h
-        save_prefs(_prefs)
-        app_log_info(f"Hauteur premier plan mise à jour : {h}px")
 
     def on_change_reddot_relaunch_delay(self, value: int):
         """Met à jour le délai avant reset auto d'une instance en reddot."""
