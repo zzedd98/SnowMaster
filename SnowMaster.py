@@ -7239,6 +7239,7 @@ class OrphanCleanupResultDialog(QDialog):
 
     stale_chrome_finished = Signal(object)
     ambiguous_finished = Signal(object)
+    all_chrome_finished = Signal(object)
     refresh_finished = Signal(object)
 
     def __init__(self, parent, report: dict):
@@ -7249,9 +7250,11 @@ class OrphanCleanupResultDialog(QDialog):
         self._report = report if isinstance(report, dict) else {}
         self._chrome_busy = False
         self._ambiguous_busy = False
+        self._all_chrome_busy = False
         self._refresh_busy = False
         self.stale_chrome_finished.connect(self._on_stale_chrome_finished)
         self.ambiguous_finished.connect(self._on_ambiguous_finished)
+        self.all_chrome_finished.connect(self._on_all_chrome_finished)
         self.refresh_finished.connect(self._on_refresh_finished)
 
         root = QVBoxLayout(self)
@@ -7287,7 +7290,7 @@ class OrphanCleanupResultDialog(QDialog):
         self.btn_refresh.setCursor(Qt.PointingHandCursor)
         self.btn_refresh.setMinimumWidth(130)
         self.btn_refresh.setToolTip(
-            "Relance le scan Clean pour mettre à jour la liste."
+            "Rescanne les process vivants et remplace toute la liste."
         )
         self.btn_refresh.clicked.connect(self._on_refresh)
 
@@ -7309,9 +7312,20 @@ class OrphanCleanupResultDialog(QDialog):
         )
         self.btn_ambiguous.clicked.connect(self._on_clean_ambiguous)
 
+        self.btn_all_chrome = QPushButton("Clean tous\nChrome")
+        self.btn_all_chrome.setCursor(Qt.PointingHandCursor)
+        self.btn_all_chrome.setMinimumWidth(130)
+        self.btn_all_chrome.setToolTip(
+            "Termine TOUS les Chrome liés aux instances\n"
+            "(y compris protégés) + les ambiguës.\n"
+            "Ne touche pas AnkaBot / Application_v2."
+        )
+        self.btn_all_chrome.clicked.connect(self._on_clean_all_chrome)
+
         side.addWidget(self.btn_refresh, 0, Qt.AlignTop)
         side.addWidget(self.btn_stale_chrome, 0, Qt.AlignTop)
         side.addWidget(self.btn_ambiguous, 0, Qt.AlignTop)
+        side.addWidget(self.btn_all_chrome, 0, Qt.AlignTop)
         side.addStretch(1)
         body.addLayout(side, 0)
 
@@ -7328,7 +7342,12 @@ class OrphanCleanupResultDialog(QDialog):
         self._apply_report(self._report)
 
     def _any_busy(self) -> bool:
-        return self._chrome_busy or self._ambiguous_busy or self._refresh_busy
+        return (
+            self._chrome_busy
+            or self._ambiguous_busy
+            or self._all_chrome_busy
+            or self._refresh_busy
+        )
 
     def _update_action_buttons(self):
         busy = self._any_busy()
@@ -7337,6 +7356,7 @@ class OrphanCleanupResultDialog(QDialog):
         self.btn_refresh.setEnabled(not busy)
         self.btn_stale_chrome.setEnabled(bool(stale) and not busy)
         self.btn_ambiguous.setEnabled(bool(ambiguous) and not busy)
+        self.btn_all_chrome.setEnabled(not busy)
         if not stale:
             self.btn_stale_chrome.setToolTip(
                 "Aucun Chrome > 3 min détecté sous les instances lors du scan."
@@ -7354,7 +7374,7 @@ class OrphanCleanupResultDialog(QDialog):
                 "(ex. Chrome sans lanceur Application_v2 confirmé)."
             )
 
-    def _apply_report(self, report: dict):
+    def _apply_report(self, report: dict, header: str = ""):
         self._report = report if isinstance(report, dict) else {}
         stale = self._report.get("stale_chrome") or []
         ambiguous = self._report.get("ambiguous") or []
@@ -7365,7 +7385,15 @@ class OrphanCleanupResultDialog(QDialog):
             f"Chrome > 3 min : {len(stale)}    |    "
             f"Ambiguës : {len(ambiguous)}"
         )
-        self.txt.setPlainText(_format_orphan_cleanup_report(self._report))
+        body = _format_orphan_cleanup_report(self._report)
+        if header:
+            body = header.rstrip() + "\n\n" + body
+        self.txt.setPlainText(body)
+        # Remonter en haut pour voir Chrome > 3 min / Ambiguës
+        try:
+            self.txt.verticalScrollBar().setValue(0)
+        except Exception:
+            pass
         self._update_action_buttons()
 
     def _on_refresh(self):
@@ -7374,6 +7402,7 @@ class OrphanCleanupResultDialog(QDialog):
         self._refresh_busy = True
         self._update_action_buttons()
         self.btn_refresh.setText("…")
+        self.txt.setPlainText("Scan en cours…")
 
         def _worker():
             report = None
@@ -7382,21 +7411,28 @@ class OrphanCleanupResultDialog(QDialog):
                 report = cleanup_orphan_processes()
             except Exception as e:
                 err = str(e)
-            self.refresh_finished.emit({"report": report, "error": err})
+            self.refresh_finished.emit({"report": report, "error": err, "header": ""})
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_refresh_finished(self, payload):
         self._refresh_busy = False
+        self._chrome_busy = False
+        self._ambiguous_busy = False
+        self._all_chrome_busy = False
         self.btn_refresh.setText("Refresh")
+        self.btn_stale_chrome.setText("Clean Chrome\n> 3 min")
+        self.btn_ambiguous.setText("Clean ambiguës")
+        self.btn_all_chrome.setText("Clean tous\nChrome")
         payload = payload or {}
         err = payload.get("error")
         report = payload.get("report")
+        header = payload.get("header") or ""
         if err:
             QMessageBox.warning(self, "Refresh", f"Erreur :\n{err}")
             self._update_action_buttons()
             return
-        self._apply_report(report if isinstance(report, dict) else {})
+        self._apply_report(report if isinstance(report, dict) else {}, header=header)
 
     def _on_clean_stale_chrome(self):
         if self._any_busy():
@@ -7406,40 +7442,32 @@ class OrphanCleanupResultDialog(QDialog):
         self.btn_stale_chrome.setText("Clean…")
 
         def _worker():
-            report = None
+            kill_report = None
             err = None
             try:
-                report = cleanup_stale_chrome_processes(min_age_s=STALE_CHROME_AGE_S)
+                kill_report = cleanup_stale_chrome_processes(min_age_s=STALE_CHROME_AGE_S)
+                header = (
+                    "—— Clean Chrome > 3 min ——\n"
+                    + _format_stale_chrome_report(kill_report or {})
+                )
+                time.sleep(0.25)
+                report = cleanup_orphan_processes()
+                self.refresh_finished.emit(
+                    {"report": report, "error": None, "header": header}
+                )
             except Exception as e:
                 err = str(e)
-            self.stale_chrome_finished.emit({"report": report, "error": err})
+                self.stale_chrome_finished.emit({"error": err})
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_stale_chrome_finished(self, payload):
+        # Erreur uniquement (succès passe par refresh_finished)
         self._chrome_busy = False
         self.btn_stale_chrome.setText("Clean Chrome\n> 3 min")
-        payload = payload or {}
-        err = payload.get("error")
-        report = payload.get("report")
+        err = (payload or {}).get("error")
         if err:
             QMessageBox.warning(self, "Clean Chrome > 3 min", f"Erreur :\n{err}")
-            self._update_action_buttons()
-            return
-        if not isinstance(report, dict):
-            report = {}
-        self.txt.append(
-            "\n\n—— Clean Chrome > 3 min ——\n" + _format_stale_chrome_report(report)
-        )
-        remaining = report.get("remaining_stale") or []
-        self._report["stale_chrome"] = remaining
-        self.lbl_summary.setText(
-            f"Clients protégés : {self._report.get('protected_clients', 0)}    |    "
-            f"Application_v2 : {self._report.get('scanned_app_v2', 0)}    |    "
-            f"Chrome : {self._report.get('scanned_chrome', 0)}    |    "
-            f"Chrome > 3 min : {len(remaining)}    |    "
-            f"Ambiguës : {len(self._report.get('ambiguous') or [])}"
-        )
         self._update_action_buttons()
 
     def _on_clean_ambiguous(self):
@@ -7453,40 +7481,60 @@ class OrphanCleanupResultDialog(QDialog):
         self.btn_ambiguous.setText("Clean…")
 
         def _worker():
-            report = None
-            err = None
             try:
-                report = cleanup_ambiguous_processes(items)
+                kill_report = cleanup_ambiguous_processes(items)
+                header = (
+                    "—— Clean ambiguës ——\n"
+                    + _format_ambiguous_cleanup_report(kill_report or {})
+                )
+                time.sleep(0.25)
+                report = cleanup_orphan_processes()
+                self.refresh_finished.emit(
+                    {"report": report, "error": None, "header": header}
+                )
             except Exception as e:
-                err = str(e)
-            self.ambiguous_finished.emit({"report": report, "error": err})
+                self.ambiguous_finished.emit({"error": str(e)})
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_ambiguous_finished(self, payload):
         self._ambiguous_busy = False
         self.btn_ambiguous.setText("Clean ambiguës")
-        payload = payload or {}
-        err = payload.get("error")
-        report = payload.get("report")
+        err = (payload or {}).get("error")
         if err:
             QMessageBox.warning(self, "Clean ambiguës", f"Erreur :\n{err}")
-            self._update_action_buttons()
+        self._update_action_buttons()
+
+    def _on_clean_all_chrome(self):
+        if self._any_busy():
             return
-        if not isinstance(report, dict):
-            report = {}
-        self.txt.append(
-            "\n\n—— Clean ambiguës ——\n" + _format_ambiguous_cleanup_report(report)
-        )
-        remaining = report.get("remaining") or []
-        self._report["ambiguous"] = remaining
-        self.lbl_summary.setText(
-            f"Clients protégés : {self._report.get('protected_clients', 0)}    |    "
-            f"Application_v2 : {self._report.get('scanned_app_v2', 0)}    |    "
-            f"Chrome : {self._report.get('scanned_chrome', 0)}    |    "
-            f"Chrome > 3 min : {len(self._report.get('stale_chrome') or [])}    |    "
-            f"Ambiguës : {len(remaining)}"
-        )
+        self._all_chrome_busy = True
+        self._update_action_buttons()
+        self.btn_all_chrome.setText("Clean…")
+
+        def _worker():
+            try:
+                kill_report = cleanup_all_related_chrome_processes()
+                header = (
+                    "—— Clean tous Chrome ——\n"
+                    + _format_all_chrome_cleanup_report(kill_report or {})
+                )
+                time.sleep(0.25)
+                report = cleanup_orphan_processes()
+                self.refresh_finished.emit(
+                    {"report": report, "error": None, "header": header}
+                )
+            except Exception as e:
+                self.all_chrome_finished.emit({"error": str(e)})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_all_chrome_finished(self, payload):
+        self._all_chrome_busy = False
+        self.btn_all_chrome.setText("Clean tous\nChrome")
+        err = (payload or {}).get("error")
+        if err:
+            QMessageBox.warning(self, "Clean tous Chrome", f"Erreur :\n{err}")
         self._update_action_buttons()
 
 
@@ -15941,14 +15989,105 @@ def _orphan_proc_info(proc: psutil.Process) -> Optional[dict]:
         return None
 
 
-def _orphan_same_identity(pid: int, create_time: float) -> bool:
-    if not pid or create_time <= 0:
-        return is_pid_alive(pid)
+def _orphan_truly_alive(pid: int, create_time: float = 0.0) -> bool:
+    """
+    Vérifie qu'un PID est réellement vivant (pas un fantôme / déjà terminé).
+    Combine Win32 GetExitCodeProcess + psutil — aligne le scan sur ce que voit taskkill.
+    """
+    if not pid:
+        return False
+    STILL_ACTIVE = 259
+    try:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+        )
+        if handle:
+            try:
+                code = wintypes.DWORD()
+                ok = ctypes.windll.kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(code)
+                )
+                if ok and int(code.value) != STILL_ACTIVE:
+                    return False
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        else:
+            err = int(ctypes.GetLastError() or 0)
+            # 87 ERROR_INVALID_PARAMETER / 6 ERROR_INVALID_HANDLE → process absent
+            if err in (6, 87):
+                return False
+            # 5 ACCESS_DENIED → existe probablement, on continue avec psutil
+    except Exception:
+        pass
+
     try:
         p = psutil.Process(int(pid))
-        return abs(float(p.create_time()) - float(create_time)) <= _ORPHAN_CT_TOL
+        if not p.is_running():
+            return False
+        try:
+            st = p.status()
+            if st in (
+                getattr(psutil, "STATUS_ZOMBIE", "zombie"),
+                getattr(psutil, "STATUS_DEAD", "dead"),
+            ):
+                return False
+        except Exception:
+            pass
+        if create_time and create_time > 0:
+            try:
+                if abs(float(p.create_time()) - float(create_time)) > _ORPHAN_CT_TOL:
+                    return False
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                return False
+            except Exception:
+                pass
+        return True
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
+    except psutil.AccessDenied:
+        # Process présent mais non interrogeable → considéré vivant
+        return True
     except Exception:
         return False
+
+
+def _orphan_same_identity(pid: int, create_time: float) -> bool:
+    if not pid:
+        return False
+    if create_time and create_time > 0:
+        return _orphan_truly_alive(pid, create_time)
+    return _orphan_truly_alive(pid, 0.0)
+
+
+def _orphan_taskkill_force(pid: int) -> Tuple[bool, str]:
+    """taskkill /F /T — retourne (ok_ou_deja_mort, message)."""
+    try:
+        flags = 0
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            flags = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(
+            ["taskkill", "/F", "/PID", str(int(pid)), "/T"],
+            capture_output=True,
+            text=True,
+            creationflags=flags,
+        )
+        out = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        low = out.lower()
+        # Déjà mort / introuvable = succès pour le nettoyage de liste
+        if result.returncode == 0:
+            return True, out or "ok"
+        if (
+            "introuvable" in low
+            or "not found" in low
+            or "aucune instance" in low
+            or "no running instance" in low
+            or "does not exist" in low
+        ):
+            return True, out or "déjà terminé"
+        return False, out or f"code {result.returncode}"
+    except Exception as e:
+        return False, str(e)
 
 
 def _orphan_client_basenames() -> set:
@@ -16186,7 +16325,7 @@ def _orphan_walk_owner_client(
 
 def _orphan_kill_tree_verified(root_info: dict, timeout: float = 4.0) -> Tuple[List[dict], List[dict]]:
     """
-    Tue root + descendants si l'identité (pid, create_time) est toujours valide.
+    Tue root + descendants (taskkill /F /T en priorité).
     Retourne (killed, failed).
     """
     killed: List[dict] = []
@@ -16195,70 +16334,58 @@ def _orphan_kill_tree_verified(root_info: dict, timeout: float = 4.0) -> Tuple[L
     ct = float(root_info.get("create_time") or 0)
     if not pid:
         return killed, failed
-    if ct > 0 and not _orphan_same_identity(pid, ct):
-        failed.append(
-            {
-                **root_info,
-                "reason": "identité PID/create_time invalide (processus recyclé ou déjà mort)",
-            }
-        )
+    if not _orphan_truly_alive(pid, ct):
+        killed.append({**root_info, "reason": "déjà terminé"})
         return killed, failed
 
-    targets: List[dict] = []
+    targets: List[dict] = [dict(root_info)]
     try:
         proc = psutil.Process(pid)
-        root_now = _orphan_proc_info(proc)
-        if not root_now:
-            failed.append({**root_info, "reason": "processus déjà terminé"})
-            return killed, failed
-        if ct > 0 and abs(float(root_now["create_time"]) - ct) > _ORPHAN_CT_TOL:
-            failed.append({**root_info, "reason": "PID recyclé avant kill"})
-            return killed, failed
-        targets.append(root_now)
-        try:
-            for ch in proc.children(recursive=True):
-                ci = _orphan_proc_info(ch)
-                if ci:
-                    targets.append(ci)
-        except Exception:
-            pass
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        failed.append({**root_info, "reason": "accès refusé ou déjà mort"})
-        return killed, failed
-
-    # terminate puis kill si besoin
-    live_procs = []
-    for t in targets:
-        try:
-            p = psutil.Process(int(t["pid"]))
-            live_procs.append(p)
-            try:
-                p.terminate()
-            except Exception:
-                pass
-        except Exception:
-            pass
-    try:
-        gone, alive = psutil.wait_procs(live_procs, timeout=timeout)
-    except Exception:
-        gone, alive = [], live_procs
-    for p in alive:
-        try:
-            p.kill()
-        except Exception:
-            pass
-    try:
-        psutil.wait_procs(alive, timeout=1.5)
+        for ch in proc.children(recursive=True):
+            ci = _orphan_proc_info(ch)
+            if ci and _orphan_truly_alive(ci["pid"], ci.get("create_time") or 0):
+                targets.append(ci)
     except Exception:
         pass
 
+    ok, msg = _orphan_taskkill_force(pid)
+    if not ok:
+        try:
+            terminate_process_tree(pid, timeout=timeout)
+            ok = True
+            msg = "psutil terminate_process_tree"
+        except Exception as e:
+            msg = f"{msg} | psutil: {e}"
+
+    time.sleep(0.15)
     for t in targets:
-        still = _orphan_same_identity(int(t["pid"]), float(t.get("create_time") or 0))
-        if still and is_pid_alive(t["pid"]):
-            failed.append({**t, "reason": "n'a pas pu être terminé"})
+        tpid = int(t.get("pid") or 0)
+        tct = float(t.get("create_time") or 0)
+        if _orphan_truly_alive(tpid, tct):
+            ok2, msg2 = _orphan_taskkill_force(tpid)
+            time.sleep(0.05)
+            if _orphan_truly_alive(tpid, tct):
+                failed.append(
+                    {**t, "reason": f"n'a pas pu être terminé ({msg2 or msg})"}
+                )
+            else:
+                killed.append({**t, "reason": t.get("reason") or "terminé"})
         else:
-            killed.append(t)
+            killed.append({**t, "reason": t.get("reason") or "terminé"})
     return killed, failed
+
+
+def _orphan_prune_dead_items(items: List[dict]) -> List[dict]:
+    out = []
+    for it in items or []:
+        try:
+            pid = int(it.get("pid") or 0)
+        except Exception:
+            continue
+        ct = float(it.get("create_time") or 0)
+        if _orphan_truly_alive(pid, ct):
+            out.append(it)
+    return out
 
 
 def cleanup_orphan_processes() -> dict:
@@ -16316,6 +16443,8 @@ def cleanup_orphan_processes() -> dict:
                 continue
             info = _orphan_proc_info(p)
             if not info:
+                continue
+            if not _orphan_truly_alive(info["pid"], info.get("create_time") or 0):
                 continue
             by_pid[info["pid"]] = info
             if _orphan_is_app_v2(info):
@@ -16506,7 +16635,135 @@ def cleanup_orphan_processes() -> dict:
         pid_to_title=pid_to_title,
     )
 
+    # Purge des fantômes (déjà morts pour Windows / taskkill)
+    report["ignored"] = _orphan_prune_dead_items(report["ignored"])
+    report["ambiguous"] = _orphan_prune_dead_items(report["ambiguous"])
+    report["stale_chrome"] = _orphan_prune_dead_items(report["stale_chrome"])
+    report["failed"] = _orphan_prune_dead_items(report["failed"])
+    report["scanned_chrome"] = len(
+        [c for c in chrome_list if _orphan_truly_alive(c["pid"], c.get("create_time") or 0)]
+    )
+
     return report
+
+
+def cleanup_all_related_chrome_processes() -> dict:
+    """
+    Tue TOUS les Chrome liés aux instances (y compris protégés) + ambiguës.
+    Ne touche pas AnkaBot / Application_v2. Utilise taskkill /F /T.
+    """
+    report = {
+        "killed": [],
+        "failed": [],
+        "skipped": [],
+        "candidates": [],
+    }
+    snap = cleanup_orphan_processes()
+    client_names = _orphan_client_basenames()
+
+    candidates: List[dict] = []
+    seen = set()
+
+    def _add(it: dict):
+        try:
+            pid = int(it.get("pid") or 0)
+        except Exception:
+            return
+        if not pid or pid in seen:
+            return
+        if not _orphan_is_chrome(it):
+            return
+        if not _orphan_truly_alive(pid, float(it.get("create_time") or 0)):
+            return
+        seen.add(pid)
+        candidates.append(it)
+
+    for it in snap.get("stale_chrome") or []:
+        _add(it)
+    for it in snap.get("ambiguous") or []:
+        _add(it)
+    for it in snap.get("ignored") or []:
+        if _orphan_is_chrome(it):
+            _add(it)
+
+    # Reliste aussi tout chrome encore sous arbres clients / App_v2
+    protected_roots = _orphan_registry_clients() + _orphan_collect_live_clients()
+    protected_pids: set = set()
+    for root in protected_roots:
+        protected_pids |= _orphan_tree_pids(root["pid"])
+    me = os.getpid()
+    by_pid: Dict[int, dict] = {}
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            pid = p.info.get("pid")
+            if not pid or pid == me:
+                continue
+            if (p.info.get("name") or "").lower() not in _CHROME_NAMES:
+                continue
+            info = _orphan_proc_info(p)
+            if not info or not _orphan_truly_alive(info["pid"], info.get("create_time") or 0):
+                continue
+            by_pid[info["pid"]] = info
+            if info["pid"] in protected_pids:
+                _add(info)
+                continue
+            owner = _orphan_walk_owner_client(info, by_pid, client_names)
+            if owner:
+                _add(info)
+                continue
+            parent = by_pid.get(int(info.get("ppid") or 0))
+            if parent is None and info.get("ppid"):
+                try:
+                    parent = _orphan_proc_info(psutil.Process(int(info["ppid"])))
+                except Exception:
+                    parent = None
+            if parent and (
+                _orphan_is_app_v2(parent) or _orphan_is_client(parent, client_names)
+            ):
+                _add(info)
+        except Exception:
+            continue
+
+    report["candidates"] = list(candidates)
+    killed_pids = set()
+    for ch in candidates:
+        if ch["pid"] in killed_pids:
+            continue
+        if _orphan_is_client(ch, client_names) or _orphan_is_app_v2(ch):
+            report["skipped"].append({**ch, "reason": "pas un Chrome"})
+            continue
+        k, f = _orphan_kill_tree_verified(ch)
+        for item in k:
+            if _orphan_is_chrome(item) or item["pid"] == ch["pid"]:
+                item["reason"] = "Clean tous Chrome (instances + ambiguës)"
+                report["killed"].append(item)
+            killed_pids.add(item["pid"])
+        for item in f:
+            report["failed"].append(item)
+
+    return report
+
+
+def _format_all_chrome_cleanup_report(report: dict) -> str:
+    def _lines(items: List[dict], limit: int = 200) -> str:
+        if not items:
+            return "  (aucun)"
+        rows = []
+        for it in items[:limit]:
+            name = it.get("name") or it.get("basename") or "?"
+            pid = it.get("pid", "?")
+            reason = it.get("reason") or ""
+            rows.append(f"  • {name} PID {pid}" + (f" — {reason}" if reason else ""))
+        if len(items) > limit:
+            rows.append(f"  … et {len(items) - limit} autre(s)")
+        return "\n".join(rows)
+
+    return (
+        f"Candidats : {len(report.get('candidates') or [])}\n"
+        f"Terminés ({len(report.get('killed') or [])}) :\n{_lines(report.get('killed') or [])}\n\n"
+        f"Échecs ({len(report.get('failed') or [])}) :\n{_lines(report.get('failed') or [])}\n\n"
+        f"Ignorés ({len(report.get('skipped') or [])}) :\n{_lines(report.get('skipped') or [])}"
+    )
 
 
 def _orphan_chrome_age_s(info: dict, now: Optional[float] = None) -> float:
@@ -16786,12 +17043,7 @@ def cleanup_ambiguous_processes(items: List[dict]) -> dict:
             continue
         # Vérifie que c'est encore le même process (anti PID recyclé)
         ct = float(raw.get("create_time") or 0)
-        if ct > 0 and not _orphan_same_identity(pid, ct):
-            report["skipped"].append(
-                {**raw, "reason": "déjà terminé ou PID recyclé — ignoré"}
-            )
-            continue
-        if not is_pid_alive(pid):
+        if not _orphan_truly_alive(pid, ct):
             report["skipped"].append({**raw, "reason": "déjà terminé"})
             continue
 
@@ -16812,9 +17064,7 @@ def cleanup_ambiguous_processes(items: List[dict]) -> dict:
         if not pid or pid in killed_pids:
             continue
         ct = float(raw.get("create_time") or 0)
-        if ct > 0 and _orphan_same_identity(pid, ct):
-            report["remaining"].append(raw)
-        elif ct <= 0 and is_pid_alive(pid):
+        if _orphan_truly_alive(pid, ct):
             report["remaining"].append(raw)
 
     return report
